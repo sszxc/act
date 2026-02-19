@@ -7,6 +7,13 @@ import matplotlib.pyplot as plt
 from copy import deepcopy
 from tqdm import tqdm
 from einops import rearrange
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
+
+# 在脚本最开始初始化，用于本地双卡 (DDP) 训练
+# ACT 等模型存在部分参数不参与 loss 计算，需启用 find_unused_parameters 避免 DDP 报错
+ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
 
 from constants import DT
 from constants import PUPPET_GRIPPER_JOINT_OPEN
@@ -102,20 +109,22 @@ def main(args):
 
     train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val)
 
-    # save dataset stats
-    if not os.path.isdir(ckpt_dir):
-        os.makedirs(ckpt_dir)
-    stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
-    with open(stats_path, 'wb') as f:
-        pickle.dump(stats, f)
+    # save dataset stats（仅主进程）
+    if accelerator.is_main_process:
+        if not os.path.isdir(ckpt_dir):
+            os.makedirs(ckpt_dir)
+        stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
+        with open(stats_path, 'wb') as f:
+            pickle.dump(stats, f)
 
     best_ckpt_info = train_bc(train_dataloader, val_dataloader, config)
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
 
-    # save best checkpoint
-    ckpt_path = os.path.join(ckpt_dir, f'policy_best.ckpt')
-    torch.save(best_state_dict, ckpt_path)
-    print(f'Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}')
+    # save best checkpoint（仅主进程，已是 unwrap 后的 state_dict）
+    if accelerator.is_main_process:
+        ckpt_path = os.path.join(ckpt_dir, f'policy_best.ckpt')
+        torch.save(best_state_dict, ckpt_path)
+        accelerator.print(f'Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}')
 
 
 def make_policy(policy_class, policy_config):
@@ -314,9 +323,13 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
 
 def forward_pass(data, policy):
+    device = accelerator.device
     image_data, qpos_data, action_data, is_pad = data
-    image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
-    return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
+    image_data = image_data.to(device)
+    qpos_data = qpos_data.to(device)
+    action_data = action_data.to(device)
+    is_pad = is_pad.to(device)
+    return policy(qpos_data, image_data, action_data, is_pad)  # TODO remove None
 
 
 def train_bc(train_dataloader, val_dataloader, config):
@@ -329,15 +342,18 @@ def train_bc(train_dataloader, val_dataloader, config):
     set_seed(seed)
 
     policy = make_policy(policy_class, policy_config)
-    policy.cuda()
     optimizer = make_optimizer(policy_class, policy)
+    # Accelerate prepare：自动 DDP 封装并分配设备，必须在训练循环前调用
+    policy, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
+        policy, optimizer, train_dataloader, val_dataloader
+    )
 
     train_history = []
     validation_history = []
     min_val_loss = np.inf
     best_ckpt_info = None
-    for epoch in tqdm(range(num_epochs)):
-        print(f'\nEpoch {epoch}')
+    for epoch in tqdm(range(num_epochs), disable=not accelerator.is_main_process):
+        accelerator.print(f'\nEpoch {epoch}')
         # validation
         with torch.inference_mode():
             policy.eval()
@@ -351,47 +367,52 @@ def train_bc(train_dataloader, val_dataloader, config):
             epoch_val_loss = epoch_summary['loss']
             if epoch_val_loss < min_val_loss:
                 min_val_loss = epoch_val_loss
-                best_ckpt_info = (epoch, min_val_loss, deepcopy(policy.state_dict()))
-        print(f'Val loss:   {epoch_val_loss:.5f}')
+                # 保存 unwrap 后的 state_dict，便于后续单卡加载
+                unwrapped_model = accelerator.unwrap_model(policy)
+                best_ckpt_info = (epoch, min_val_loss, deepcopy(unwrapped_model.state_dict()))
+        accelerator.print(f'Val loss:   {epoch_val_loss:.5f}')
         summary_string = ''
         for k, v in epoch_summary.items():
             summary_string += f'{k}: {v.item():.3f} '
-        print(summary_string)
+        accelerator.print(summary_string)
 
         # training
         policy.train()
         optimizer.zero_grad()
         for batch_idx, data in enumerate(train_dataloader):
             forward_dict = forward_pass(data, policy)
-            # backward
             loss = forward_dict['loss']
-            loss.backward()
+            accelerator.backward(loss)
             optimizer.step()
             optimizer.zero_grad()
             train_history.append(detach_dict(forward_dict))
         epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*epoch:(batch_idx+1)*(epoch+1)])
         epoch_train_loss = epoch_summary['loss']
-        print(f'Train loss: {epoch_train_loss:.5f}')
+        accelerator.print(f'Train loss: {epoch_train_loss:.5f}')
         summary_string = ''
         for k, v in epoch_summary.items():
             summary_string += f'{k}: {v.item():.3f} '
-        print(summary_string)
+        accelerator.print(summary_string)
 
-        if epoch % 100 == 0:
+        if epoch % 100 == 0 and accelerator.is_main_process:
+            unwrapped_model = accelerator.unwrap_model(policy)
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
-            torch.save(policy.state_dict(), ckpt_path)
+            torch.save(unwrapped_model.state_dict(), ckpt_path)
             plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
 
-    ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
-    torch.save(policy.state_dict(), ckpt_path)
+    if accelerator.is_main_process:
+        unwrapped_model = accelerator.unwrap_model(policy)
+        ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
+        torch.save(unwrapped_model.state_dict(), ckpt_path)
 
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
-    ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt')
-    torch.save(best_state_dict, ckpt_path)
-    print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}')
+    if accelerator.is_main_process:
+        ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt')
+        torch.save(best_state_dict, ckpt_path)
+        accelerator.print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}')
 
-    # save training curves
-    plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed)
+        # save training curves
+        plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed)
 
     return best_ckpt_info
 
@@ -410,7 +431,7 @@ def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
         plt.legend()
         plt.title(key)
         plt.savefig(plot_path)
-    print(f'Saved plots to {ckpt_dir}')
+    accelerator.print(f'Saved plots to {ckpt_dir}')
 
 
 if __name__ == '__main__':
