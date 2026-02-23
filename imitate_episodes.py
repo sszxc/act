@@ -1,6 +1,10 @@
+import os
+# 无显示器时使用离屏渲染，避免 "OpenGL platform library has not been loaded" 错误
+if 'MUJOCO_GL' not in os.environ:
+    os.environ['MUJOCO_GL'] = 'egl'  # 有 GPU 用 egl；无 GPU 可改为 'osmesa'
+
 import torch
 import numpy as np
-import os
 import pickle
 import argparse
 import matplotlib.pyplot as plt

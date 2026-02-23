@@ -1,8 +1,9 @@
 import os
 import numpy as np
-import cv2
 import h5py
 import argparse
+import imageio
+from tqdm import tqdm
 
 import matplotlib.pyplot as plt
 from constants import DT
@@ -41,39 +42,68 @@ def main(args):
     # visualize_timestamp(t_list, dataset_path) # TODO addn timestamp back
 
 
+def _save_video(frames, output_path, fps=30, verbose=False):
+    """使用 imageio 保存视频，尝试多种编码器以保证可播放"""
+    if not output_path.endswith('.mp4'):
+        output_path += '.mp4'
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    if verbose:
+        print(f"使用 imageio 保存视频到: {output_path}")
+        print(f"帧数: {len(frames)}, 帧率: {fps}")
+
+    codecs_to_try = ["libx264", "libx264rgb", "mpeg4", "libvpx-vp9"]
+    for codec in codecs_to_try:
+        try:
+            if verbose:
+                print(f"尝试使用 {codec} 编码器...")
+            with imageio.get_writer(output_path, fps=fps, codec=codec) as writer:
+                for frame in tqdm(frames, desc="写入视频帧", unit="帧", disable=not verbose):
+                    writer.append_data(frame)
+            if verbose:
+                print(f"✓ 视频已保存 (使用 {codec} 编码器): {output_path}")
+            print(f'Saved video to: {output_path}')
+            return
+        except Exception as e:
+            print(f"✗ {codec} 编码器失败: {e}")
+            continue
+    raise RuntimeError(f"所有编码器均失败，无法保存视频: {output_path}")
+
+
 def save_videos(video, dt, video_path=None):
+    """将 video（list 或 dict 格式的多相机帧）转为帧列表并用 imageio 保存"""
+    if video_path is None:
+        video_path = 'output.mp4'
+    fps = int(1 / dt) if dt > 0 else 30
+
     if isinstance(video, list):
         cam_names = list(video[0].keys())
-        h, w, _ = video[0][cam_names[0]].shape
-        w = w * len(cam_names)
-        fps = int(1/dt)
-        out = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-        for ts, image_dict in enumerate(video):
+        frames = []
+        for image_dict in video:
             images = []
             for cam_name in cam_names:
-                image = image_dict[cam_name]
-                image = image[:, :, [2, 1, 0]] # swap B and R channel
+                image = image_dict[cam_name].copy()
+                if image.shape[2] == 3:
+                    image = image[:, :, [2, 1, 0]]  # BGR -> RGB
                 images.append(image)
-            images = np.concatenate(images, axis=1)
-            out.write(images)
-        out.release()
-        print(f'Saved video to: {video_path}')
+            frame = np.concatenate(images, axis=1)
+            frames.append(frame)
     elif isinstance(video, dict):
         cam_names = list(video.keys())
-        all_cam_videos = []
-        for cam_name in cam_names:
-            all_cam_videos.append(video[cam_name])
-        all_cam_videos = np.concatenate(all_cam_videos, axis=2) # width dimension
-
-        n_frames, h, w, _ = all_cam_videos.shape
-        fps = int(1 / dt)
-        out = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+        all_cam_videos = np.concatenate([video[cam_name] for cam_name in cam_names], axis=2)
+        n_frames = all_cam_videos.shape[0]
+        frames = []
         for t in range(n_frames):
-            image = all_cam_videos[t]
-            image = image[:, :, [2, 1, 0]]  # swap B and R channel
-            out.write(image)
-        out.release()
-        print(f'Saved video to: {video_path}')
+            image = all_cam_videos[t].copy()
+            if image.shape[2] == 3:
+                image = image[:, :, [2, 1, 0]]  # BGR -> RGB
+            frames.append(image)
+    else:
+        raise TypeError("video 必须是 list 或 dict")
+
+    _save_video(frames, video_path, fps=fps, verbose=False)
 
 
 def visualize_joints(qpos_list, command_list, plot_path=None, ylim=None, label_overwrite=None):

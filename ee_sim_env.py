@@ -1,6 +1,9 @@
+import os
+if 'MUJOCO_GL' not in os.environ:
+    os.environ['MUJOCO_GL'] = 'egl'
+
 import numpy as np
 import collections
-import os
 
 from constants import DT, XML_DIR, START_ARM_POSE
 from constants import PUPPET_GRIPPER_POSITION_CLOSE

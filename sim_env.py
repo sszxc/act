@@ -1,5 +1,9 @@
-import numpy as np
 import os
+# 无显示器时使用离屏渲染（必须在 import dm_control 之前设置）
+if 'MUJOCO_GL' not in os.environ:
+    os.environ['MUJOCO_GL'] = 'egl'
+
+import numpy as np
 import collections
 import matplotlib.pyplot as plt
 from dm_control import mujoco
