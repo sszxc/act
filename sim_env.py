@@ -10,7 +10,7 @@ from dm_control import mujoco
 from dm_control.rl import control
 from dm_control.suite import base
 
-from constants import DT, XML_DIR, START_ARM_POSE
+from constants import DT, XML_DIR, START_ARM_POSE, DEX_ALLEGRO_XML_PATH
 from constants import PUPPET_GRIPPER_POSITION_UNNORMALIZE_FN
 from constants import MASTER_GRIPPER_POSITION_NORMALIZE_FN
 from constants import PUPPET_GRIPPER_POSITION_NORMALIZE_FN
@@ -20,6 +20,17 @@ import IPython
 e = IPython.embed
 
 BOX_POSE = [None] # to be changed from outside
+DEX_OBJECT_POSE = [None]  # for Allegro dex task: object (x,y,z,qw,qx,qy,qz)
+
+def sample_dex_object_pose():
+    """Sample random object pose for dex eval. Returns (7,) array: x,y,z, qw,qx,qy,qz."""
+    x_range = [0.0, 0.2]
+    y_range = [-0.2, 0.2]
+    z_range = [0.03, 0.05]
+    ranges = np.vstack([x_range, y_range, z_range])
+    pos = np.random.uniform(ranges[:, 0], ranges[:, 1])
+    quat = np.array([1.0, 0.0, 0.0, 0.0])  # w,x,y,z
+    return np.concatenate([pos, quat]).astype(np.float64)
 
 def make_sim_env(task_name):
     """
@@ -49,6 +60,12 @@ def make_sim_env(task_name):
         xml_path = os.path.join(XML_DIR, f'bimanual_viperx_insertion.xml')
         physics = mujoco.Physics.from_xml_path(xml_path)
         task = InsertionTask(random=False)
+        env = control.Environment(physics, task, time_limit=20, control_timestep=DT,
+                                  n_sub_steps=None, flat_observation=False)
+    elif 'dex' in task_name:
+        xml_path = DEX_ALLEGRO_XML_PATH
+        physics = mujoco.Physics.from_xml_path(xml_path)
+        task = AllegroDexGraspTask(random=False)
         env = control.Environment(physics, task, time_limit=20, control_timestep=DT,
                                   n_sub_steps=None, flat_observation=False)
     else:
@@ -230,6 +247,84 @@ class InsertionTask(BimanualViperXTask):
             reward = 3
         if pin_touched: # successful insertion
             reward = 4
+        return reward
+
+
+class AllegroDexGraspTask(base.Task):
+    """Allegro hand + free joint object (e.g. rubiks cube). Action 22d: x,y,z,rx,ry,rz + 16 finger joints. Qpos 29d, qvel 28d."""
+
+    OBJECT_BODY_NAME = '077_rubiks_cube/'
+    HAND_QPOS_SIZE = 22
+    OBJECT_QPOS_SIZE = 7
+    OBJECT_QVEL_SIZE = 6
+    Z_LIFT_THRESHOLD = 0.05
+
+    def __init__(self, random=None):
+        super().__init__(random=random)
+        self.max_reward = 2
+
+    def before_step(self, action, physics):
+        # action (22,): root 6 + finger 16; actuators in XML order
+        physics.data.ctrl[:] = np.asarray(action, dtype=np.float64)
+
+    def initialize_episode(self, physics):
+        with physics.reset_context():
+            # hand: initial pose (zeros = default from XML)
+            physics.data.qpos[:self.HAND_QPOS_SIZE] = 0.0
+            np.copyto(physics.data.ctrl, physics.data.qpos[:self.HAND_QPOS_SIZE])
+            assert DEX_OBJECT_POSE[0] is not None
+            physics.data.qpos[self.HAND_QPOS_SIZE:self.HAND_QPOS_SIZE + self.OBJECT_QPOS_SIZE] = DEX_OBJECT_POSE[0]
+        super().initialize_episode(physics)
+
+    @staticmethod
+    def get_qpos(physics):
+        # hand 22 (6 root + 16 finger) then object 7 (xyz + quat)
+        qpos = physics.data.qpos.copy()
+        hand = qpos[:AllegroDexGraspTask.HAND_QPOS_SIZE]
+        obj = qpos[AllegroDexGraspTask.HAND_QPOS_SIZE:AllegroDexGraspTask.HAND_QPOS_SIZE + AllegroDexGraspTask.OBJECT_QPOS_SIZE]
+        return np.concatenate([hand, obj])
+
+    @staticmethod
+    def get_qvel(physics):
+        qvel = physics.data.qvel.copy()
+        hand = qvel[:AllegroDexGraspTask.HAND_QPOS_SIZE]
+        obj = qvel[AllegroDexGraspTask.HAND_QPOS_SIZE:AllegroDexGraspTask.HAND_QPOS_SIZE + AllegroDexGraspTask.OBJECT_QVEL_SIZE]
+        return np.concatenate([hand, obj])
+
+    @staticmethod
+    def get_env_state(physics):
+        return physics.data.qpos[AllegroDexGraspTask.HAND_QPOS_SIZE:AllegroDexGraspTask.HAND_QPOS_SIZE + AllegroDexGraspTask.OBJECT_QPOS_SIZE].copy()
+
+    def get_observation(self, physics):
+        obs = collections.OrderedDict()
+        obs['qpos'] = self.get_qpos(physics)
+        obs['qvel'] = self.get_qvel(physics)
+        obs['env_state'] = self.get_env_state(physics)
+        obs['images'] = dict()
+        obs['images']['default_cam'] = physics.render(height=480, width=640, camera_id='default_cam')
+        obs['images']['wrist_cam'] = physics.render(height=480, width=640, camera_id='wrist_cam')
+        return obs
+
+    def get_reward(self, physics):
+        reward = 0
+        # hand-object contact
+        try:
+            obj_body_id = physics.model.name2id(self.OBJECT_BODY_NAME, 'body')
+        except Exception:
+            obj_body_id = None
+        if obj_body_id is not None:
+            for i in range(physics.data.ncon):
+                g1 = physics.data.contact[i].geom1
+                g2 = physics.data.contact[i].geom2
+                b1 = physics.model.geom_bodyid[g1]
+                b2 = physics.model.geom_bodyid[g2]
+                if (b1 == obj_body_id and b2 != 0) or (b2 == obj_body_id and b1 != 0):
+                    reward = 1
+                    break
+        # object lifted (z above threshold)
+        obj_z = physics.data.qpos[self.HAND_QPOS_SIZE + 2]  # z of free joint
+        if obj_z > self.Z_LIFT_THRESHOLD:
+            reward = 2
         return reward
 
 

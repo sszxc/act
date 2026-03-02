@@ -2,33 +2,41 @@ import pathlib
 
 ### Task parameters
 DATA_DIR = 'data'
+DEFAULT_STATE_DIM = 14
+STATE_DIM_DEX = 22
+DEX_ALLEGRO_XML_PATH = '/mnt/1tb1/xuechao/MuJoCo-Asset-Pipeline/asset/scene/freejoint/teleop_scene_left_077_rubiks_cube/teleop_scene_left_077_rubiks_cube.xml'
+
 SIM_TASK_CONFIGS = {
-    'sim_transfer_cube_scripted':{
-        'dataset_dir': DATA_DIR + '/sim_transfer_cube_scripted',
-        'num_episodes': 50,
-        'episode_len': 400,
-        'camera_names': ['top']
+    "sim_transfer_cube_scripted": {
+        "dataset_dir": DATA_DIR + "/sim_transfer_cube_scripted",
+        "num_episodes": 50,
+        "episode_len": 400,
+        "camera_names": ["top"],
     },
-
-    'sim_transfer_cube_human':{
-        'dataset_dir': DATA_DIR + '/sim_transfer_cube_human',
-        'num_episodes': 50,
-        'episode_len': 400,
-        'camera_names': ['top']
+    "sim_transfer_cube_human": {
+        "dataset_dir": DATA_DIR + "/sim_transfer_cube_human",
+        "num_episodes": 50,
+        "episode_len": 400,
+        "camera_names": ["top"],
     },
-
-    'sim_insertion_scripted': {
-        'dataset_dir': DATA_DIR + '/sim_insertion_scripted',
-        'num_episodes': 50,
-        'episode_len': 400,
-        'camera_names': ['top']
+    "sim_insertion_scripted": {
+        "dataset_dir": DATA_DIR + "/sim_insertion_scripted",
+        "num_episodes": 50,
+        "episode_len": 400,
+        "camera_names": ["top"],
     },
-
-    'sim_insertion_human': {
-        'dataset_dir': DATA_DIR + '/sim_insertion_human',
-        'num_episodes': 50,
-        'episode_len': 500,
-        'camera_names': ['top']
+    "sim_insertion_human": {
+        "dataset_dir": DATA_DIR + "/sim_insertion_human",
+        "num_episodes": 50,
+        "episode_len": 500,
+        "camera_names": ["top"],
+    },
+    "sim_dexgrasp_cube_teleop": {
+        "dataset_dir": DATA_DIR + "/sim_dexgrasp_cube_teleop/20260226_160642",
+        "num_episodes": 6,
+        "episode_len": 400,
+        "camera_names": ["default_cam", "wrist_cam"],
+        "state_dim": STATE_DIM_DEX,
     },
 }
 

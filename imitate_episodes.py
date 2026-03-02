@@ -12,7 +12,7 @@ from copy import deepcopy
 from tqdm import tqdm
 from einops import rearrange
 
-from constants import DT
+from constants import DT, DEFAULT_STATE_DIM
 from constants import PUPPET_GRIPPER_JOINT_OPEN
 from utils import load_data # data functions
 from utils import sample_box_pose, sample_insertion_pose # robot functions
@@ -20,7 +20,7 @@ from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from policy import ACTPolicy, CNNMLPPolicy
 from visualize_episodes import save_videos
 
-from sim_env import BOX_POSE
+from sim_env import BOX_POSE, DEX_OBJECT_POSE, sample_dex_object_pose
 
 import IPython
 e = IPython.embed
@@ -49,9 +49,9 @@ def main(args):
     num_episodes = task_config['num_episodes']
     episode_len = task_config['episode_len']
     camera_names = task_config['camera_names']
+    state_dim = task_config.get('state_dim', DEFAULT_STATE_DIM)
 
     # fixed parameters
-    state_dim = 14
     lr_backbone = 1e-5
     backbone = 'resnet18'
     if policy_class == 'ACT':
@@ -69,10 +69,11 @@ def main(args):
                          'dec_layers': dec_layers,
                          'nheads': nheads,
                          'camera_names': camera_names,
+                         'state_dim': state_dim,
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
-                         'camera_names': camera_names,}
+                         'camera_names': camera_names, 'state_dim': state_dim,}
     else:
         raise NotImplementedError
 
@@ -104,7 +105,14 @@ def main(args):
         print()
         exit()
 
-    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val)
+    train_dataloader, val_dataloader, stats, _ = load_data(
+        dataset_dir,
+        num_episodes,
+        camera_names,
+        batch_size_train,
+        batch_size_val,
+        num_queries=policy_config['num_queries'],
+    )
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -164,7 +172,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
     max_timesteps = config['episode_len']
     task_name = config['task_name']
     temporal_agg = config['temporal_agg']
-    onscreen_cam = 'angle'
+    onscreen_cam = 'default_cam' if 'dex' in task_name else 'angle'
 
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
@@ -209,6 +217,8 @@ def eval_bc(config, ckpt_name, save_episode=True):
             BOX_POSE[0] = sample_box_pose() # used in sim reset
         elif 'sim_insertion' in task_name:
             BOX_POSE[0] = np.concatenate(sample_insertion_pose()) # used in sim reset
+        elif 'dex' in task_name:
+            DEX_OBJECT_POSE[0] = sample_dex_object_pose()
 
         ts = env.reset()
 
@@ -242,6 +252,8 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 else:
                     image_list.append({'main': obs['image']})
                 qpos_numpy = np.array(obs['qpos'])
+                # 环境可能返回 hand+object（如 dex 29 维），而 stats 与 policy 使用 state_dim（如 22 维），只取前 state_dim 维
+                qpos_numpy = qpos_numpy[:state_dim]
                 qpos = pre_process(qpos_numpy)
                 qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
                 qpos_history[:, t] = qpos
@@ -249,7 +261,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
                 ### query policy
                 if config['policy_class'] == "ACT":
-                    if t % query_frequency == 0:
+                    if t % query_frequency == 0:  # 每隔多少步重算一个 chunk
                         all_actions = policy(qpos, curr_image)
                     if temporal_agg:
                         all_time_actions[[t], t:t+num_queries] = all_actions
