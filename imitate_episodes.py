@@ -11,9 +11,10 @@ import matplotlib.pyplot as plt
 from copy import deepcopy
 from tqdm import tqdm
 from einops import rearrange
+import h5py
 
 from constants import DT, DEFAULT_STATE_DIM
-from constants import PUPPET_GRIPPER_JOINT_OPEN
+from constants import PUPPET_GRIPPER_JOINT_OPEN, PUPPET_GRIPPER_POSITION_UNNORMALIZE_FN
 from utils import load_data # data functions
 from utils import sample_box_pose, sample_insertion_pose # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict # helper functions
@@ -90,7 +91,12 @@ def main(args):
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
-        'real_robot': not is_sim
+        'real_robot': not is_sim,
+        # dataset info for evaluation-time initialization
+        'dataset_dir': dataset_dir,
+        'num_episodes': num_episodes,
+        # whether to overwrite sim initial qpos from dataset
+        'init_qpos_from_dataset': args.get('init_qpos_from_dataset', False),
     }
 
     if is_eval:
@@ -172,6 +178,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
     max_timesteps = config['episode_len']
     task_name = config['task_name']
     temporal_agg = config['temporal_agg']
+    dataset_dir = config.get('dataset_dir', None)
+    num_episodes = config.get('num_episodes', None)
+    init_qpos_from_dataset = config.get('init_qpos_from_dataset', False)
     onscreen_cam = 'default_cam' if 'dex' in task_name else 'angle'
 
     # load policy and stats
@@ -188,6 +197,69 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
     pre_process = lambda s_qpos: (s_qpos - stats['qpos_mean']) / stats['qpos_std']
     post_process = lambda a: a * stats['action_std'] + stats['action_mean']
+
+    def sample_dataset_start_qpos():
+        """
+        从数据集中随机采一条轨迹的起始 qpos（t=0）。
+        返回原始 qpos（不做归一化），形状为 (qpos_dim,)。
+        """
+        assert dataset_dir is not None and num_episodes is not None, \
+            "dataset_dir / num_episodes 未在 config 中提供，无法从数据集采样初始 qpos。"
+        episode_idx = np.random.randint(0, num_episodes)
+        dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}.hdf5')
+        with h5py.File(dataset_path, 'r') as root:
+            qpos0 = root['/observations/qpos'][0]
+        return np.array(qpos0, dtype=np.float32)
+
+    def overwrite_sim_qpos_from_dataset(env, task_name, dataset_qpos):
+        """
+        将模拟环境的初始关节位置，用数据集中某条轨迹起点的 qpos 覆盖。
+        只对 sim 环境生效，对 real_robot 不做任何事。
+        """
+        physics = env._physics
+
+        # bi-manual 14-dim 任务（transfer_cube / insertion）
+        if 'sim_transfer_cube' in task_name or 'sim_insertion' in task_name:
+            # 期望的观测维度是 14: [L_arm(6), L_grip(1), R_arm(6), R_grip(1)]
+            q = np.asarray(dataset_qpos, dtype=np.float32)
+            if q.shape[0] < 14:
+                raise ValueError(f"数据集 qpos 维度 {q.shape[0]} < 14，无法映射到模拟关节。")
+            q = q[:14]
+            left_arm = q[:6]
+            left_grip_norm = q[6]
+            right_arm = q[7:13]
+            right_grip_norm = q[13]
+
+            # 归一化位置 -> 物理手指位置
+            left_grip_pos = PUPPET_GRIPPER_POSITION_UNNORMALIZE_FN(float(left_grip_norm))
+            right_grip_pos = PUPPET_GRIPPER_POSITION_UNNORMALIZE_FN(float(right_grip_norm))
+
+            with physics.reset_context():
+                # 手臂关节
+                physics.data.qpos[:6] = left_arm
+                physics.data.qpos[8:14] = right_arm
+                # 夹爪：两指对称，一个正一个负（与 before_step 中 env_action 一致）
+                physics.data.qpos[6] = left_grip_pos
+                physics.data.qpos[7] = -left_grip_pos
+                physics.data.qpos[14] = right_grip_pos
+                physics.data.qpos[15] = -right_grip_pos
+                # 保持其他 qpos（如 BOX_POSE）不变，只更新控制量为当前关节
+                np.copyto(physics.data.ctrl, physics.data.qpos[:16])
+
+        # dexterous hand 任务：只用手部 22 维 qpos 初始化
+        elif 'dex' in task_name:
+            q = np.asarray(dataset_qpos, dtype=np.float32)
+            if q.shape[0] < 22:
+                raise ValueError(f"dex 任务期望至少 22 维手部 qpos，但数据集给了 {q.shape[0]} 维。")
+            hand_qpos = q[:22]
+            with physics.reset_context():
+                physics.data.qpos[:22] = hand_qpos
+                # 控制量跟随当前手部状态
+                np.copyto(physics.data.ctrl, physics.data.qpos[:22])
+
+        else:
+            # 未知的 sim 任务，不做覆盖
+            return
 
     # load environment
     if real_robot:
@@ -221,6 +293,18 @@ def eval_bc(config, ckpt_name, save_episode=True):
             DEX_OBJECT_POSE[0] = sample_dex_object_pose()
 
         ts = env.reset()
+
+        # 可选：将模拟初始 qpos 覆盖为数据集中的某条轨迹起点
+        if (not real_robot) and init_qpos_from_dataset:
+            try:
+                dataset_qpos0 = sample_dataset_start_qpos()
+                overwrite_sim_qpos_from_dataset(env, task_name, dataset_qpos0)
+                # 使用新的物理状态重新生成观测，替换当前 ts.observation
+                new_obs = env._task.get_observation(env._physics)
+                ts = ts._replace(observation=new_obs)
+                print("Initialized sim qpos from dataset start qpos.")
+            except Exception as ex:
+                print(f"[WARN] 初始化 qpos 从数据集失败，使用默认初始化. error={ex}")
 
         ### onscreen render
         if onscreen_render:
@@ -301,7 +385,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
         rewards = np.array(rewards)
         episode_return = np.sum(rewards[rewards!=None])
         episode_returns.append(episode_return)
-        episode_highest_reward = np.max(rewards)
+        episode_highest_reward = np.max(rewards[rewards!=None])
         highest_rewards.append(episode_highest_reward)
         print(f'Rollout {rollout_id}\n{episode_return=}, {episode_highest_reward=}, {env_max_reward=}, Success: {episode_highest_reward==env_max_reward}')
 
@@ -433,6 +517,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--onscreen_render', action='store_true')
+    parser.add_argument('--init_qpos_from_dataset', action='store_true',
+                        help='在 eval（模拟环境）时，用数据集中随机一条轨迹的起始 qpos 覆盖模拟环境初始姿态')
     parser.add_argument('--ckpt_dir', action='store', type=str, help='ckpt_dir', required=True)
     parser.add_argument('--policy_class', action='store', type=str, help='policy_class, capitalize', required=True)
     parser.add_argument('--task_name', action='store', type=str, help='task_name', required=True)

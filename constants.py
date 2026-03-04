@@ -32,8 +32,8 @@ SIM_TASK_CONFIGS = {
         "camera_names": ["top"],
     },
     "sim_dexgrasp_cube_teleop": {
-        "dataset_dir": DATA_DIR + "/sim_dexgrasp_cube_teleop/20260226_160642",
-        "num_episodes": 6,
+        "dataset_dir": DATA_DIR + "/sim_dexgrasp_cube_teleop/20260304_123721",
+        "num_episodes": 51,
         "episode_len": 400,
         "camera_names": ["default_cam", "wrist_cam"],
         "state_dim": STATE_DIM_DEX,
