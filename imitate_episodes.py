@@ -19,7 +19,7 @@ from utils import load_data # data functions
 from utils import sample_box_pose, sample_insertion_pose # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from policy import ACTPolicy, CNNMLPPolicy
-from visualize_episodes import save_videos
+from visualize_episodes import save_videos, visualize_joints
 
 from sim_env import BOX_POSE, DEX_OBJECT_POSE, sample_dex_object_pose
 
@@ -97,6 +97,9 @@ def main(args):
         'num_episodes': num_episodes,
         # whether to overwrite sim initial qpos from dataset
         'init_qpos_from_dataset': args.get('init_qpos_from_dataset', False),
+        # direct replay: 用数据集中某条轨迹的 action 序列直接控制 sim，不跑 policy
+        'direct_replay': args.get('direct_replay', False),
+        'replay_episode': args.get('replay_episode', 0),
     }
 
     if is_eval:
@@ -181,7 +184,15 @@ def eval_bc(config, ckpt_name, save_episode=True):
     dataset_dir = config.get('dataset_dir', None)
     num_episodes = config.get('num_episodes', None)
     init_qpos_from_dataset = config.get('init_qpos_from_dataset', False)
+    direct_replay = config.get('direct_replay', False)
+    replay_episode = config.get('replay_episode', 0)
     onscreen_cam = 'default_cam' if 'dex' in task_name else 'angle'
+
+    if direct_replay and real_robot:
+        raise ValueError('direct_replay 仅支持 sim 环境，不能用于 real_robot。')
+    if direct_replay:
+        assert dataset_dir is not None and num_episodes is not None, \
+            "direct_replay 需要 dataset_dir 和 num_episodes。"
 
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
@@ -210,6 +221,17 @@ def eval_bc(config, ckpt_name, save_episode=True):
         with h5py.File(dataset_path, 'r') as root:
             qpos0 = root['/observations/qpos'][0]
         return np.array(qpos0, dtype=np.float32)
+
+    def load_episode_for_replay(episode_idx):
+        """
+        加载指定 episode 的 qpos[0] 和整条 action 序列，用于 direct replay。
+        返回 (qpos0, actions)，actions 形状 (T, action_dim)，为原始未归一化。
+        """
+        dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}.hdf5')
+        with h5py.File(dataset_path, 'r') as root:
+            qpos0 = np.array(root['/observations/qpos'][0], dtype=np.float32)
+            actions = np.array(root['/action'][()], dtype=np.float64)
+        return qpos0, actions
 
     def overwrite_sim_qpos_from_dataset(env, task_name, dataset_qpos):
         """
@@ -279,11 +301,18 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
     max_timesteps = int(max_timesteps * 1) # may increase for real-world tasks
 
-    num_rollouts = 50
+    num_rollouts = 50 if not direct_replay else min(50, num_episodes)
     episode_returns = []
     highest_rewards = []
     for rollout_id in range(num_rollouts):
         rollout_id += 0
+        ### direct replay: 本 rollout 要回放的 episode
+        replay_qpos0, replay_actions = None, None
+        if direct_replay:
+            episode_idx = (replay_episode + rollout_id) % num_episodes
+            replay_qpos0, replay_actions = load_episode_for_replay(episode_idx)
+            print(f'[direct_replay] Rollout {rollout_id} replay episode_{episode_idx}, T={len(replay_actions)}')
+
         ### set task
         if 'sim_transfer_cube' in task_name:
             BOX_POSE[0] = sample_box_pose() # used in sim reset
@@ -294,12 +323,11 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
         ts = env.reset()
 
-        # 可选：将模拟初始 qpos 覆盖为数据集中的某条轨迹起点
-        if (not real_robot) and init_qpos_from_dataset:
+        # 将模拟初始 qpos 覆盖为数据集中的某条轨迹起点（init_qpos_from_dataset 随机一条；direct_replay 用当前回放的那条）
+        if not real_robot and (init_qpos_from_dataset or direct_replay):
             try:
-                dataset_qpos0 = sample_dataset_start_qpos()
+                dataset_qpos0 = replay_qpos0 if direct_replay else sample_dataset_start_qpos()
                 overwrite_sim_qpos_from_dataset(env, task_name, dataset_qpos0)
-                # 使用新的物理状态重新生成观测，替换当前 ts.observation
                 new_obs = env._task.get_observation(env._physics)
                 ts = ts._replace(observation=new_obs)
                 print("Initialized sim qpos from dataset start qpos.")
@@ -313,7 +341,8 @@ def eval_bc(config, ckpt_name, save_episode=True):
             plt.ion()
 
         ### evaluation loop
-        if temporal_agg:
+        steps_this_rollout = min(max_timesteps, replay_actions.shape[0]) if direct_replay else max_timesteps
+        if temporal_agg and not direct_replay:
             all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim]).cuda()
 
         qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
@@ -322,7 +351,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
         target_qpos_list = []
         rewards = []
         with torch.inference_mode():
-            for t in range(max_timesteps):
+            for t in range(steps_this_rollout):
                 ### update onscreen render and wait for DT
                 if onscreen_render:
                     image = env._physics.render(height=480, width=640, camera_id=onscreen_cam)
@@ -336,45 +365,43 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 else:
                     image_list.append({'main': obs['image']})
                 qpos_numpy = np.array(obs['qpos'])
-                # 环境可能返回 hand+object（如 dex 29 维），而 stats 与 policy 使用 state_dim（如 22 维），只取前 state_dim 维
                 qpos_numpy = qpos_numpy[:state_dim]
-                qpos = pre_process(qpos_numpy)
-                qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
-                qpos_history[:, t] = qpos
-                curr_image = get_image(ts, camera_names)
-
-                ### query policy
-                if config['policy_class'] == "ACT":
-                    if t % query_frequency == 0:  # 每隔多少步重算一个 chunk
-                        all_actions = policy(qpos, curr_image)
-                    if temporal_agg:
-                        all_time_actions[[t], t:t+num_queries] = all_actions
-                        actions_for_curr_step = all_time_actions[:, t]
-                        actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
-                        actions_for_curr_step = actions_for_curr_step[actions_populated]
-                        k = 0.01
-                        exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
-                        exp_weights = exp_weights / exp_weights.sum()
-                        exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
-                        raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
-                    else:
-                        raw_action = all_actions[:, t % query_frequency]
-                elif config['policy_class'] == "CNNMLP":
-                    raw_action = policy(qpos, curr_image)
-                else:
-                    raise NotImplementedError
-
-                ### post-process actions
-                raw_action = raw_action.squeeze(0).cpu().numpy()
-                action = post_process(raw_action)
-                target_qpos = action
-
-                ### step the environment
-                ts = env.step(target_qpos)
-
-                ### for visualization
                 qpos_list.append(qpos_numpy)
+                if not direct_replay:
+                    qpos = pre_process(qpos_numpy)
+                    qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
+                    qpos_history[:, t] = qpos
+                    curr_image = get_image(ts, camera_names)
+
+                ### 动作来源：direct_replay 用数据集里的 action[t]，否则用 policy 输出
+                if direct_replay:
+                    target_qpos = np.asarray(replay_actions[t], dtype=np.float64)
+                else:
+                    ### query policy
+                    if config['policy_class'] == "ACT":
+                        if t % query_frequency == 0:
+                            all_actions = policy(qpos, curr_image)
+                        if temporal_agg:
+                            all_time_actions[[t], t:t+num_queries] = all_actions
+                            actions_for_curr_step = all_time_actions[:, t]
+                            actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
+                            actions_for_curr_step = actions_for_curr_step[actions_populated]
+                            k = 0.01
+                            exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
+                            exp_weights = exp_weights / exp_weights.sum()
+                            exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
+                            raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
+                        else:
+                            raw_action = all_actions[:, t % query_frequency]
+                    elif config['policy_class'] == "CNNMLP":
+                        raw_action = policy(qpos, curr_image)
+                    else:
+                        raise NotImplementedError
+                    raw_action = raw_action.squeeze(0).cpu().numpy()
+                    target_qpos = post_process(raw_action)
+
                 target_qpos_list.append(target_qpos)
+                ts = env.step(target_qpos)
                 rewards.append(ts.reward)
 
             plt.close()
@@ -391,6 +418,10 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
         if save_episode:
             save_videos(image_list, DT, video_path=os.path.join(ckpt_dir, f'video{rollout_id}.mp4'))
+            # 记录并可视化关节角度：state vs command
+            plot_path = os.path.join(ckpt_dir, f'video{rollout_id}_qpos.png')
+            visualize_joints(qpos_list, target_qpos_list, plot_path=plot_path,
+                             label_overwrite=('State', 'Command'))
 
     success_rate = np.mean(np.array(highest_rewards) == env_max_reward)
     avg_return = np.mean(episode_returns)
@@ -519,6 +550,10 @@ if __name__ == '__main__':
     parser.add_argument('--onscreen_render', action='store_true')
     parser.add_argument('--init_qpos_from_dataset', action='store_true',
                         help='在 eval（模拟环境）时，用数据集中随机一条轨迹的起始 qpos 覆盖模拟环境初始姿态')
+    parser.add_argument('--direct_replay', action='store_true',
+                        help='eval 时用数据集中某条轨迹的 action 序列直接控制 sim，不跑 policy；会同时用该条轨迹的 qpos[0] 初始化')
+    parser.add_argument('--replay_episode', type=int, default=0,
+                        help='direct_replay 时从第几条轨迹开始回放（rollout i 回放 episode replay_episode+i）')
     parser.add_argument('--ckpt_dir', action='store', type=str, help='ckpt_dir', required=True)
     parser.add_argument('--policy_class', action='store', type=str, help='policy_class, capitalize', required=True)
     parser.add_argument('--task_name', action='store', type=str, help='task_name', required=True)
@@ -533,5 +568,6 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
-    
+
+    breakpoint()
     main(vars(parser.parse_args()))

@@ -65,7 +65,9 @@ def get_args_parser():
     parser.add_argument('--temporal_agg', action='store_true')
     parser.add_argument('--init_qpos_from_dataset', action='store_true',
                         help='在 eval（模拟环境）时，用数据集中随机一条轨迹的起始 qpos 覆盖模拟环境初始姿态')
-
+    parser.add_argument('--direct_replay', action='store_true',
+                        help='在 eval（模拟环境）时，用数据集中指定轨迹的 action 序列直接控制 sim，不跑 policy')
+    parser.add_argument('--replay_episode', action='store', type=int, help='replay_episode', required=False)
     return parser
 
 
@@ -113,4 +115,3 @@ def build_CNNMLP_model_and_optimizer(args_override):
                                   weight_decay=args.weight_decay)
 
     return model, optimizer
-
