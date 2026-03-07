@@ -283,6 +283,8 @@ def eval_bc(config, ckpt_name, save_episode=True):
             # 未知的 sim 任务，不做覆盖
             return
 
+    max_timesteps = int(max_timesteps * 5) # may increase for real-world tasks
+
     # load environment
     if real_robot:
         from aloha_scripts.robot_utils import move_grippers # requires aloha
@@ -291,15 +293,13 @@ def eval_bc(config, ckpt_name, save_episode=True):
         env_max_reward = 0
     else:
         from sim_env import make_sim_env
-        env = make_sim_env(task_name)
+        env = make_sim_env(task_name, time_limit=max_timesteps*DT)
         env_max_reward = env.task.max_reward
 
     query_frequency = policy_config['num_queries']
     if temporal_agg:
         query_frequency = 1
         num_queries = policy_config['num_queries']
-
-    max_timesteps = int(max_timesteps * 1) # may increase for real-world tasks
 
     num_rollouts = 50 if not direct_replay else min(50, num_episodes)
     episode_returns = []
