@@ -1,0 +1,23 @@
+# Hydra config for imitate_episodes training (defaults)
+# Override from CLI: python imitate_episodes.py num_epochs=3000 lr=5e-6
+
+defaults: []
+
+hydra:
+  run:
+    dir: .
+
+task_name: sim_dexgrasp_cube_teleop
+policy_class: ACT
+
+# Training
+batch_size: 16
+num_epochs: 2000
+lr: 1.0e-5
+seed: 0
+
+# ACT policy
+kl_weight: 1
+chunk_size: 100
+hidden_dim: 512
+dim_feedforward: 3200

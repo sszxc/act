@@ -3,11 +3,16 @@ import os
 if 'MUJOCO_GL' not in os.environ:
     os.environ['MUJOCO_GL'] = 'egl'  # 有 GPU 用 egl；无 GPU 可改为 'osmesa'
 
+import sys
+import shutil
 import torch
 import numpy as np
 import pickle
 import argparse
 import matplotlib.pyplot as plt
+from omegaconf import OmegaConf
+import hydra
+from hydra.core.hydra_config import HydraConfig
 from copy import deepcopy
 from tqdm import tqdm
 from einops import rearrange
@@ -26,7 +31,32 @@ from sim_env import BOX_POSE, DEX_OBJECT_POSE, sample_dex_object_pose
 import IPython
 e = IPython.embed
 
-def main(args):
+
+def _save_hydra_config_to_dir(hydra_cfg, output_dir: str) -> None:
+    """
+    将 Hydra 的 config（含插值解析版本）保存到指定结果目录，并尽量复制当前运行目录下的 .hydra 目录。
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 1) 保存用户配置（原始 & resolve 后）
+    OmegaConf.save(hydra_cfg, os.path.join(output_dir, "config_hydra.yaml"))
+    OmegaConf.save(hydra_cfg, os.path.join(output_dir, "config_hydra_resolved.yaml"), resolve=True)
+
+    # 2) 保存 Hydra 运行时信息（不保证一定可用）
+    try:
+        runtime_cfg = HydraConfig.get()
+        OmegaConf.save(runtime_cfg, os.path.join(output_dir, "hydra_runtime.yaml"), resolve=True)
+    except Exception:
+        pass
+
+    # 3) 复制当前工作目录下的 .hydra（如果存在）
+    src_hydra_dir = os.path.join(os.getcwd(), ".hydra")
+    if os.path.isdir(src_hydra_dir):
+        dst_hydra_dir = os.path.join(output_dir, ".hydra")
+        shutil.copytree(src_hydra_dir, dst_hydra_dir, dirs_exist_ok=True)
+
+
+def train_or_eval(args, hydra_cfg=None):
     set_seed(1)
     # command line parameters
     is_eval = args['eval']
@@ -123,6 +153,11 @@ def main(args):
             f'ckpt_dir already exists: {ckpt_dir}. Refusing to overwrite in train mode.'
         )
 
+    # 训练开始：先创建结果目录并保存 Hydra 配置
+    os.makedirs(ckpt_dir, exist_ok=False)
+    if hydra_cfg is not None:
+        _save_hydra_config_to_dir(hydra_cfg, ckpt_dir)
+
     train_dataloader, val_dataloader, stats, _ = load_data(
         dataset_dir,
         num_episodes,
@@ -134,8 +169,6 @@ def main(args):
     )
 
     # save dataset stats
-    if not os.path.isdir(ckpt_dir):
-        os.makedirs(ckpt_dir)
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
     with open(stats_path, 'wb') as f:
         pickle.dump(stats, f)
@@ -574,7 +607,11 @@ def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
     print(f'Saved plots to {ckpt_dir}')
 
 
-if __name__ == '__main__':
+# Eval args are parsed before Hydra; ckpt_dir is always CLI-provided.
+_EVAL_ARGS = None
+
+
+def _parse_eval_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--onscreen_render', action='store_true')
@@ -584,20 +621,29 @@ if __name__ == '__main__':
                         help='eval 时用数据集中某条轨迹的 action 序列直接控制 sim，不跑 policy；会同时用该条轨迹的 qpos[0] 初始化')
     parser.add_argument('--replay_episode', type=int, default=0,
                         help='direct_replay 时从第几条轨迹开始回放（rollout i 回放 episode replay_episode+i）')
-    parser.add_argument('--ckpt_dir', action='store', type=str, help='ckpt_dir', required=True)
-    parser.add_argument('--policy_class', action='store', type=str, help='policy_class, capitalize', required=True)
-    parser.add_argument('--task_name', action='store', type=str, help='task_name', required=True)
-    parser.add_argument('--batch_size', action='store', type=int, help='batch_size', required=True)
-    parser.add_argument('--seed', action='store', type=int, help='seed', required=True)
-    parser.add_argument('--num_epochs', action='store', type=int, help='num_epochs', required=True)
-    parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
+    parser.add_argument('--temporal_agg', action='store_true',
+                        help='eval 时使用 temporal aggregation 平滑 ACT 输出')
+    parser.add_argument('--ckpt_dir', type=str, required=True,
+                        help='checkpoint dir (required; provided via CLI only)')
+    eval_args, unknown = parser.parse_known_args()
+    return eval_args, unknown
 
-    # for ACT
-    parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
-    parser.add_argument('--chunk_size', action='store', type=int, help='chunk_size', required=False)
-    parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
-    parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
-    parser.add_argument('--temporal_agg', action='store_true')
 
-    breakpoint()
-    main(vars(parser.parse_args()))
+@hydra.main(config_path='config', config_name='config', version_base=None)
+def main(cfg):
+    global _EVAL_ARGS
+    args_dict = OmegaConf.to_container(cfg, resolve=True)
+    args_dict['eval'] = _EVAL_ARGS.eval
+    args_dict['onscreen_render'] = _EVAL_ARGS.onscreen_render
+    args_dict['init_qpos_from_dataset'] = _EVAL_ARGS.init_qpos_from_dataset
+    args_dict['direct_replay'] = _EVAL_ARGS.direct_replay
+    args_dict['replay_episode'] = _EVAL_ARGS.replay_episode
+    args_dict['temporal_agg'] = _EVAL_ARGS.temporal_agg
+    args_dict['ckpt_dir'] = _EVAL_ARGS.ckpt_dir
+    train_or_eval(args_dict, hydra_cfg=cfg)
+
+
+if __name__ == '__main__':
+    _EVAL_ARGS, unknown = _parse_eval_args()
+    sys.argv = [sys.argv[0]] + unknown
+    main()
