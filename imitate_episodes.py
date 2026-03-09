@@ -13,7 +13,7 @@ from tqdm import tqdm
 from einops import rearrange
 import h5py
 
-from constants import DT, DEFAULT_STATE_DIM
+from constants import DT, DEFAULT_STATE_DIM, ROOT_DIM, STATE_DIM_DEX
 from constants import PUPPET_GRIPPER_JOINT_OPEN, PUPPET_GRIPPER_POSITION_UNNORMALIZE_FN
 from utils import load_data # data functions
 from utils import sample_box_pose, sample_insertion_pose # robot functions
@@ -51,6 +51,7 @@ def main(args):
     episode_len = task_config['episode_len']
     camera_names = task_config['camera_names']
     state_dim = task_config.get('state_dim', DEFAULT_STATE_DIM)
+    action_dim = task_config.get('action_dim', state_dim)
 
     # fixed parameters
     lr_backbone = 1e-5
@@ -71,10 +72,11 @@ def main(args):
                          'nheads': nheads,
                          'camera_names': camera_names,
                          'state_dim': state_dim,
+                         'action_dim': action_dim,
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
-                         'camera_names': camera_names, 'state_dim': state_dim,}
+                         'camera_names': camera_names, 'state_dim': state_dim, 'action_dim': action_dim,}
     else:
         raise NotImplementedError
 
@@ -83,6 +85,7 @@ def main(args):
         'ckpt_dir': ckpt_dir,
         'episode_len': episode_len,
         'state_dim': state_dim,
+        'action_dim': action_dim,
         'lr': args['lr'],
         'policy_class': policy_class,
         'onscreen_render': onscreen_render,
@@ -114,6 +117,12 @@ def main(args):
         print()
         exit()
 
+    # train 模式：若 ckpt_dir 已存在则报错，避免覆盖
+    if os.path.exists(ckpt_dir):
+        raise FileExistsError(
+            f'ckpt_dir already exists: {ckpt_dir}. Refusing to overwrite in train mode.'
+        )
+
     train_dataloader, val_dataloader, stats, _ = load_data(
         dataset_dir,
         num_episodes,
@@ -121,6 +130,7 @@ def main(args):
         batch_size_train,
         batch_size_val,
         num_queries=policy_config['num_queries'],
+        task_name=task_name,
     )
 
     # save dataset stats
@@ -129,6 +139,11 @@ def main(args):
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
     with open(stats_path, 'wb') as f:
         pickle.dump(stats, f)
+    if 'pca' in stats:
+        pca_path = os.path.join(ckpt_dir, 'pca.pkl')
+        with open(pca_path, 'wb') as f:
+            pickle.dump(stats['pca'], f)
+        print(f'Saved PCA to {pca_path}')
 
     best_ckpt_info = train_bc(train_dataloader, val_dataloader, config)
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
@@ -173,6 +188,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
     set_seed(1000)
     ckpt_dir = config['ckpt_dir']
     state_dim = config['state_dim']
+    action_dim = config.get('action_dim', state_dim)
     real_robot = config['real_robot']
     policy_class = config['policy_class']
     onscreen_render = config['onscreen_render']
@@ -187,6 +203,8 @@ def eval_bc(config, ckpt_name, save_episode=True):
     direct_replay = config.get('direct_replay', False)
     replay_episode = config.get('replay_episode', 0)
     onscreen_cam = 'default_cam' if 'dex' in task_name else 'angle'
+
+    use_pca_action = ('dex' in task_name and action_dim < STATE_DIM_DEX and not direct_replay)
 
     if direct_replay and real_robot:
         raise ValueError('direct_replay 仅支持 sim 环境，不能用于 real_robot。')
@@ -208,6 +226,13 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
     pre_process = lambda s_qpos: (s_qpos - stats['qpos_mean']) / stats['qpos_std']
     post_process = lambda a: a * stats['action_std'] + stats['action_mean']
+
+    pca = None
+    if use_pca_action:
+        pca_path = os.path.join(ckpt_dir, 'pca.pkl')
+        with open(pca_path, 'rb') as f:
+            pca = pickle.load(f)
+        print(f'Loaded PCA from {pca_path} for action inverse transform')
 
     def sample_dataset_start_qpos():
         """
@@ -343,7 +368,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
         ### evaluation loop
         steps_this_rollout = min(max_timesteps, replay_actions.shape[0]) if direct_replay else max_timesteps
         if temporal_agg and not direct_replay:
-            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim]).cuda()
+            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, action_dim]).cuda()
 
         qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
         image_list = [] # for visualization
@@ -399,6 +424,11 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         raise NotImplementedError
                     raw_action = raw_action.squeeze(0).cpu().numpy()
                     target_qpos = post_process(raw_action)
+                    if use_pca_action and pca is not None:
+                        root_6 = target_qpos[:ROOT_DIM]
+                        finger_pcs = target_qpos[ROOT_DIM:].reshape(1, -1)
+                        finger_16 = pca.inverse_transform(finger_pcs).squeeze(0)
+                        target_qpos = np.concatenate([root_6, finger_16]).astype(np.float64)
 
                 target_qpos_list.append(target_qpos)
                 ts = env.step(target_qpos)

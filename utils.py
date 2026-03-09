@@ -3,6 +3,9 @@ import torch
 import os
 import h5py
 from torch.utils.data import TensorDataset, DataLoader
+from sklearn.decomposition import PCA
+
+from constants import ROOT_DIM, FINGER_DIM
 
 import IPython
 e = IPython.embed
@@ -113,24 +116,156 @@ def get_norm_stats(dataset_dir, num_episodes):
     return stats
 
 
-def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, num_queries):
+def fit_finger_pca(dataset_dir, num_episodes, n_components=3):
+    """Collect finger action (indices 6:22) from all episodes and fit PCA."""
+    finger_data = []
+    for episode_idx in range(num_episodes):
+        dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}.hdf5')
+        with h5py.File(dataset_path, 'r') as root:
+            action = root['/action'][()]  # (T, 22)
+        finger_data.append(action[:, ROOT_DIM:ROOT_DIM + FINGER_DIM])
+    finger_data = np.concatenate(finger_data, axis=0).astype(np.float64)
+    pca = PCA(n_components=n_components)
+    pca.fit(finger_data)
+    return pca
+
+
+def get_norm_stats_with_pca(dataset_dir, num_episodes, pca_finger_dim):
+    """Get norm_stats on PCA-transformed action (root 6 + finger PCs) and return PCA object."""
+    pca = fit_finger_pca(dataset_dir, num_episodes, n_components=pca_finger_dim)
+    all_qpos_data = []
+    all_action_transformed = []
+    for episode_idx in range(num_episodes):
+        dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}.hdf5')
+        with h5py.File(dataset_path, 'r') as root:
+            qpos = root['/observations/qpos'][()]
+            action = root['/action'][()]  # (T, 22)
+        root_6 = action[:, :ROOT_DIM]
+        finger_pcs = pca.transform(action[:, ROOT_DIM:ROOT_DIM + FINGER_DIM])
+        action_transformed = np.concatenate([root_6, finger_pcs], axis=1)
+        all_qpos_data.append(torch.from_numpy(qpos))
+        all_action_transformed.append(torch.from_numpy(action_transformed.astype(np.float32)))
+    all_qpos_data = torch.cat(all_qpos_data, dim=0)
+    all_action_transformed = torch.cat(all_action_transformed, dim=0)
+
+    action_mean = all_action_transformed.mean(dim=0, keepdim=True)
+    action_std = all_action_transformed.std(dim=0, keepdim=True)
+    action_std = torch.clip(action_std, 1e-2, np.inf)
+    qpos_mean = all_qpos_data.mean(dim=0, keepdim=True)
+    qpos_std = all_qpos_data.std(dim=0, keepdim=True)
+    qpos_std = torch.clip(qpos_std, 1e-2, np.inf)
+
+    norm_stats = {
+        "action_mean": action_mean.numpy().squeeze(),
+        "action_std": action_std.numpy().squeeze(),
+        "qpos_mean": qpos_mean.numpy().squeeze(),
+        "qpos_std": qpos_std.numpy().squeeze(),
+        "example_qpos": all_qpos_data[0].numpy(),
+    }
+    return norm_stats, pca
+
+
+class EpisodicDatasetPCA(torch.utils.data.Dataset):
+    """Like EpisodicDataset but transforms 22d action to root 6 + finger PCs via PCA."""
+
+    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, num_queries, pca, pca_finger_dim):
+        super(EpisodicDatasetPCA).__init__()
+        self.episode_ids = episode_ids
+        self.dataset_dir = dataset_dir
+        self.camera_names = camera_names
+        self.norm_stats = norm_stats
+        self.num_queries = int(num_queries)
+        self.pca = pca
+        self.pca_finger_dim = pca_finger_dim
+        self.action_dim_out = ROOT_DIM + pca_finger_dim
+        self.is_sim = None
+        self.__getitem__(0)
+
+    def __len__(self):
+        return len(self.episode_ids)
+
+    def __getitem__(self, index):
+        sample_full_episode = False
+        episode_id = self.episode_ids[index]
+        dataset_path = os.path.join(self.dataset_dir, f'episode_{episode_id}.hdf5')
+        with h5py.File(dataset_path, 'r') as root:
+            is_sim = root.attrs['sim']
+            original_action_shape = root['/action'].shape
+            episode_len = int(original_action_shape[0])
+            if sample_full_episode:
+                start_ts = 0
+            else:
+                start_ts = np.random.choice(episode_len)
+            qpos = root['/observations/qpos'][start_ts]
+            qvel = root['/observations/qvel'][start_ts]
+            image_dict = dict()
+            for cam_name in self.camera_names:
+                image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start_ts]
+            if is_sim:
+                action_start_ts = start_ts
+            else:
+                action_start_ts = max(0, start_ts - 1)
+            action_end_ts = min(episode_len, action_start_ts + self.num_queries)
+            action = root['/action'][action_start_ts:action_end_ts]  # (action_len, 22)
+            action_len = action_end_ts - action_start_ts
+
+        self.is_sim = is_sim
+        root_6 = action[:, :ROOT_DIM]
+        finger_pcs = self.pca.transform(action[:, ROOT_DIM:ROOT_DIM + FINGER_DIM])
+        action_transformed = np.concatenate([root_6, finger_pcs], axis=1).astype(np.float32)
+        padded_action = np.zeros((self.num_queries, self.action_dim_out), dtype=np.float32)
+        padded_action[:action_len] = action_transformed
+        is_pad = np.zeros(self.num_queries, dtype=np.float32)
+        is_pad[action_len:] = 1
+
+        all_cam_images = []
+        for cam_name in self.camera_names:
+            all_cam_images.append(image_dict[cam_name])
+        all_cam_images = np.stack(all_cam_images, axis=0)
+
+        image_data = torch.from_numpy(all_cam_images)
+        qpos_data = torch.from_numpy(qpos).float()
+        action_data = torch.from_numpy(padded_action).float()
+        is_pad = torch.from_numpy(is_pad).bool()
+
+        image_data = torch.einsum('k h w c -> k c h w', image_data)
+        image_data = (image_data / 255.0).float()
+        action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
+        qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
+        action_data = action_data.float()
+        qpos_data = qpos_data.float()
+
+        return image_data, qpos_data, action_data, is_pad
+
+
+def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, num_queries, task_name=None):
     print(f'\nData from: {dataset_dir}\n')
-    # obtain train test split
     train_ratio = 0.8
     shuffled_indices = np.random.permutation(num_episodes)
     train_indices = shuffled_indices[:int(train_ratio * num_episodes)]
     val_indices = shuffled_indices[int(train_ratio * num_episodes):]
 
-    # obtain normalization stats for qpos and action
-    norm_stats = get_norm_stats(dataset_dir, num_episodes)
+    if task_name == 'sim_dexgrasp_pca_cube_teleop':
+        from constants import SIM_TASK_CONFIGS
+        pca_finger_dim = SIM_TASK_CONFIGS[task_name]['pca_finger_dim']
+        norm_stats, pca = get_norm_stats_with_pca(dataset_dir, num_episodes, pca_finger_dim)
+        stats = {**norm_stats, 'pca': pca}
+        train_dataset = EpisodicDatasetPCA(
+            train_indices, dataset_dir, camera_names, norm_stats, num_queries=num_queries,
+            pca=pca, pca_finger_dim=pca_finger_dim)
+        val_dataset = EpisodicDatasetPCA(
+            val_indices, dataset_dir, camera_names, norm_stats, num_queries=num_queries,
+            pca=pca, pca_finger_dim=pca_finger_dim)
+    else:
+        norm_stats = get_norm_stats(dataset_dir, num_episodes)
+        stats = norm_stats
+        train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, num_queries=num_queries)
+        val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats, num_queries=num_queries)
 
-    # construct dataset and dataloader
-    train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, num_queries=num_queries)
-    val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats, num_queries=num_queries)
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
 
-    return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim
+    return train_dataloader, val_dataloader, stats, train_dataset.is_sim
 
 
 ### env utils
