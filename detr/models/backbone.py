@@ -18,6 +18,7 @@ from .position_encoding import build_position_encoding
 import IPython
 e = IPython.embed
 
+
 class FrozenBatchNorm2d(torch.nn.Module):
     """
     BatchNorm2d where the batch statistics and the affine parameters are fixed.
@@ -89,9 +90,40 @@ class Backbone(BackboneBase):
                  train_backbone: bool,
                  return_interm_layers: bool,
                  dilation: bool):
-        backbone = getattr(torchvision.models, name)(
+        model_fn = getattr(torchvision.models, name)
+        download_pretrained = is_main_process()
+
+        kwargs = dict(
             replace_stride_with_dilation=[False, False, dilation],
-            pretrained=is_main_process(), norm_layer=FrozenBatchNorm2d) # pretrained # TODO do we want frozen batch_norm??
+            norm_layer=FrozenBatchNorm2d,
+        )
+
+        # torchvision>=0.13: `pretrained` is deprecated in favor of `weights`
+        if download_pretrained:
+            weights_enum_name = {
+                "resnet18": "ResNet18_Weights",
+                "resnet34": "ResNet34_Weights",
+                "resnet50": "ResNet50_Weights",
+                "resnet101": "ResNet101_Weights",
+                "resnet152": "ResNet152_Weights",
+            }.get(name)
+            weights_enum = getattr(torchvision.models, weights_enum_name, None) if weights_enum_name else None
+            if weights_enum is not None:
+                # Match the legacy `pretrained=True` behavior as closely as possible.
+                kwargs["weights"] = getattr(weights_enum, "IMAGENET1K_V1", weights_enum.DEFAULT)
+            else:
+                kwargs["pretrained"] = True
+        else:
+            # Avoid redundant downloads on non-main processes in distributed setups.
+            kwargs["weights"] = None
+
+        try:
+            backbone = model_fn(**kwargs)
+        except TypeError:
+            # Fallback for older torchvision versions that don't support `weights`.
+            kwargs.pop("weights", None)
+            kwargs["pretrained"] = download_pretrained
+            backbone = model_fn(**kwargs)
         num_channels = 512 if name in ('resnet18', 'resnet34') else 2048
         super().__init__(backbone, train_backbone, num_channels, return_interm_layers)
 
