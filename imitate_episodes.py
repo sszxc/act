@@ -5,6 +5,8 @@ if 'MUJOCO_GL' not in os.environ:
 
 import sys
 import shutil
+import json
+from datetime import datetime
 import torch
 import numpy as np
 import pickle
@@ -57,7 +59,8 @@ def _save_hydra_config_to_dir(hydra_cfg, output_dir: str) -> None:
 
 
 def train_or_eval(args, hydra_cfg=None):
-    set_seed(1)
+    # 根据配置中的 seed 统一设置随机种子（影响 numpy / torch 以及数据划分等）
+    set_seed(args['seed'])
     # command line parameters
     is_eval = args['eval']
     ckpt_dir = args['ckpt_dir']
@@ -136,15 +139,60 @@ def train_or_eval(args, hydra_cfg=None):
     }
 
     if is_eval:
+        # 为本次 eval 创建独立子目录：eval+时间戳
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        eval_dir_name = f"eval_{timestamp}"
+        eval_dir = os.path.join(ckpt_dir, eval_dir_name)
+        os.makedirs(eval_dir, exist_ok=False)
+
+        # 保存本次 eval 使用的 config 参数，便于之后复现
+        eval_config_path = os.path.join(eval_dir, "eval_config.yaml")
+        OmegaConf.save(OmegaConf.create(config), eval_config_path)
+
+        # 简单的 logger：既打印到 stdout，也写入 log 文件
+        log_path = os.path.join(eval_dir, "eval.log")
+        log_file = open(log_path, "w")
+
+        def _log(msg: str):
+            print(msg)
+            print(msg, file=log_file)
+            log_file.flush()
+
         ckpt_names = [f'policy_best.ckpt']
         results = []
         for ckpt_name in ckpt_names:
-            success_rate, avg_return = eval_bc(config, ckpt_name, save_episode=True)
+            success_rate, avg_return = eval_bc(
+                config,
+                ckpt_name,
+                save_episode=True,
+                output_dir=eval_dir,
+                logger=_log,
+            )
             results.append([ckpt_name, success_rate, avg_return])
 
         for ckpt_name, success_rate, avg_return in results:
-            print(f'{ckpt_name}: {success_rate=} {avg_return=}')
-        print()
+            _log(f'{ckpt_name}: {success_rate=} {avg_return=}')
+        _log("")  # 换行
+
+        # 额外保存一个 json，总结成功率等指标
+        summary_json = {
+            "ckpt_dir": ckpt_dir,
+            "eval_dir": eval_dir,
+            "results": [
+                {
+                    "ckpt_name": ckpt_name,
+                    "success_rate": float(success_rate),
+                    "avg_return": float(avg_return),
+                }
+                for ckpt_name, success_rate, avg_return in results
+            ],
+        }
+        summary_json_path = os.path.join(eval_dir, "eval_summary.json")
+        with open(summary_json_path, "w") as f:
+            json.dump(summary_json, f, indent=2)
+        _log(f"Saved eval summary to {summary_json_path}")
+
+        log_file.close()
         exit()
 
     # train 模式：若 ckpt_dir 已存在则报错，避免覆盖
@@ -217,8 +265,9 @@ def get_image(ts, camera_names):
     return curr_image
 
 
-def eval_bc(config, ckpt_name, save_episode=True):
-    set_seed(1000)
+def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print):
+    # eval 阶段也使用同一个 seed，保证可复现；如需单独 eval seed，可在 config 中扩展
+    set_seed(config.get('seed', 0))
     ckpt_dir = config['ckpt_dir']
     state_dim = config['state_dim']
     action_dim = config.get('action_dim', state_dim)
@@ -245,14 +294,18 @@ def eval_bc(config, ckpt_name, save_episode=True):
         assert dataset_dir is not None and num_episodes is not None, \
             "direct_replay 需要 dataset_dir 和 num_episodes。"
 
+    # 若未显式指定 output_dir，则默认仍写入 ckpt_dir（兼容旧逻辑）
+    if output_dir is None:
+        output_dir = ckpt_dir
+
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     policy = make_policy(policy_class, policy_config)
     loading_status = policy.load_state_dict(torch.load(ckpt_path))
-    print(loading_status)
+    logger(loading_status)
     policy.cuda()
     policy.eval()
-    print(f'Loaded: {ckpt_path}')
+    logger(f'Loaded: {ckpt_path}')
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
     with open(stats_path, 'rb') as f:
         stats = pickle.load(f)
@@ -265,7 +318,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
         pca_path = os.path.join(ckpt_dir, 'pca.pkl')
         with open(pca_path, 'rb') as f:
             pca = pickle.load(f)
-        print(f'Loaded PCA from {pca_path} for action inverse transform')
+        logger(f'Loaded PCA from {pca_path} for action inverse transform')
 
     def sample_dataset_start_qpos():
         """
@@ -369,7 +422,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
         if direct_replay:
             episode_idx = (replay_episode + rollout_id) % num_episodes
             replay_qpos0, replay_actions = load_episode_for_replay(episode_idx)
-            print(f'[direct_replay] Rollout {rollout_id} replay episode_{episode_idx}, T={len(replay_actions)}')
+            logger(f'[direct_replay] Rollout {rollout_id} replay episode_{episode_idx}, T={len(replay_actions)}')
 
         ### set task
         if 'sim_transfer_cube' in task_name:
@@ -388,9 +441,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 overwrite_sim_qpos_from_dataset(env, task_name, dataset_qpos0)
                 new_obs = env._task.get_observation(env._physics)
                 ts = ts._replace(observation=new_obs)
-                print("Initialized sim qpos from dataset start qpos.")
+                logger("Initialized sim qpos from dataset start qpos.")
             except Exception as ex:
-                print(f"[WARN] 初始化 qpos 从数据集失败，使用默认初始化. error={ex}")
+                logger(f"[WARN] 初始化 qpos 从数据集失败，使用默认初始化. error={ex}")
 
         ### onscreen render
         if onscreen_render:
@@ -408,8 +461,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
         qpos_list = []
         target_qpos_list = []
         rewards = []
+        # 每个 rollout 内部的 step 进度条
         with torch.inference_mode():
-            for t in range(steps_this_rollout):
+            for t in tqdm(range(steps_this_rollout), desc=f"Rollout {rollout_id} steps", leave=False):
                 ### update onscreen render and wait for DT
                 if onscreen_render:
                     image = env._physics.render(height=480, width=640, camera_id=onscreen_cam)
@@ -477,12 +531,12 @@ def eval_bc(config, ckpt_name, save_episode=True):
         episode_returns.append(episode_return)
         episode_highest_reward = np.max(rewards[rewards!=None])
         highest_rewards.append(episode_highest_reward)
-        print(f'Rollout {rollout_id}\n{episode_return=}, {episode_highest_reward=}, {env_max_reward=}, Success: {episode_highest_reward==env_max_reward}')
+        logger(f'Rollout {rollout_id}\n{episode_return=}, {episode_highest_reward=}, {env_max_reward=}, Success: {episode_highest_reward==env_max_reward}')
 
         if save_episode:
-            save_videos(image_list, DT, video_path=os.path.join(ckpt_dir, f'video{rollout_id}.mp4'))
+            save_videos(image_list, DT, video_path=os.path.join(output_dir, f'video{rollout_id}.mp4'))
             # 记录并可视化关节角度：state vs command
-            plot_path = os.path.join(ckpt_dir, f'video{rollout_id}_qpos.png')
+            plot_path = os.path.join(output_dir, f'video{rollout_id}_qpos.png')
             visualize_joints(qpos_list, target_qpos_list, plot_path=plot_path,
                              label_overwrite=('State', 'Command'))
 
@@ -494,11 +548,11 @@ def eval_bc(config, ckpt_name, save_episode=True):
         more_or_equal_r_rate = more_or_equal_r / num_rollouts
         summary_str += f'Reward >= {r}: {more_or_equal_r}/{num_rollouts} = {more_or_equal_r_rate*100}%\n'
 
-    print(summary_str)
+    logger(summary_str)
 
-    # save success rate to txt
+    # save success rate and returns to txt
     result_file_name = 'result_' + ckpt_name.split('.')[0] + '.txt'
-    with open(os.path.join(ckpt_dir, result_file_name), 'w') as f:
+    with open(os.path.join(output_dir, result_file_name), 'w') as f:
         f.write(summary_str)
         f.write(repr(episode_returns))
         f.write('\n\n')
@@ -571,7 +625,7 @@ def train_bc(train_dataloader, val_dataloader, config):
             summary_string += f'{k}: {v.item():.3f} '
         print(summary_string)
 
-        if epoch % 100 == 0:
+        if epoch % 500 == 0:
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
             torch.save(policy.state_dict(), ckpt_path)
             plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
