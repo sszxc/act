@@ -98,6 +98,7 @@ def train_or_eval(args, hydra_cfg=None):
                          'kl_weight': args['kl_weight'],
                          'hidden_dim': args['hidden_dim'],
                          'dim_feedforward': args['dim_feedforward'],
+                         'latent_z_dim': args['latent_z_dim'],
                          'lr_backbone': lr_backbone,
                          'backbone': backbone,
                          'enc_layers': enc_layers,

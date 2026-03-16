@@ -28,6 +28,7 @@ DETR_DEFAULTS = {
     'camera_names': [],
     'state_dim': 14,
     'action_dim': None,
+    'latent_z_dim': 32,
 }
 
 
