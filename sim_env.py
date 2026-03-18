@@ -29,8 +29,15 @@ def sample_dex_object_pose():
     z_range = [0.03, 0.05]
     ranges = np.vstack([x_range, y_range, z_range])
     pos = np.random.uniform(ranges[:, 0], ranges[:, 1])
-    quat = np.array([1.0, 0.0, 0.0, 0.0])  # w,x,y,z
-    return np.concatenate([pos, quat]).astype(np.float64)
+    # Uniform random rotation on SO(3) (Haar measure), not naive Euler-angle sampling.
+    # Reference construction: Shoemake 1992.
+    u1, u2, u3 = np.random.uniform(0.0, 1.0, size=(3,))
+    qx = np.sqrt(1.0 - u1) * np.sin(2.0 * np.pi * u2)
+    qy = np.sqrt(1.0 - u1) * np.cos(2.0 * np.pi * u2)
+    qz = np.sqrt(u1) * np.sin(2.0 * np.pi * u3)
+    qw = np.sqrt(u1) * np.cos(2.0 * np.pi * u3)
+    quat_wxyz = np.array([qw, qx, qy, qz], dtype=np.float64)
+    return np.concatenate([pos.astype(np.float64), quat_wxyz])
 
 def make_sim_env(task_name, time_limit=20):
     """

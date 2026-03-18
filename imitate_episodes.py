@@ -1,4 +1,5 @@
 import os
+import time
 # 无显示器时使用离屏渲染，避免 "OpenGL platform library has not been loaded" 错误
 if 'MUJOCO_GL' not in os.environ:
     os.environ['MUJOCO_GL'] = 'egl'  # 有 GPU 用 egl；无 GPU 可改为 'osmesa'
@@ -137,6 +138,8 @@ def train_or_eval(args, hydra_cfg=None):
         # direct replay: 用数据集中某条轨迹的 action 序列直接控制 sim，不跑 policy
         'direct_replay': args.get('direct_replay', False),
         'replay_episode': args.get('replay_episode', 0),
+        # eval 时最多保存多少条 rollout 的视频和 png；None 表示全部保存
+        'max_save_episodes': args.get('max_save_episodes', None),
     }
 
     if is_eval:
@@ -161,6 +164,8 @@ def train_or_eval(args, hydra_cfg=None):
 
         ckpt_names = [f'policy_best.ckpt']
         results = []
+
+        eval_start = time.time()
         for ckpt_name in ckpt_names:
             success_rate, avg_return = eval_bc(
                 config,
@@ -168,11 +173,14 @@ def train_or_eval(args, hydra_cfg=None):
                 save_episode=True,
                 output_dir=eval_dir,
                 logger=_log,
+                max_save_episodes=config.get('max_save_episodes', None),
             )
             results.append([ckpt_name, success_rate, avg_return])
+        eval_elapsed_sec = time.time() - eval_start
 
         for ckpt_name, success_rate, avg_return in results:
             _log(f'{ckpt_name}: {success_rate=} {avg_return=}')
+        _log(f"Total eval time: {eval_elapsed_sec:.2f} seconds")
         _log("")  # 换行
 
         # 额外保存一个 json，总结成功率等指标
@@ -187,6 +195,7 @@ def train_or_eval(args, hydra_cfg=None):
                 }
                 for ckpt_name, success_rate, avg_return in results
             ],
+            "eval_elapsed_seconds": float(eval_elapsed_sec),
         }
         summary_json_path = os.path.join(eval_dir, "eval_summary.json")
         with open(summary_json_path, "w") as f:
@@ -266,7 +275,7 @@ def get_image(ts, camera_names):
     return curr_image
 
 
-def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print):
+def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print, max_save_episodes=None):
     # eval 阶段也使用同一个 seed，保证可复现；如需单独 eval seed，可在 config 中扩展
     set_seed(config.get('seed', 0))
     ckpt_dir = config['ckpt_dir']
@@ -458,9 +467,14 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print)
             all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, action_dim]).cuda()
 
         qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
-        image_list = [] # for visualization
-        qpos_list = []
-        target_qpos_list = []
+
+        # 是否为本 rollout 保存视频/图片
+        will_save_this_rollout = save_episode and (
+            max_save_episodes is None or rollout_id < max_save_episodes
+        )
+        image_list = [] if will_save_this_rollout else None  # for visualization
+        qpos_list = [] if will_save_this_rollout else None
+        target_qpos_list = [] if will_save_this_rollout else None
         rewards = []
         # 每个 rollout 内部的 step 进度条
         with torch.inference_mode():
@@ -473,13 +487,15 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print)
 
                 ### process previous timestep to get qpos and image_list
                 obs = ts.observation
-                if 'images' in obs:
-                    image_list.append(obs['images'])
-                else:
-                    image_list.append({'main': obs['image']})
+                if will_save_this_rollout:
+                    if 'images' in obs:
+                        image_list.append(obs['images'])
+                    else:
+                        image_list.append({'main': obs['image']})
                 qpos_numpy = np.array(obs['qpos'])
                 qpos_numpy = qpos_numpy[:state_dim]
-                qpos_list.append(qpos_numpy)
+                if will_save_this_rollout:
+                    qpos_list.append(qpos_numpy)
                 if not direct_replay:
                     qpos = pre_process(qpos_numpy)
                     qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
@@ -518,7 +534,8 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print)
                         finger_16 = pca.inverse_transform(finger_pcs).squeeze(0)
                         target_qpos = np.concatenate([root_6, finger_16]).astype(np.float64)
 
-                target_qpos_list.append(target_qpos)
+                if will_save_this_rollout:
+                    target_qpos_list.append(target_qpos)
                 ts = env.step(target_qpos)
                 rewards.append(ts.reward)
 
@@ -534,7 +551,7 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print)
         highest_rewards.append(episode_highest_reward)
         logger(f'Rollout {rollout_id}\n{episode_return=}, {episode_highest_reward=}, {env_max_reward=}, Success: {episode_highest_reward==env_max_reward}')
 
-        if save_episode:
+        if will_save_this_rollout:
             save_videos(image_list, DT, video_path=os.path.join(output_dir, f'video{rollout_id}.mp4'))
             # 记录并可视化关节角度：state vs command
             plot_path = os.path.join(output_dir, f'video{rollout_id}_qpos.png')
@@ -678,6 +695,8 @@ def _parse_eval_args():
                         help='direct_replay 时从第几条轨迹开始回放（rollout i 回放 episode replay_episode+i）')
     parser.add_argument('--temporal_agg', action='store_true',
                         help='eval 时使用 temporal aggregation 平滑 ACT 输出')
+    parser.add_argument('--max_save_episodes', type=int, default=None,
+                        help='eval 时只保存前 N 条 rollout 的视频和 png，后续不再保存以节省时间；默认保存全部')
     parser.add_argument('--ckpt_dir', type=str, required=True,
                         help='checkpoint dir (required; provided via CLI only)')
     eval_args, unknown = parser.parse_known_args()
@@ -695,6 +714,7 @@ def main(cfg):
     args_dict['replay_episode'] = _EVAL_ARGS.replay_episode
     args_dict['temporal_agg'] = _EVAL_ARGS.temporal_agg
     args_dict['ckpt_dir'] = _EVAL_ARGS.ckpt_dir
+    args_dict['max_save_episodes'] = _EVAL_ARGS.max_save_episodes
     train_or_eval(args_dict, hydra_cfg=cfg)
 
 
