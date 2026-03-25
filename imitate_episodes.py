@@ -130,6 +130,8 @@ def train_or_eval(args, hydra_cfg=None):
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
         'real_robot': not is_sim,
+        # eval-only: user-specified latent z (fixed within rollout)
+        'latent_z_sample': args.get('latent_z_sample', None),
         # dataset info for evaluation-time initialization
         'dataset_dir': dataset_dir,
         'num_episodes': num_episodes,
@@ -298,6 +300,30 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
 
     use_pca_action = ('dex' in task_name and action_dim < STATE_DIM_DEX and not direct_replay)
 
+    latent_z_sample_str = config.get('latent_z_sample', None)
+    latent_z_dim = int(policy_config.get('latent_z_dim', 32)) if isinstance(policy_config, dict) else 32
+
+    def _parse_latent_z_sample(s):
+        if s is None:
+            return None
+        s = str(s).strip()
+        if s == "" or s.lower() in {"none", "null"}:
+            return None
+        try:
+            if s.startswith("["):
+                arr = json.loads(s)
+            else:
+                arr = [float(x) for x in s.split(",")]
+        except Exception as ex:
+            raise ValueError(f"无法解析 --latent_z_sample: {s!r}. 期望 'v1,v2,...' 或 JSON 列表字符串。error={ex}")
+        if not isinstance(arr, (list, tuple)):
+            raise ValueError(f"--latent_z_sample 解析结果不是 list/tuple: {type(arr)}")
+        if len(arr) != latent_z_dim:
+            raise ValueError(f"--latent_z_sample 维度不匹配: got {len(arr)}, expected latent_z_dim={latent_z_dim}")
+        return torch.tensor(arr, dtype=torch.float32).cuda()
+
+    base_latent_z = _parse_latent_z_sample(latent_z_sample_str)
+
     if direct_replay and real_robot:
         raise ValueError('direct_replay 仅支持 sim 环境，不能用于 real_robot。')
     if direct_replay:
@@ -427,6 +453,7 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
     highest_rewards = []
     for rollout_id in range(num_rollouts):
         rollout_id += 0
+        rollout_latent_z = base_latent_z
         ### direct replay: 本 rollout 要回放的 episode
         replay_qpos0, replay_actions = None, None
         if direct_replay:
@@ -509,7 +536,7 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
                     ### query policy
                     if config['policy_class'] == "ACT":
                         if t % query_frequency == 0:
-                            all_actions = policy(qpos, curr_image)
+                            all_actions = policy(qpos, curr_image, latent_z_sample=rollout_latent_z)
                         if temporal_agg:
                             all_time_actions[[t], t:t+num_queries] = all_actions
                             actions_for_curr_step = all_time_actions[:, t]
@@ -697,6 +724,8 @@ def _parse_eval_args():
                         help='eval 时使用 temporal aggregation 平滑 ACT 输出')
     parser.add_argument('--max_save_episodes', type=int, default=None,
                         help='eval 时只保存前 N 条 rollout 的视频和 png，后续不再保存以节省时间；默认保存全部')
+    parser.add_argument('--latent_z_sample', type=str, default=None,
+                        help='(eval only) 手动指定 latent z 向量，整个 rollout 固定。格式: "v1,v2,...,vD" 或 JSON 列表字符串，例如 "[0, 0.1, ...]". 维度需等于 latent_z_dim。')
     parser.add_argument('--ckpt_dir', type=str, required=True,
                         help='checkpoint dir (required; provided via CLI only)')
     eval_args, unknown = parser.parse_known_args()
@@ -715,6 +744,7 @@ def main(cfg):
     args_dict['temporal_agg'] = _EVAL_ARGS.temporal_agg
     args_dict['ckpt_dir'] = _EVAL_ARGS.ckpt_dir
     args_dict['max_save_episodes'] = _EVAL_ARGS.max_save_episodes
+    args_dict['latent_z_sample'] = _EVAL_ARGS.latent_z_sample
     train_or_eval(args_dict, hydra_cfg=cfg)
 
 

@@ -76,7 +76,7 @@ class DETRVAE(nn.Module):
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim) # project latent sample to embedding
         self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for proprio and latent
 
-    def forward(self, qpos, image, env_state, actions=None, is_pad=None):
+    def forward(self, qpos, image, env_state, actions=None, is_pad=None, latent_z_sample=None):
         """
         qpos: batch, qpos_dim
         image: batch, num_cam, channel, height, width
@@ -111,7 +111,27 @@ class DETRVAE(nn.Module):
             latent_input = self.latent_out_proj(latent_sample)
         else:
             mu = logvar = None
-            latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32).to(qpos.device)
+            if latent_z_sample is None:
+                latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32).to(qpos.device)
+            else:
+                z = latent_z_sample
+                if not torch.is_tensor(z):
+                    z = torch.as_tensor(z, dtype=torch.float32)
+                z = z.to(device=qpos.device, dtype=torch.float32)
+                if z.ndim == 1:
+                    if z.shape[0] != self.latent_dim:
+                        raise ValueError(f"latent_z_sample dim mismatch: got {z.shape[0]}, expected {self.latent_dim}")
+                    z = z.unsqueeze(0).expand(bs, -1)
+                elif z.ndim == 2:
+                    if z.shape[1] != self.latent_dim:
+                        raise ValueError(f"latent_z_sample dim mismatch: got {z.shape[1]}, expected {self.latent_dim}")
+                    if z.shape[0] == 1 and bs > 1:
+                        z = z.expand(bs, -1)
+                    elif z.shape[0] != bs:
+                        raise ValueError(f"latent_z_sample batch mismatch: got {z.shape[0]}, expected {bs}")
+                else:
+                    raise ValueError(f"latent_z_sample must be 1D or 2D, got shape {tuple(z.shape)}")
+                latent_sample = z
             latent_input = self.latent_out_proj(latent_sample)
 
         if self.backbones is not None:

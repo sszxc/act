@@ -15,7 +15,7 @@ class ACTPolicy(nn.Module):
         self.kl_weight = args_override['kl_weight']
         print(f'KL Weight {self.kl_weight}')
 
-    def __call__(self, qpos, image, actions=None, is_pad=None):
+    def __call__(self, qpos, image, actions=None, is_pad=None, latent_z_sample=None):
         env_state = None
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])
@@ -34,7 +34,7 @@ class ACTPolicy(nn.Module):
             loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight
             return loss_dict
         else: # inference time
-            a_hat, _, (_, _) = self.model(qpos, image, env_state) # no action, sample from prior
+            a_hat, _, (_, _) = self.model(qpos, image, env_state, latent_z_sample=latent_z_sample) # no action, sample from prior
             return a_hat
 
     def configure_optimizers(self):
