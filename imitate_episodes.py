@@ -142,6 +142,8 @@ def train_or_eval(args, hydra_cfg=None):
         'replay_episode': args.get('replay_episode', 0),
         # eval 时最多保存多少条 rollout 的视频和 png；None 表示全部保存
         'max_save_episodes': args.get('max_save_episodes', None),
+        # eval 时总共运行多少条 rollout
+        'num_rollouts': args.get('num_rollouts', 50),
     }
 
     if is_eval:
@@ -296,6 +298,7 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
     init_qpos_from_dataset = config.get('init_qpos_from_dataset', False)
     direct_replay = config.get('direct_replay', False)
     replay_episode = config.get('replay_episode', 0)
+    num_rollouts_cfg = int(config.get('num_rollouts', 50))
     onscreen_cam = 'default_cam' if 'dex' in task_name else 'angle'
 
     use_pca_action = ('dex' in task_name and action_dim < STATE_DIM_DEX and not direct_replay)
@@ -337,7 +340,20 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     policy = make_policy(policy_class, policy_config)
-    loading_status = policy.load_state_dict(torch.load(ckpt_path))
+    state_dict = torch.load(ckpt_path)
+    loading_status = policy.load_state_dict(state_dict, strict=False)
+    # Backward-compat: allow missing FiLM buffers introduced later.
+    allowed_missing = {"model.visual_film_gamma", "model.visual_film_beta"}
+    missing = set(getattr(loading_status, "missing_keys", []))
+    unexpected = set(getattr(loading_status, "unexpected_keys", []))
+    missing_not_allowed = missing - allowed_missing
+    if unexpected or missing_not_allowed:
+        raise RuntimeError(
+            "Error(s) in loading state_dict for ACTPolicy:\n"
+            f"\tUnexpected key(s) in state_dict: {sorted(unexpected)}\n"
+            f"\tMissing key(s) in state_dict (not allowed): {sorted(missing_not_allowed)}\n"
+            f"\tMissing key(s) allowed: {sorted(missing & allowed_missing)}"
+        )
     logger(loading_status)
     policy.cuda()
     policy.eval()
@@ -448,7 +464,7 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
         query_frequency = 1
         num_queries = policy_config['num_queries']
 
-    num_rollouts = 50 if not direct_replay else min(50, num_episodes)
+    num_rollouts = num_rollouts_cfg if not direct_replay else min(num_rollouts_cfg, num_episodes)
     episode_returns = []
     highest_rewards = []
     for rollout_id in range(num_rollouts):
@@ -724,6 +740,8 @@ def _parse_eval_args():
                         help='eval 时使用 temporal aggregation 平滑 ACT 输出')
     parser.add_argument('--max_save_episodes', type=int, default=None,
                         help='eval 时只保存前 N 条 rollout 的视频和 png，后续不再保存以节省时间；默认保存全部')
+    parser.add_argument('--num_rollouts', type=int, default=50,
+                        help='eval 时总共跑多少条 rollout（默认 50；direct_replay 时会再取 min(num_rollouts, num_episodes)）')
     parser.add_argument('--latent_z_sample', type=str, default=None,
                         help='(eval only) 手动指定 latent z 向量，整个 rollout 固定。格式: "v1,v2,...,vD" 或 JSON 列表字符串，例如 "[0, 0.1, ...]". 维度需等于 latent_z_dim。')
     parser.add_argument('--ckpt_dir', type=str, required=True,
@@ -744,6 +762,7 @@ def main(cfg):
     args_dict['temporal_agg'] = _EVAL_ARGS.temporal_agg
     args_dict['ckpt_dir'] = _EVAL_ARGS.ckpt_dir
     args_dict['max_save_episodes'] = _EVAL_ARGS.max_save_episodes
+    args_dict['num_rollouts'] = _EVAL_ARGS.num_rollouts
     args_dict['latent_z_sample'] = _EVAL_ARGS.latent_z_sample
     train_or_eval(args_dict, hydra_cfg=cfg)
 

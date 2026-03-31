@@ -2,8 +2,11 @@
 """
 DETR model and criterion classes.
 """
+import os
+
 import torch
 from torch import nn
+from PIL import Image
 from torch.autograd import Variable
 from .backbone import build_backbone
 from .transformer import build_transformer, TransformerEncoder, TransformerEncoderLayer
@@ -29,6 +32,16 @@ def get_sinusoid_encoding_table(n_position, d_hid):
     sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])  # dim 2i+1
 
     return torch.FloatTensor(sinusoid_table).unsqueeze(0)
+
+
+# Hardcoded: save FiLM-after feature map (channel-mean grayscale) for offline video stitching.
+_FILM_VIZ_SAVE = True
+_FILM_VIZ_OUT_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "tmp",
+    "film_features_after_film",
+)
+_FILM_VIZ_MODE = "mean"  # "max" or "mean"
 
 
 class DETRVAE(nn.Module):
@@ -58,6 +71,16 @@ class DETRVAE(nn.Module):
             self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
             self.backbones = nn.ModuleList(backbones)
             self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)
+
+            # Hardcoded FiLM on visual features before Transformer.
+            # Edit these values directly in this file as needed.
+            self.register_buffer("visual_film_gamma", torch.ones(hidden_dim))
+            self.register_buffer("visual_film_beta", torch.zeros(hidden_dim))
+            # self.visual_film_beta[: hidden_dim // 2] = -0.5
+            # self.visual_film_gamma[: hidden_dim // 2] = 0.5
+            # self.visual_film_gamma[hidden_dim // 2 :] = 0.5
+            # self.visual_film_beta[hidden_dim // 2 :] += 0.01 * torch.randn(hidden_dim - hidden_dim // 2)
+            self._film_viz_frame_idx = 0
         else:
             self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)
             self.input_proj_env_state = nn.Linear(7, hidden_dim)
@@ -149,6 +172,33 @@ class DETRVAE(nn.Module):
             # fold camera dimension into width dimension
             src = torch.cat(all_cam_features, axis=3)
             pos = torch.cat(all_cam_pos, axis=3)
+
+            # FiLM (feature-wise affine): src = gamma * src + beta
+            gamma = self.visual_film_gamma.view(1, -1, 1, 1).to(dtype=src.dtype, device=src.device)
+            beta = self.visual_film_beta.view(1, -1, 1, 1).to(dtype=src.dtype, device=src.device)
+            src = src * gamma + beta
+
+            if _FILM_VIZ_SAVE and not self.training:
+                with torch.no_grad():
+                    if _FILM_VIZ_MODE == "mean":
+                        gray = src[0].detach().mean(dim=0).float().cpu().numpy()
+                    elif _FILM_VIZ_MODE == "max":
+                        gray = src[0].detach().max(dim=0)[0].float().cpu().numpy()
+                    else:
+                        raise ValueError(f"Invalid FiLM visualization mode: {_FILM_VIZ_MODE}")
+                    g_min, g_max = float(gray.min()), float(gray.max())
+                    if g_max > g_min:
+                        gray_u8 = ((gray - g_min) / (g_max - g_min) * 255.0).astype(np.uint8)
+                    else:
+                        gray_u8 = np.zeros_like(gray, dtype=np.uint8)
+                    os.makedirs(_FILM_VIZ_OUT_DIR, exist_ok=True)
+                    idx = self._film_viz_frame_idx
+                    self._film_viz_frame_idx = idx + 1
+                    Image.fromarray(gray_u8, mode="L").save(
+                        os.path.join(_FILM_VIZ_OUT_DIR, f"film_{_FILM_VIZ_MODE}_{idx:06d}.png")
+                    )
+                    breakpoint()
+
             hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
         else:
             qpos = self.input_proj_robot_state(qpos)
@@ -158,7 +208,6 @@ class DETRVAE(nn.Module):
         a_hat = self.action_head(hs)
         is_pad_hat = self.is_pad_head(hs)
         return a_hat, is_pad_hat, [mu, logvar]
-
 
 
 class CNNMLP(nn.Module):
@@ -295,4 +344,3 @@ def build_cnnmlp(args):
     print("number of parameters: %.2fM" % (n_parameters/1e6,))
 
     return model
-

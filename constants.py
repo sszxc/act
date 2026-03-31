@@ -7,6 +7,7 @@ STATE_DIM_DEX = 22
 ROOT_DIM = 6   # allegro hand root 6dof (x,y,z,rx,ry,rz)
 FINGER_DIM = 16  # allegro finger joints
 DEX_ALLEGRO_XML_PATH = '/mnt/1tb1/xuechao/MuJoCo-Asset-Pipeline/asset/scene/freejoint/teleop_scene_left_077_rubiks_cube/teleop_scene_left_077_rubiks_cube.xml'
+# DEX_ALLEGRO_XML_PATH = "/mnt/1tb1/xuechao/MuJoCo-Asset-Pipeline/asset/scene/freejoint/teleop_scene_left_035_power_drill/teleop_scene_left_035_power_drill.xml"
 
 SIM_TASK_CONFIGS = {
     "sim_transfer_cube_scripted": {
