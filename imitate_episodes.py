@@ -279,6 +279,279 @@ def get_image(ts, camera_names):
     return curr_image
 
 
+def overwrite_sim_qpos_from_dataset(env, task_name, dataset_qpos):
+    """
+    将模拟环境的初始关节位置，用数据集中某条轨迹起点的 qpos 覆盖。
+    只对 sim 环境生效，对 real_robot 不做任何事。
+    """
+    physics = env._physics
+
+    # bi-manual 14-dim 任务（transfer_cube / insertion）
+    if 'sim_transfer_cube' in task_name or 'sim_insertion' in task_name:
+        q = np.asarray(dataset_qpos, dtype=np.float32)
+        if q.shape[0] < 14:
+            raise ValueError(f"数据集 qpos 维度 {q.shape[0]} < 14，无法映射到模拟关节。")
+        q = q[:14]
+        left_arm = q[:6]
+        left_grip_norm = q[6]
+        right_arm = q[7:13]
+        right_grip_norm = q[13]
+
+        left_grip_pos = PUPPET_GRIPPER_POSITION_UNNORMALIZE_FN(float(left_grip_norm))
+        right_grip_pos = PUPPET_GRIPPER_POSITION_UNNORMALIZE_FN(float(right_grip_norm))
+
+        with physics.reset_context():
+            physics.data.qpos[:6] = left_arm
+            physics.data.qpos[8:14] = right_arm
+            physics.data.qpos[6] = left_grip_pos
+            physics.data.qpos[7] = -left_grip_pos
+            physics.data.qpos[14] = right_grip_pos
+            physics.data.qpos[15] = -right_grip_pos
+            np.copyto(physics.data.ctrl, physics.data.qpos[:16])
+
+    elif 'dex' in task_name:
+        q = np.asarray(dataset_qpos, dtype=np.float32)
+        if q.shape[0] < 22:
+            raise ValueError(f"dex 任务期望至少 22 维手部 qpos，但数据集给了 {q.shape[0]} 维。")
+        hand_qpos = q[:22]
+        with physics.reset_context():
+            physics.data.qpos[:22] = hand_qpos
+            np.copyto(physics.data.ctrl, physics.data.qpos[:22])
+
+
+def sample_dataset_start_qpos(dataset_dir, num_episodes):
+    episode_idx = np.random.randint(0, num_episodes)
+    dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}.hdf5')
+    with h5py.File(dataset_path, 'r') as root:
+        qpos0 = root['/observations/qpos'][0]
+    return np.array(qpos0, dtype=np.float32)
+
+
+def apply_object_pose_for_reset(task_name, fixed_object_pose):
+    """
+    在 env.reset() 前设置 BOX_POSE[0] 或 DEX_OBJECT_POSE[0]。
+    fixed_object_pose: None 时按任务随机采样；否则为固定长度向量（transfer 7, insertion 14, dex 7）。
+    """
+    if fixed_object_pose is not None:
+        arr = np.asarray(fixed_object_pose, dtype=np.float64).reshape(-1)
+        if 'sim_transfer_cube' in task_name:
+            if arr.size != 7:
+                raise ValueError(f"sim_transfer_cube 需要 7 维 object pose，got {arr.size}")
+            BOX_POSE[0] = arr
+        elif 'sim_insertion' in task_name:
+            if arr.size != 14:
+                raise ValueError(f"sim_insertion 需要 14 维 object pose，got {arr.size}")
+            BOX_POSE[0] = arr
+        elif 'dex' in task_name:
+            if arr.size != 7:
+                raise ValueError(f"dex 任务需要 7 维 object pose，got {arr.size}")
+            DEX_OBJECT_POSE[0] = arr
+        else:
+            raise NotImplementedError(f"apply_object_pose_for_reset: {task_name}")
+    else:
+        if 'sim_transfer_cube' in task_name:
+            BOX_POSE[0] = sample_box_pose()
+        elif 'sim_insertion' in task_name:
+            BOX_POSE[0] = np.concatenate(sample_insertion_pose())
+        elif 'dex' in task_name:
+            DEX_OBJECT_POSE[0] = sample_dex_object_pose()
+
+
+def rollout_single_episode_return(
+    policy,
+    env,
+    config,
+    pre_process,
+    post_process,
+    *,
+    pca,
+    use_pca_action,
+    rollout_latent_z,
+    film_theta=None,
+    fixed_object_pose=None,
+    fixed_init_qpos=None,
+    init_qpos_from_dataset=False,
+    dataset_dir=None,
+    num_episodes=None,
+    direct_replay=False,
+    replay_qpos0=None,
+    replay_actions=None,
+    save_episode=False,
+    output_dir=None,
+    rollout_id=0,
+    max_save_episodes=None,
+    onscreen_render=False,
+    logger=print,
+    quiet=False,
+):
+    """
+    单次 rollout，返回 (episode_return, episode_highest_reward)。
+    sim 时在 reset 前根据 fixed_object_pose 设置物体位姿；可选 fixed_init_qpos 或 init_qpos_from_dataset。
+    """
+    real_robot = config['real_robot']
+    policy_class = config['policy_class']
+    policy_config = config['policy_config']
+    camera_names = config['camera_names']
+    state_dim = config['state_dim']
+    action_dim = config.get('action_dim', state_dim)
+    task_name = config['task_name']
+    temporal_agg = config['temporal_agg']
+    max_timesteps_cfg = config['episode_len']
+    onscreen_cam = 'default_cam' if 'dex' in task_name else 'angle'
+
+    max_timesteps = int(max_timesteps_cfg * 2)
+    query_frequency = policy_config['num_queries']
+    if temporal_agg:
+        query_frequency = 1
+        num_queries = policy_config['num_queries']
+
+    ### direct replay
+    if direct_replay and real_robot:
+        raise ValueError('direct_replay 仅支持 sim')
+
+    if not real_robot:
+        apply_object_pose_for_reset(task_name, fixed_object_pose)
+    ts = env.reset()
+
+    if not real_robot and fixed_init_qpos is not None:
+        try:
+            overwrite_sim_qpos_from_dataset(env, task_name, fixed_init_qpos)
+            new_obs = env._task.get_observation(env._physics)
+            ts = ts._replace(observation=new_obs)
+            logger("Initialized sim qpos from fixed_init_qpos.")
+        except Exception as ex:
+            logger(f"[WARN] fixed_init_qpos 失败: {ex}")
+    elif not real_robot and (init_qpos_from_dataset or direct_replay):
+        try:
+            if direct_replay:
+                dataset_qpos0 = replay_qpos0
+            else:
+                assert dataset_dir is not None and num_episodes is not None
+                dataset_qpos0 = sample_dataset_start_qpos(dataset_dir, num_episodes)
+            overwrite_sim_qpos_from_dataset(env, task_name, dataset_qpos0)
+            new_obs = env._task.get_observation(env._physics)
+            ts = ts._replace(observation=new_obs)
+            logger("Initialized sim qpos from dataset start qpos.")
+        except Exception as ex:
+            logger(f"[WARN] 初始化 qpos 从数据集失败，使用默认初始化. error={ex}")
+
+    if onscreen_render:
+        ax = plt.subplot()
+        plt_img = ax.imshow(env._physics.render(height=480, width=640, camera_id=onscreen_cam))
+        plt.ion()
+
+    steps_this_rollout = min(max_timesteps, replay_actions.shape[0]) if direct_replay else max_timesteps
+    if temporal_agg and not direct_replay:
+        all_time_actions = torch.zeros([max_timesteps, max_timesteps + num_queries, action_dim]).cuda()
+
+    qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
+
+    will_save_this_rollout = save_episode and (
+        max_save_episodes is None or rollout_id < max_save_episodes
+    )
+    image_list = [] if will_save_this_rollout else None
+    qpos_list = [] if will_save_this_rollout else None
+    target_qpos_list = [] if will_save_this_rollout else None
+    rewards = []
+
+    step_iter = range(steps_this_rollout)
+    if not quiet:
+        step_iter = tqdm(step_iter, desc=f"Rollout {rollout_id} steps", leave=False)
+
+    with torch.inference_mode():
+        for t in step_iter:
+            if onscreen_render:
+                image = env._physics.render(height=480, width=640, camera_id=onscreen_cam)
+                plt_img.set_data(image)
+                plt.pause(DT)
+
+            obs = ts.observation
+            if will_save_this_rollout:
+                if 'images' in obs:
+                    image_list.append(obs['images'])
+                else:
+                    image_list.append({'main': obs['image']})
+            qpos_numpy = np.array(obs['qpos'])
+            qpos_numpy = qpos_numpy[:state_dim]
+            if will_save_this_rollout:
+                qpos_list.append(qpos_numpy)
+            if not direct_replay:
+                qpos = pre_process(qpos_numpy)
+                qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
+                qpos_history[:, t] = qpos
+                curr_image = get_image(ts, camera_names)
+
+            if direct_replay:
+                target_qpos = np.asarray(replay_actions[t], dtype=np.float64)
+            else:
+                if policy_class == "ACT":
+                    if t % query_frequency == 0:
+                        if film_theta is not None:
+                            hdim = int(policy.model.visual_film_gamma.numel())
+                            theta = np.asarray(film_theta, dtype=np.float32).reshape(-1)
+                            if theta.size != 2 * hdim:
+                                raise ValueError(f"film_theta dim mismatch: got {theta.size}, expected {2*hdim}")
+                            film_gamma = torch.from_numpy(theta[:hdim]).to(device=qpos.device, dtype=qpos.dtype).unsqueeze(0)
+                            film_beta = torch.from_numpy(theta[hdim:]).to(device=qpos.device, dtype=qpos.dtype).unsqueeze(0)
+                        else:
+                            film_gamma = None
+                            film_beta = None
+                        all_actions = policy(
+                            qpos,
+                            curr_image,
+                            latent_z_sample=rollout_latent_z,
+                            film_gamma=film_gamma,
+                            film_beta=film_beta,
+                        )
+                    if temporal_agg:
+                        all_time_actions[[t], t:t + num_queries] = all_actions
+                        actions_for_curr_step = all_time_actions[:, t]
+                        actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
+                        actions_for_curr_step = actions_for_curr_step[actions_populated]
+                        k = 0.01
+                        exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
+                        exp_weights = exp_weights / exp_weights.sum()
+                        exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
+                        raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
+                    else:
+                        raw_action = all_actions[:, t % query_frequency]
+                elif policy_class == "CNNMLP":
+                    raw_action = policy(qpos, curr_image)
+                else:
+                    raise NotImplementedError
+                raw_action = raw_action.squeeze(0).cpu().numpy()
+                target_qpos = post_process(raw_action)
+                if use_pca_action and pca is not None:
+                    root_6 = target_qpos[:ROOT_DIM]
+                    finger_pcs = target_qpos[ROOT_DIM:].reshape(1, -1)
+                    finger_16 = pca.inverse_transform(finger_pcs).squeeze(0)
+                    target_qpos = np.concatenate([root_6, finger_16]).astype(np.float64)
+
+            if will_save_this_rollout:
+                target_qpos_list.append(target_qpos)
+            ts = env.step(target_qpos)
+            rewards.append(ts.reward)
+
+    if onscreen_render:
+        plt.close()
+
+    if real_robot:
+        from aloha_scripts.robot_utils import move_grippers
+        move_grippers([env.puppet_bot_left, env.puppet_bot_right], [PUPPET_GRIPPER_JOINT_OPEN] * 2, move_time=0.5)
+
+    rewards = np.array(rewards)
+    episode_return = np.sum(rewards[rewards != None])
+    episode_highest_reward = np.max(rewards[rewards != None])
+
+    if will_save_this_rollout and output_dir is not None:
+        save_videos(image_list, DT, video_path=os.path.join(output_dir, f'video{rollout_id}.mp4'))
+        plot_path = os.path.join(output_dir, f'video{rollout_id}_qpos.png')
+        visualize_joints(qpos_list, target_qpos_list, plot_path=plot_path,
+                         label_overwrite=('State', 'Command'))
+
+    return float(episode_return), float(episode_highest_reward)
+
+
 def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print, max_save_episodes=None):
     # eval 阶段也使用同一个 seed，保证可复现；如需单独 eval seed，可在 config 中扩展
     set_seed(config.get('seed', 0))
@@ -299,7 +572,6 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
     direct_replay = config.get('direct_replay', False)
     replay_episode = config.get('replay_episode', 0)
     num_rollouts_cfg = int(config.get('num_rollouts', 50))
-    onscreen_cam = 'default_cam' if 'dex' in task_name else 'angle'
 
     use_pca_action = ('dex' in task_name and action_dim < STATE_DIM_DEX and not direct_replay)
 
@@ -372,19 +644,6 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
             pca = pickle.load(f)
         logger(f'Loaded PCA from {pca_path} for action inverse transform')
 
-    def sample_dataset_start_qpos():
-        """
-        从数据集中随机采一条轨迹的起始 qpos（t=0）。
-        返回原始 qpos（不做归一化），形状为 (qpos_dim,)。
-        """
-        assert dataset_dir is not None and num_episodes is not None, \
-            "dataset_dir / num_episodes 未在 config 中提供，无法从数据集采样初始 qpos。"
-        episode_idx = np.random.randint(0, num_episodes)
-        dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}.hdf5')
-        with h5py.File(dataset_path, 'r') as root:
-            qpos0 = root['/observations/qpos'][0]
-        return np.array(qpos0, dtype=np.float32)
-
     def load_episode_for_replay(episode_idx):
         """
         加载指定 episode 的 qpos[0] 和整条 action 序列，用于 direct replay。
@@ -396,61 +655,10 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
             actions = np.array(root['/action'][()], dtype=np.float64)
         return qpos0, actions
 
-    def overwrite_sim_qpos_from_dataset(env, task_name, dataset_qpos):
-        """
-        将模拟环境的初始关节位置，用数据集中某条轨迹起点的 qpos 覆盖。
-        只对 sim 环境生效，对 real_robot 不做任何事。
-        """
-        physics = env._physics
-
-        # bi-manual 14-dim 任务（transfer_cube / insertion）
-        if 'sim_transfer_cube' in task_name or 'sim_insertion' in task_name:
-            # 期望的观测维度是 14: [L_arm(6), L_grip(1), R_arm(6), R_grip(1)]
-            q = np.asarray(dataset_qpos, dtype=np.float32)
-            if q.shape[0] < 14:
-                raise ValueError(f"数据集 qpos 维度 {q.shape[0]} < 14，无法映射到模拟关节。")
-            q = q[:14]
-            left_arm = q[:6]
-            left_grip_norm = q[6]
-            right_arm = q[7:13]
-            right_grip_norm = q[13]
-
-            # 归一化位置 -> 物理手指位置
-            left_grip_pos = PUPPET_GRIPPER_POSITION_UNNORMALIZE_FN(float(left_grip_norm))
-            right_grip_pos = PUPPET_GRIPPER_POSITION_UNNORMALIZE_FN(float(right_grip_norm))
-
-            with physics.reset_context():
-                # 手臂关节
-                physics.data.qpos[:6] = left_arm
-                physics.data.qpos[8:14] = right_arm
-                # 夹爪：两指对称，一个正一个负（与 before_step 中 env_action 一致）
-                physics.data.qpos[6] = left_grip_pos
-                physics.data.qpos[7] = -left_grip_pos
-                physics.data.qpos[14] = right_grip_pos
-                physics.data.qpos[15] = -right_grip_pos
-                # 保持其他 qpos（如 BOX_POSE）不变，只更新控制量为当前关节
-                np.copyto(physics.data.ctrl, physics.data.qpos[:16])
-
-        # dexterous hand 任务：只用手部 22 维 qpos 初始化
-        elif 'dex' in task_name:
-            q = np.asarray(dataset_qpos, dtype=np.float32)
-            if q.shape[0] < 22:
-                raise ValueError(f"dex 任务期望至少 22 维手部 qpos，但数据集给了 {q.shape[0]} 维。")
-            hand_qpos = q[:22]
-            with physics.reset_context():
-                physics.data.qpos[:22] = hand_qpos
-                # 控制量跟随当前手部状态
-                np.copyto(physics.data.ctrl, physics.data.qpos[:22])
-
-        else:
-            # 未知的 sim 任务，不做覆盖
-            return
-
     max_timesteps = int(max_timesteps * 5) # may increase for real-world tasks
 
     # load environment
     if real_robot:
-        from aloha_scripts.robot_utils import move_grippers # requires aloha
         from aloha_scripts.real_env import make_real_env # requires aloha
         env = make_real_env(init_node=True)
         env_max_reward = 0
@@ -459,147 +667,47 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
         env = make_sim_env(task_name, time_limit=max_timesteps*DT)
         env_max_reward = env.task.max_reward
 
-    query_frequency = policy_config['num_queries']
-    if temporal_agg:
-        query_frequency = 1
-        num_queries = policy_config['num_queries']
-
     num_rollouts = num_rollouts_cfg if not direct_replay else min(num_rollouts_cfg, num_episodes)
     episode_returns = []
     highest_rewards = []
+    fixed_object_pose = config.get('fixed_object_pose', None)
+    fixed_init_qpos = config.get('fixed_init_qpos', None)
     for rollout_id in range(num_rollouts):
-        rollout_id += 0
         rollout_latent_z = base_latent_z
-        ### direct replay: 本 rollout 要回放的 episode
         replay_qpos0, replay_actions = None, None
         if direct_replay:
             episode_idx = (replay_episode + rollout_id) % num_episodes
             replay_qpos0, replay_actions = load_episode_for_replay(episode_idx)
             logger(f'[direct_replay] Rollout {rollout_id} replay episode_{episode_idx}, T={len(replay_actions)}')
 
-        ### set task
-        if 'sim_transfer_cube' in task_name:
-            BOX_POSE[0] = sample_box_pose() # used in sim reset
-        elif 'sim_insertion' in task_name:
-            BOX_POSE[0] = np.concatenate(sample_insertion_pose()) # used in sim reset
-        elif 'dex' in task_name:
-            DEX_OBJECT_POSE[0] = sample_dex_object_pose()
-
-        ts = env.reset()
-
-        # 将模拟初始 qpos 覆盖为数据集中的某条轨迹起点（init_qpos_from_dataset 随机一条；direct_replay 用当前回放的那条）
-        if not real_robot and (init_qpos_from_dataset or direct_replay):
-            try:
-                dataset_qpos0 = replay_qpos0 if direct_replay else sample_dataset_start_qpos()
-                overwrite_sim_qpos_from_dataset(env, task_name, dataset_qpos0)
-                new_obs = env._task.get_observation(env._physics)
-                ts = ts._replace(observation=new_obs)
-                logger("Initialized sim qpos from dataset start qpos.")
-            except Exception as ex:
-                logger(f"[WARN] 初始化 qpos 从数据集失败，使用默认初始化. error={ex}")
-
-        ### onscreen render
-        if onscreen_render:
-            ax = plt.subplot()
-            plt_img = ax.imshow(env._physics.render(height=480, width=640, camera_id=onscreen_cam))
-            plt.ion()
-
-        ### evaluation loop
-        steps_this_rollout = min(max_timesteps, replay_actions.shape[0]) if direct_replay else max_timesteps
-        if temporal_agg and not direct_replay:
-            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, action_dim]).cuda()
-
-        qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
-
-        # 是否为本 rollout 保存视频/图片
-        will_save_this_rollout = save_episode and (
-            max_save_episodes is None or rollout_id < max_save_episodes
+        episode_return, episode_highest_reward = rollout_single_episode_return(
+            policy,
+            env,
+            config,
+            pre_process,
+            post_process,
+            pca=pca,
+            use_pca_action=use_pca_action,
+            rollout_latent_z=rollout_latent_z,
+            fixed_object_pose=fixed_object_pose,
+            fixed_init_qpos=fixed_init_qpos,
+            init_qpos_from_dataset=init_qpos_from_dataset,
+            dataset_dir=dataset_dir,
+            num_episodes=num_episodes,
+            direct_replay=direct_replay,
+            replay_qpos0=replay_qpos0,
+            replay_actions=replay_actions,
+            save_episode=save_episode,
+            output_dir=output_dir,
+            rollout_id=rollout_id,
+            max_save_episodes=max_save_episodes,
+            onscreen_render=onscreen_render,
+            logger=logger,
+            quiet=False,
         )
-        image_list = [] if will_save_this_rollout else None  # for visualization
-        qpos_list = [] if will_save_this_rollout else None
-        target_qpos_list = [] if will_save_this_rollout else None
-        rewards = []
-        # 每个 rollout 内部的 step 进度条
-        with torch.inference_mode():
-            for t in tqdm(range(steps_this_rollout), desc=f"Rollout {rollout_id} steps", leave=False):
-                ### update onscreen render and wait for DT
-                if onscreen_render:
-                    image = env._physics.render(height=480, width=640, camera_id=onscreen_cam)
-                    plt_img.set_data(image)
-                    plt.pause(DT)
-
-                ### process previous timestep to get qpos and image_list
-                obs = ts.observation
-                if will_save_this_rollout:
-                    if 'images' in obs:
-                        image_list.append(obs['images'])
-                    else:
-                        image_list.append({'main': obs['image']})
-                qpos_numpy = np.array(obs['qpos'])
-                qpos_numpy = qpos_numpy[:state_dim]
-                if will_save_this_rollout:
-                    qpos_list.append(qpos_numpy)
-                if not direct_replay:
-                    qpos = pre_process(qpos_numpy)
-                    qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
-                    qpos_history[:, t] = qpos
-                    curr_image = get_image(ts, camera_names)
-
-                ### 动作来源：direct_replay 用数据集里的 action[t]，否则用 policy 输出
-                if direct_replay:
-                    target_qpos = np.asarray(replay_actions[t], dtype=np.float64)
-                else:
-                    ### query policy
-                    if config['policy_class'] == "ACT":
-                        if t % query_frequency == 0:
-                            all_actions = policy(qpos, curr_image, latent_z_sample=rollout_latent_z)
-                        if temporal_agg:
-                            all_time_actions[[t], t:t+num_queries] = all_actions
-                            actions_for_curr_step = all_time_actions[:, t]
-                            actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
-                            actions_for_curr_step = actions_for_curr_step[actions_populated]
-                            k = 0.01
-                            exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
-                            exp_weights = exp_weights / exp_weights.sum()
-                            exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
-                            raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
-                        else:
-                            raw_action = all_actions[:, t % query_frequency]
-                    elif config['policy_class'] == "CNNMLP":
-                        raw_action = policy(qpos, curr_image)
-                    else:
-                        raise NotImplementedError
-                    raw_action = raw_action.squeeze(0).cpu().numpy()
-                    target_qpos = post_process(raw_action)
-                    if use_pca_action and pca is not None:
-                        root_6 = target_qpos[:ROOT_DIM]
-                        finger_pcs = target_qpos[ROOT_DIM:].reshape(1, -1)
-                        finger_16 = pca.inverse_transform(finger_pcs).squeeze(0)
-                        target_qpos = np.concatenate([root_6, finger_16]).astype(np.float64)
-
-                if will_save_this_rollout:
-                    target_qpos_list.append(target_qpos)
-                ts = env.step(target_qpos)
-                rewards.append(ts.reward)
-
-            plt.close()
-        if real_robot:
-            move_grippers([env.puppet_bot_left, env.puppet_bot_right], [PUPPET_GRIPPER_JOINT_OPEN] * 2, move_time=0.5)  # open
-            pass
-
-        rewards = np.array(rewards)
-        episode_return = np.sum(rewards[rewards!=None])
         episode_returns.append(episode_return)
-        episode_highest_reward = np.max(rewards[rewards!=None])
         highest_rewards.append(episode_highest_reward)
         logger(f'Rollout {rollout_id}\n{episode_return=}, {episode_highest_reward=}, {env_max_reward=}, Success: {episode_highest_reward==env_max_reward}')
-
-        if will_save_this_rollout:
-            save_videos(image_list, DT, video_path=os.path.join(output_dir, f'video{rollout_id}.mp4'))
-            # 记录并可视化关节角度：state vs command
-            plot_path = os.path.join(output_dir, f'video{rollout_id}_qpos.png')
-            visualize_joints(qpos_list, target_qpos_list, plot_path=plot_path,
-                             label_overwrite=('State', 'Command'))
 
     success_rate = np.mean(np.array(highest_rewards) == env_max_reward)
     avg_return = np.mean(episode_returns)

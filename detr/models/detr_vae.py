@@ -34,8 +34,9 @@ def get_sinusoid_encoding_table(n_position, d_hid):
     return torch.FloatTensor(sinusoid_table).unsqueeze(0)
 
 
-# Hardcoded: save FiLM-after feature map (channel-mean grayscale) for offline video stitching.
-_FILM_VIZ_SAVE = True
+# FiLM-after feature map dump for offline video stitching. Off by default (would block automated rollout).
+# Enable with: ACT_FILM_VIZ_SAVE=1
+_FILM_VIZ_SAVE = os.environ.get("ACT_FILM_VIZ_SAVE", "").lower() in ("1", "true", "yes")
 _FILM_VIZ_OUT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "tmp",
@@ -99,7 +100,17 @@ class DETRVAE(nn.Module):
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim) # project latent sample to embedding
         self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for proprio and latent
 
-    def forward(self, qpos, image, env_state, actions=None, is_pad=None, latent_z_sample=None):
+    def forward(
+        self,
+        qpos,
+        image,
+        env_state,
+        actions=None,
+        is_pad=None,
+        latent_z_sample=None,
+        film_gamma=None,
+        film_beta=None,
+    ):
         """
         qpos: batch, qpos_dim
         image: batch, num_cam, channel, height, width
@@ -174,8 +185,30 @@ class DETRVAE(nn.Module):
             pos = torch.cat(all_cam_pos, axis=3)
 
             # FiLM (feature-wise affine): src = gamma * src + beta
-            gamma = self.visual_film_gamma.view(1, -1, 1, 1).to(dtype=src.dtype, device=src.device)
-            beta = self.visual_film_beta.view(1, -1, 1, 1).to(dtype=src.dtype, device=src.device)
+            # Default: use internal buffers (shared across batch).
+            # Optional: allow per-sample FiLM via film_gamma/film_beta of shape (bs, hidden_dim).
+            if film_gamma is None:
+                gamma = self.visual_film_gamma.view(1, -1, 1, 1).to(dtype=src.dtype, device=src.device)
+            else:
+                g = film_gamma
+                if not torch.is_tensor(g):
+                    g = torch.as_tensor(g, dtype=torch.float32)
+                g = g.to(device=src.device, dtype=src.dtype)
+                if g.ndim == 1:
+                    g = g.view(1, -1)
+                gamma = g.view(g.shape[0], -1, 1, 1)
+
+            if film_beta is None:
+                beta = self.visual_film_beta.view(1, -1, 1, 1).to(dtype=src.dtype, device=src.device)
+            else:
+                b = film_beta
+                if not torch.is_tensor(b):
+                    b = torch.as_tensor(b, dtype=torch.float32)
+                b = b.to(device=src.device, dtype=src.dtype)
+                if b.ndim == 1:
+                    b = b.view(1, -1)
+                beta = b.view(b.shape[0], -1, 1, 1)
+
             src = src * gamma + beta
 
             if _FILM_VIZ_SAVE and not self.training:
@@ -197,7 +230,6 @@ class DETRVAE(nn.Module):
                     Image.fromarray(gray_u8, mode="L").save(
                         os.path.join(_FILM_VIZ_OUT_DIR, f"film_{_FILM_VIZ_MODE}_{idx:06d}.png")
                     )
-                    breakpoint()
 
             hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
         else:
