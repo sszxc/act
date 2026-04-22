@@ -21,7 +21,7 @@ from tqdm import tqdm
 from einops import rearrange
 import h5py
 
-from constants import DT, DEFAULT_STATE_DIM, ROOT_DIM, STATE_DIM_DEX
+from constants import DT, DEFAULT_STATE_DIM, ROOT_DIM, STATE_DIM_ALLEGRO
 from constants import PUPPET_GRIPPER_JOINT_OPEN, PUPPET_GRIPPER_POSITION_UNNORMALIZE_FN
 from utils import load_data # data functions
 from utils import sample_box_pose, sample_insertion_pose # robot functions
@@ -573,7 +573,7 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
     replay_episode = config.get('replay_episode', 0)
     num_rollouts_cfg = int(config.get('num_rollouts', 50))
 
-    use_pca_action = ('dex' in task_name and action_dim < STATE_DIM_DEX and not direct_replay)
+    use_pca_action = ('dex' in task_name and action_dim < STATE_DIM_ALLEGRO and not direct_replay)
 
     latent_z_sample_str = config.get('latent_z_sample', None)
     latent_z_dim = int(policy_config.get('latent_z_dim', 32)) if isinstance(policy_config, dict) else 32
