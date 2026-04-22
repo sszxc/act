@@ -1,0 +1,5 @@
+- [x] 确认训练的时候参数会保存一份到 config
+- [x] eval 的时候视频保存到子文件夹（文件夹下包括 eval 的参数
+- [ ] eval 和 train 的结果保存一个用时
+- [ ] 参数扫描
+- [ ] 对 image 的 attention？

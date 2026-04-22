@@ -7,7 +7,7 @@ import numpy as np
 from PIL import Image
 
 # 改成你自己的 hdf5 路径
-HDF5_PATH = "data/sim_transfer_cube_scripted/episode_0.hdf5"
+HDF5_PATH = "data/sim_dexgrasp_cube_teleop/20260304_123721/episode_0.hdf5"
 DATASET_KEY = "observations/images/top"
 
 
