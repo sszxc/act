@@ -5,7 +5,6 @@ if 'MUJOCO_GL' not in os.environ:
 
 import numpy as np
 import collections
-import matplotlib.pyplot as plt
 from dm_control import mujoco
 from dm_control.rl import control
 from dm_control.suite import base
@@ -76,12 +75,13 @@ def make_sim_env(task_name, time_limit=20):
         env = control.Environment(physics, task, time_limit=time_limit, control_timestep=DT,
                                   n_sub_steps=None, flat_observation=False)
     elif 'sim_hmf_proto5_manipulation' in task_name:
-        raise NotImplementedError(
-            "sim_hmf_proto5_manipulation 尚未在 sim_env.py 中实现对应的 Mujoco XML/Task。"
-            "当前仓库仅内置 bimanual transfer/insertion（14-dim action）与 allegro dex（22-dim action）。"
-            "你的新任务期望 action_dim=25/state_dim=24，需要新增相应 XML、Task.before_step(action) 映射、"
-            "以及 get_observation() 中 images 相机名 corner3/lhand_palm_right_cam 的渲染。"
-        )
+        # UR5e + Honda hand (left) pick&place v3 with mocap-welded wrist.
+        # Action 25d: mocap_pos(3) + mocap_quat(4) + hand_ctrl(18).
+        xml_path = '/home/lab/Documents/proto5_description/Metaworld/metaworld/assets/ur5e_honda_hand/ur5e_hand_pick_place_v3.xml'
+        physics = mujoco.Physics.from_xml_path(xml_path)
+        task = Proto5PickPlaceV3Task(random=False)
+        env = control.Environment(physics, task, time_limit=time_limit, control_timestep=DT,
+                                  n_sub_steps=None, flat_observation=False)
     else:
         raise NotImplementedError
     return env
@@ -342,6 +342,111 @@ class AllegroDexGraspTask(base.Task):
         return reward
 
 
+class Proto5PickPlaceV3Task(base.Task):
+    """
+    UR5e + Honda hand (left) with mocap welded to wrist.
+
+    - Action (25,): mocap_pos(3), mocap_quat(4) (wxyz), ctrl(18)
+    - Observation:
+        - qpos: robot qpos (24,) = ur5e(6) + hand(18)
+        - qvel: robot qvel (24,)
+        - env_state: object free joint pose (7,) = xyz + quat(wxyz)
+        - images: corner3, lhand_palm_right_cam
+    """
+
+    MOCAP_BODY_NAME = 'mocap'
+    ROBOT_QPOS_SIZE = 24
+    OBJECT_QPOS_SIZE = 7
+    CTRL_SIZE = 18
+    KEYFRAME_NAME = 'home'
+
+    def __init__(self, random=None):
+        super().__init__(random=random)
+        self.max_reward = 0
+
+    @staticmethod
+    def _get_mocap_id(physics):
+        body_id = physics.model.name2id(Proto5PickPlaceV3Task.MOCAP_BODY_NAME, 'body')
+        mocap_id = int(physics.model.body_mocapid[body_id])
+        if mocap_id < 0:
+            raise ValueError(f"Body '{Proto5PickPlaceV3Task.MOCAP_BODY_NAME}' is not a mocap body in this XML.")
+        return mocap_id
+
+    def before_step(self, action, physics):
+        action = np.asarray(action, dtype=np.float64).reshape(-1)
+        if action.shape[0] != 7 + self.CTRL_SIZE:
+            raise ValueError(f"Expected action dim {7 + self.CTRL_SIZE}, got {action.shape[0]}.")
+
+        mocap_pos = action[:3]
+        mocap_quat = action[3:7]  # wxyz (as in the XML keyframe mquat)
+        ctrl = action[7:]
+
+        mocap_id = self._get_mocap_id(physics)
+        physics.data.mocap_pos[mocap_id][:] = mocap_pos
+        physics.data.mocap_quat[mocap_id][:] = mocap_quat
+
+        if physics.model.nu != self.CTRL_SIZE:
+            raise ValueError(f"Expected nu={self.CTRL_SIZE} actuators, got {physics.model.nu}.")
+        physics.data.ctrl[:] = ctrl
+
+    def initialize_episode(self, physics):
+        with physics.reset_context():
+            # Prefer named keyframe init if present; fallback to first keyframe if any.
+            key_id = None
+            if getattr(physics.model, 'nkey', 0) > 0:
+                try:
+                    key_id = physics.model.name2id(self.KEYFRAME_NAME, 'key')
+                except Exception:
+                    key_id = 0
+
+            if key_id is not None:
+                if physics.model.key_qpos.shape[0] > key_id:
+                    physics.data.qpos[:] = physics.model.key_qpos[key_id]
+                if getattr(physics.model, 'key_qvel', None) is not None and physics.model.key_qvel.shape[0] > key_id:
+                    physics.data.qvel[:] = physics.model.key_qvel[key_id]
+                if getattr(physics.model, 'key_ctrl', None) is not None and physics.model.key_ctrl.shape[0] > key_id:
+                    # key_ctrl length should match nu (=18)
+                    physics.data.ctrl[:] = physics.model.key_ctrl[key_id]
+                if getattr(physics.model, 'key_mpos', None) is not None and physics.model.key_mpos.shape[0] > key_id:
+                    mocap_id = self._get_mocap_id(physics)
+                    physics.data.mocap_pos[mocap_id][:] = physics.model.key_mpos[key_id]
+                if getattr(physics.model, 'key_mquat', None) is not None and physics.model.key_mquat.shape[0] > key_id:
+                    mocap_id = self._get_mocap_id(physics)
+                    physics.data.mocap_quat[mocap_id][:] = physics.model.key_mquat[key_id]
+
+        super().initialize_episode(physics)
+
+    @staticmethod
+    def get_qpos(physics):
+        qpos = physics.data.qpos.copy()
+        return qpos[:Proto5PickPlaceV3Task.ROBOT_QPOS_SIZE]
+
+    @staticmethod
+    def get_qvel(physics):
+        qvel = physics.data.qvel.copy()
+        return qvel[:Proto5PickPlaceV3Task.ROBOT_QPOS_SIZE]
+
+    @staticmethod
+    def get_env_state(physics):
+        qpos = physics.data.qpos.copy()
+        start = Proto5PickPlaceV3Task.ROBOT_QPOS_SIZE
+        end = start + Proto5PickPlaceV3Task.OBJECT_QPOS_SIZE
+        return qpos[start:end]
+
+    def get_observation(self, physics):
+        obs = collections.OrderedDict()
+        obs['qpos'] = self.get_qpos(physics)
+        obs['qvel'] = self.get_qvel(physics)
+        obs['env_state'] = self.get_env_state(physics)
+        obs['images'] = dict()
+        obs['images']['corner3'] = physics.render(height=480, width=640, camera_id='corner3')
+        obs['images']['lhand_palm_right_cam'] = physics.render(height=480, width=640, camera_id='lhand_palm_right_cam')
+        return obs
+
+    def get_reward(self, physics):
+        return 0
+
+
 def get_action(master_bot_left, master_bot_right):
     action = np.zeros(14)
     # arm action
@@ -358,6 +463,7 @@ def get_action(master_bot_left, master_bot_right):
 
 def test_sim_teleop():
     """ Testing teleoperation in sim with ALOHA. Requires hardware and ALOHA repo to work. """
+    import matplotlib.pyplot as plt
     from interbotix_xs_modules.arm import InterbotixManipulatorXS
 
     BOX_POSE[0] = [0.2, 0.5, 0.05, 1, 0, 0, 0]

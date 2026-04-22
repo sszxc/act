@@ -65,8 +65,8 @@ SIM_TASK_CONFIGS = {
         "pca_finger_dim": 3,
     },
     "sim_hmf_proto5_manipulation": {
-        "dataset_dir": DATA_DIR + "/sim_hmf_proto5_manipulation",
-        "num_episodes": 50,
+        "dataset_dir": DATA_DIR + "/sim_hmf_proto5_teleop/pick_place_v3/20260422_123320",
+        "num_episodes": 10,
         "episode_len": 400,
         "camera_names": ["corner3", "lhand_palm_right_cam"],
         "state_dim": 24,
