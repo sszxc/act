@@ -2,6 +2,9 @@
 """
 在固定物体初始位姿下，用 CMA-ES 或 ARS 搜索 ACT 策略中 FiLM（visual gamma/beta）参数，以最大化单局 episode_return。
 
+可选 Random Subspace Projection（RSP）：在随机低维子空间中优化 z，使 theta = theta_base + P @ z（P 固定），
+默认子空间维度 16；--rsp_subspace_dim 0 表示在全维 FiLM 上优化（与旧行为一致）。
+
 依赖：
   - 必选：numpy, torch, matplotlib
   - CMA-ES：pip install cma（仅 --method cma 时需要）
@@ -9,6 +12,9 @@
 示例：
   python optimize_film_params.py --ckpt /path/to/policy_best.ckpt --task_name sim_transfer_cube_human \\
     --fixed_object_pose "0.1,0.5,0.05,1,0,0,0" --method ars --ars_iters 3 --ars_pairs 2 --output_dir tmp/film_search
+
+  # 与旧版一致：全维 FiLM 搜索（关闭 RSP）
+  python optimize_film_params.py ... --rsp_subspace_dim 0 ...
 
   python optimize_film_params.py --ckpt ... --method cma --cma_maxiter 5 --cma_popsize 8 ...
 """
@@ -82,6 +88,41 @@ def _film_theta_from_policy(policy: ACTPolicy) -> np.ndarray:
     g = policy.model.visual_film_gamma.detach().float().cpu().numpy()
     b = policy.model.visual_film_beta.detach().float().cpu().numpy()
     return np.concatenate([g, b], axis=0)
+
+
+def _make_rsp_projection(
+    film_dim: int,
+    subspace_dim: int,
+    rng: np.random.Generator,
+    *,
+    orthogonal: bool,
+) -> np.ndarray:
+    """返回 P，形状 (film_dim, subspace_dim)，列满秩；theta = theta_base + P @ z。"""
+    if subspace_dim <= 0:
+        raise ValueError("subspace_dim 须为正")
+    if subspace_dim > film_dim:
+        raise ValueError(f"rsp_subspace_dim={subspace_dim} 不能大于 film_dim={film_dim}")
+    a = rng.standard_normal((film_dim, subspace_dim))
+    if orthogonal:
+        q, _ = np.linalg.qr(a, mode="reduced")
+        return q.astype(np.float64, copy=False)
+    return a.astype(np.float64, copy=False)
+
+
+def _rsp_decode(theta_base: np.ndarray, proj: np.ndarray, z: np.ndarray) -> np.ndarray:
+    z = np.asarray(z, dtype=np.float64).reshape(-1)
+    if z.shape[0] != proj.shape[1]:
+        raise ValueError(f"z 维 {z.shape[0]} != rsp 维 {proj.shape[1]}")
+    return theta_base + proj @ z
+
+
+def _rsp_decode_batch(theta_base: np.ndarray, proj: np.ndarray, z_batch: np.ndarray) -> np.ndarray:
+    zb = np.asarray(z_batch, dtype=np.float64)
+    if zb.ndim == 1:
+        zb = zb.reshape(1, -1)
+    if zb.shape[1] != proj.shape[1]:
+        raise ValueError(f"z_batch 形状 {zb.shape} 与 proj 列数 {proj.shape[1]} 不符")
+    return theta_base + zb @ proj.T
 
 
 def _apply_film_theta(policy: ACTPolicy, theta: np.ndarray, hidden_dim: int):
@@ -587,6 +628,23 @@ def main():
         default=1,
         help="并行评估候选数（一次 batch 同步推进多少条轨迹；单 GPU 批量推理）",
     )
+    p.add_argument(
+        "--rsp_subspace_dim",
+        type=int,
+        default=16,
+        help="FiLM 随机子空间维度；z 经 P 映射到全维。0 表示不用 RSP，直接在全维优化",
+    )
+    p.add_argument(
+        "--rsp_seed",
+        type=int,
+        default=None,
+        help="生成投影矩阵的随机种子；默认与 --seed 相同",
+    )
+    p.add_argument(
+        "--rsp_raw_gaussian",
+        action="store_true",
+        help="投影列用高斯 i.i.d.，不做 QR 正交化（默认 QR 得到列正交基）",
+    )
 
     args = p.parse_args()
     if args.policy_class != "ACT":
@@ -629,7 +687,22 @@ def main():
 
     hidden_dim = int(policy.model.visual_film_gamma.numel())
     film_dim = 2 * hidden_dim
+    rsp_dim = int(args.rsp_subspace_dim)
+    if rsp_dim < 0:
+        print(f"非法 --rsp_subspace_dim={rsp_dim}", file=sys.stderr)
+        sys.exit(1)
+    if rsp_dim >= film_dim:
+        print(
+            f"警告: rsp_subspace_dim={rsp_dim} >= film_dim={film_dim}，改为全维优化",
+            file=sys.stderr,
+        )
+        rsp_dim = 0
+    use_rsp = 0 < rsp_dim < film_dim
     print(f"Loaded {ckpt_loaded}, FiLM 参数维度 = {film_dim} (hidden_dim={hidden_dim})")
+    if use_rsp:
+        print(f"RSP: 优化维度 = {rsp_dim}（映射到 {film_dim}）")
+    else:
+        print("RSP: 关闭，全维优化")
 
     latent_z = _parse_latent_z(args.latent_z_sample, args.latent_z_dim)
 
@@ -664,7 +737,7 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    def fitness_batch(theta_batch: np.ndarray) -> np.ndarray:
+    def eval_theta_batch(theta_batch: np.ndarray) -> np.ndarray:
         return rollout_batch_episode_returns(
             policy,
             envs[: theta_batch.shape[0]],
@@ -680,27 +753,58 @@ def main():
             num_episodes=task_cfg.get("num_episodes"),
         )
 
-    def fitness(theta: np.ndarray) -> float:
-        return float(fitness_batch(np.asarray(theta, dtype=np.float64).reshape(1, -1))[0])
+    theta_base = _film_theta_from_policy(policy).astype(np.float64, copy=False)
+    rsp_proj: np.ndarray | None = None
+    if use_rsp:
+        rsp_seed_used = int(args.rsp_seed) if args.rsp_seed is not None else int(args.seed)
+        rng_p = np.random.default_rng(rsp_seed_used)
+        rsp_proj = _make_rsp_projection(
+            film_dim, rsp_dim, rng_p, orthogonal=not args.rsp_raw_gaussian
+        )
+        z0 = np.zeros(rsp_dim, dtype=np.float64)
 
-    theta0 = _film_theta_from_policy(policy)
+        def fitness_batch(z_batch: np.ndarray) -> np.ndarray:
+            return eval_theta_batch(_rsp_decode_batch(theta_base, rsp_proj, z_batch))
+
+        def fitness(z: np.ndarray) -> float:
+            return float(fitness_batch(np.asarray(z, dtype=np.float64).reshape(1, -1))[0])
+
+        opt_x0 = z0
+    else:
+
+        def fitness_batch(theta_batch: np.ndarray) -> np.ndarray:
+            return eval_theta_batch(theta_batch)
+
+        def fitness(theta: np.ndarray) -> float:
+            return float(fitness_batch(np.asarray(theta, dtype=np.float64).reshape(1, -1))[0])
+
+        opt_x0 = theta_base
+
     meta = {
         "ckpt": ckpt_loaded,
         "task_name": task_name,
         "method": args.method,
         "film_dim": film_dim,
+        "rsp_subspace_dim": rsp_dim,
+        "rsp_enabled": use_rsp,
         "fixed_object_pose": fixed_object_pose.tolist(),
         "env_max_reward": env_max_reward,
     }
+    if use_rsp:
+        meta["rsp_seed"] = int(args.rsp_seed) if args.rsp_seed is not None else int(args.seed)
+        meta["rsp_orthogonal"] = not args.rsp_raw_gaussian
+        meta["theta_base"] = theta_base.tolist()
     with open(out_dir / "run_meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
+    if use_rsp and rsp_proj is not None:
+        np.save(out_dir / "rsp_projection.npy", rsp_proj)
 
     if args.method == "ars":
         log_path = out_dir / "ars_history.jsonl"
         if int(args.parallel) > 1:
-            best_theta, h_best, h_iter = run_ars_batched(
+            best_x, h_best, h_iter = run_ars_batched(
                 fitness_batch,
-                theta0,
+                opt_x0,
                 n_iters=args.ars_iters,
                 n_pairs=args.ars_pairs,
                 sigma=args.ars_sigma,
@@ -710,9 +814,9 @@ def main():
                 batch_size=int(args.parallel),
             )
         else:
-            best_theta, h_best, h_iter = run_ars(
+            best_x, h_best, h_iter = run_ars(
                 fitness,
-                theta0,
+                opt_x0,
                 n_iters=args.ars_iters,
                 n_pairs=args.ars_pairs,
                 sigma=args.ars_sigma,
@@ -725,9 +829,9 @@ def main():
     else:
         log_path = out_dir / "cma_history.jsonl"
         if int(args.parallel) > 1:
-            best_theta, h_best, h_gen = run_cma_batched(
+            best_x, h_best, h_gen = run_cma_batched(
                 fitness_batch,
-                theta0,
+                opt_x0,
                 sigma0=args.cma_sigma0,
                 maxiter=args.cma_maxiter,
                 popsize=args.cma_popsize,
@@ -736,9 +840,9 @@ def main():
                 batch_size=int(args.parallel),
             )
         else:
-            best_theta, h_best, h_gen = run_cma(
+            best_x, h_best, h_gen = run_cma(
                 fitness,
-                theta0,
+                opt_x0,
                 sigma0=args.cma_sigma0,
                 maxiter=args.cma_maxiter,
                 popsize=args.cma_popsize,
@@ -748,16 +852,27 @@ def main():
         np.savez(out_dir / "cma_curves.npz", best_so_far=h_best, gen_max=h_gen)
         _save_curve_png(out_dir / "reward_curve.png", h_best, "best_so_far", h_gen, "gen_max")
 
+    if use_rsp and rsp_proj is not None:
+        best_theta = _rsp_decode(theta_base, rsp_proj, best_x)
+        np.save(out_dir / "best_rsp_z.npy", np.asarray(best_x, dtype=np.float64))
+    else:
+        best_theta = np.asarray(best_x, dtype=np.float64)
+
     _apply_film_theta(policy, best_theta, hidden_dim)
     film_ckpt = {
         "visual_film_gamma": policy.model.visual_film_gamma.cpu(),
         "visual_film_beta": policy.model.visual_film_beta.cpu(),
         "best_theta": torch.from_numpy(best_theta.astype(np.float32)),
     }
+    if use_rsp and rsp_proj is not None:
+        film_ckpt["best_rsp_z"] = torch.from_numpy(np.asarray(best_x, dtype=np.float32))
+        film_ckpt["rsp_projection"] = torch.from_numpy(rsp_proj.astype(np.float32))
     torch.save(film_ckpt, out_dir / "best_film_only.pt")
     best_logged = float(np.max(h_best)) if len(h_best) else float("nan")
     print(f"Done. Best episode_return in log ≈ {best_logged}")
     print(f"Saved: {out_dir / 'best_film_only.pt'}, {out_dir / 'reward_curve.png'}")
+    if use_rsp:
+        print(f"RSP 产物: {out_dir / 'rsp_projection.npy'}, {out_dir / 'best_rsp_z.npy'}")
 
 
 if __name__ == "__main__":
