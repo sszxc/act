@@ -3,7 +3,7 @@ import pathlib
 ### Task parameters
 DATA_DIR = 'data'
 DEFAULT_STATE_DIM = 14
-STATE_DIM_DEX = 22
+STATE_DIM_ALLEGRO = 22
 ROOT_DIM = 6   # allegro hand root 6dof (x,y,z,rx,ry,rz)
 FINGER_DIM = 16  # allegro finger joints
 DEX_ALLEGRO_XML_PATH = '/mnt/1tb1/xuechao/MuJoCo-Asset-Pipeline/asset/scene/freejoint/teleop_scene_left_077_rubiks_cube/teleop_scene_left_077_rubiks_cube.xml'
@@ -39,30 +39,38 @@ SIM_TASK_CONFIGS = {
         "num_episodes": 51,
         "episode_len": 400,
         "camera_names": ["default_cam", "wrist_cam"],
-        "state_dim": STATE_DIM_DEX,
+        "state_dim": STATE_DIM_ALLEGRO,
     },
     "sim_dexgrasp_cube_teleop_minimal": {
         "dataset_dir": DATA_DIR + "/sim_dexgrasp_cube_teleop/20260306_152210",
         "num_episodes": 5,
         "episode_len": 400,
         "camera_names": ["default_cam", "wrist_cam"],
-        "state_dim": STATE_DIM_DEX,
+        "state_dim": STATE_DIM_ALLEGRO,
     },
     "sim_dexgrasp_cube_teleop": {
         "dataset_dir": DATA_DIR + "/sim_dexgrasp_cube_teleop/20260306_153749",
         "num_episodes": 49,
         "episode_len": 400,
         "camera_names": ["default_cam", "wrist_cam"],
-        "state_dim": STATE_DIM_DEX,
+        "state_dim": STATE_DIM_ALLEGRO,
     },
     "sim_dexgrasp_pca_cube_teleop": {
         "dataset_dir": DATA_DIR + "/sim_dexgrasp_cube_teleop/20260306_153749",
         "num_episodes": 49,
         "episode_len": 400,
         "camera_names": ["default_cam", "wrist_cam"],
-        "state_dim": STATE_DIM_DEX,
+        "state_dim": STATE_DIM_ALLEGRO,
         "action_dim": ROOT_DIM + 3,  # root 6 + finger 3 PCs
         "pca_finger_dim": 3,
+    },
+    "sim_hmf_proto5_manipulation": {
+        "dataset_dir": DATA_DIR + "/sim_hmf_proto5_manipulation",
+        "num_episodes": 50,
+        "episode_len": 400,
+        "camera_names": ["corner3", "lhand_palm_right_cam"],
+        "state_dim": 24,
+        "action_dim": 25,
     },
 }
 

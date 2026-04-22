@@ -75,6 +75,13 @@ def make_sim_env(task_name, time_limit=20):
         task = AllegroDexGraspTask(random=False)
         env = control.Environment(physics, task, time_limit=time_limit, control_timestep=DT,
                                   n_sub_steps=None, flat_observation=False)
+    elif 'sim_hmf_proto5_manipulation' in task_name:
+        raise NotImplementedError(
+            "sim_hmf_proto5_manipulation 尚未在 sim_env.py 中实现对应的 Mujoco XML/Task。"
+            "当前仓库仅内置 bimanual transfer/insertion（14-dim action）与 allegro dex（22-dim action）。"
+            "你的新任务期望 action_dim=25/state_dim=24，需要新增相应 XML、Task.before_step(action) 映射、"
+            "以及 get_observation() 中 images 相机名 corner3/lhand_palm_right_cam 的渲染。"
+        )
     else:
         raise NotImplementedError
     return env
