@@ -11,7 +11,7 @@ from constants import DT
 
 
 def _draw_camera_name(image, name):
-    """在图像左上角绘制相机名（image 为 RGB numpy (H,W,3) uint8）"""
+    """Draw camera name at top-left (image: RGB numpy (H,W,3) uint8)."""
     if image.size == 0 or image.shape[2] != 3:
         return image
     pil = Image.fromarray(image)
@@ -20,7 +20,7 @@ def _draw_camera_name(image, name):
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
     except Exception:
         font = ImageFont.load_default()
-    # 描边效果：先画黑边再画白字，保证在任意背景下可读
+    # Stroke: black outline then white text for contrast
     x, y = 10, 10
     for dx, dy in [(-1,-1),(-1,1),(1,-1),(1,1),(-1,0),(1,0),(0,-1),(0,1)]:
         draw.text((x+dx, y+dy), name, font=font, fill=(0, 0, 0))
@@ -30,7 +30,7 @@ def _draw_camera_name(image, name):
 import IPython
 e = IPython.embed
 
-# ALOHA 双臂关节名（仅作参考，绘图不再使用，以支持任意构型数据集）
+# ALOHA dual-arm joint names (reference only; plots use generic joint dim)
 # JOINT_NAMES = ["waist", "shoulder", "elbow", "forearm_roll", "wrist_angle", "wrist_rotate"]
 # STATE_NAMES = JOINT_NAMES + ["gripper"]
 
@@ -68,7 +68,7 @@ def main(args):
 
 
 def _save_video(frames, output_path, fps=30, verbose=False):
-    """使用 imageio 保存视频，尝试多种编码器以保证可播放"""
+    """Save video with imageio; try several codecs for compatibility."""
     if not output_path.endswith('.mp4'):
         output_path += '.mp4'
     out_dir = os.path.dirname(output_path)
@@ -76,30 +76,30 @@ def _save_video(frames, output_path, fps=30, verbose=False):
         os.makedirs(out_dir, exist_ok=True)
 
     if verbose:
-        print(f"使用 imageio 保存视频到: {output_path}")
-        print(f"帧数: {len(frames)}, 帧率: {fps}")
+        print(f"Saving video with imageio to: {output_path}")
+        print(f"Frames: {len(frames)}, fps: {fps}")
 
     codecs_to_try = ["libx264", "libx264rgb", "mpeg4", "libvpx-vp9"]
     for codec in codecs_to_try:
         try:
             if verbose:
-                print(f"尝试使用 {codec} 编码器...")
+                print(f"Trying codec {codec}...")
             with imageio.get_writer(output_path, fps=fps, codec=codec) as writer:
-                for frame in tqdm(frames, desc="写入视频帧", unit="帧"):
+                for frame in tqdm(frames, desc="Writing frames", unit="frame"):
                     writer.append_data(frame)
             if verbose:
-                print(f"✓ 视频已保存 (使用 {codec} 编码器): {output_path}")
+                print(f"✓ Video saved (codec {codec}): {output_path}")
             print(f'Saved video to: {output_path}')
             return
         except Exception as e:
-            print(f"✗ {codec} 编码器失败: {e}")
+            print(f"✗ Codec {codec} failed: {e}")
             continue
-    raise RuntimeError(f"所有编码器均失败，无法保存视频: {output_path}")
+    raise RuntimeError(f"All codecs failed; could not save video: {output_path}")
 
 
 def save_videos(video, dt, video_path=None, input_bgr=False):
-    """将 video（list 或 dict 格式的多相机帧）转为帧列表并用 imageio 保存。
-    input_bgr: 若 True 表示 HDF5 里存的是 BGR，会转成 RGB 再写；默认 False 表示已是 RGB，不转换。
+    """Build frame list from video (list or dict of multi-cam frames) and save via imageio.
+    input_bgr: if True, HDF5 stores BGR → convert to RGB before writing; else assume RGB.
     """
     if video_path is None:
         video_path = 'output.mp4'
@@ -108,7 +108,7 @@ def save_videos(video, dt, video_path=None, input_bgr=False):
     if isinstance(video, list):
         cam_names = list(video[0].keys())
         frames = []
-        for image_dict in tqdm(video, desc="生成视频帧", unit="帧"):
+        for image_dict in tqdm(video, desc="Building frames", unit="frame"):
             images = []
             for cam_name in cam_names:
                 image = image_dict[cam_name].copy()
@@ -122,7 +122,7 @@ def save_videos(video, dt, video_path=None, input_bgr=False):
         cam_names = list(video.keys())
         n_frames = video[cam_names[0]].shape[0]
         frames = []
-        for t in tqdm(range(n_frames), desc="生成视频帧", unit="帧"):
+        for t in tqdm(range(n_frames), desc="Building frames", unit="frame"):
             images = []
             for cam_name in cam_names:
                 image = video[cam_name][t].copy()
@@ -133,7 +133,7 @@ def save_videos(video, dt, video_path=None, input_bgr=False):
             frame = np.concatenate(images, axis=1)
             frames.append(frame)
     else:
-        raise TypeError("video 必须是 list 或 dict")
+        raise TypeError("video must be list or dict")
 
     _save_video(frames, video_path, fps=fps, verbose=False)
 
@@ -148,14 +148,14 @@ def visualize_joints(qpos_list, command_list, plot_path=None, ylim=None, label_o
     command = np.array(command_list)
     num_ts, qpos_dim = qpos.shape
     command_dim = command.shape[1]
-    num_dim = max(qpos_dim, command_dim)  # 允许 qpos 与 action 维度不一致
+    num_dim = max(qpos_dim, command_dim)  # qpos/action dims may differ
     h, w = 2, num_dim
     num_figs = num_dim
     fig, axs = plt.subplots(num_figs, 1, figsize=(w, h * num_figs))
 
-    # plot joint state（不绑定具体 joint 名称，支持任意机械臂构型）
+    # Plot joint state (generic dims; no fixed joint names)
     # all_names = [name + '_left' for name in STATE_NAMES] + [name + '_right' for name in STATE_NAMES]
-    for dim_idx in tqdm(range(num_dim), desc="绘制关节状态", unit="轴"):
+    for dim_idx in tqdm(range(num_dim), desc="Plotting state", unit="dim"):
         ax = axs[dim_idx]
         if dim_idx < qpos_dim:
             ax.plot(qpos[:, dim_idx], label=label1)
@@ -163,7 +163,7 @@ def visualize_joints(qpos_list, command_list, plot_path=None, ylim=None, label_o
         ax.legend()
 
     # plot arm command
-    for dim_idx in tqdm(range(num_dim), desc="绘制关节指令", unit="轴"):
+    for dim_idx in tqdm(range(num_dim), desc="Plotting command", unit="dim"):
         ax = axs[dim_idx]
         if dim_idx < command_dim:
             ax.plot(command[:, dim_idx], label=label2)
@@ -213,6 +213,6 @@ if __name__ == '__main__':
     parser.add_argument(
         '--input_bgr',
         action='store_true',
-        help='HDF5 中图像为 BGR 时指定，会转为 RGB 再写视频；默认假定已是 RGB。',
+        help='HDF5 stores BGR images; converts to RGB for video. Default assumes RGB.',
     )
     main(vars(parser.parse_args()))

@@ -1,8 +1,8 @@
 import os
 import time
-# 无显示器时使用离屏渲染，避免 "OpenGL platform library has not been loaded" 错误
+# Headless/offscreen rendering when no display; avoids "OpenGL platform library has not been loaded".
 if 'MUJOCO_GL' not in os.environ:
-    os.environ['MUJOCO_GL'] = 'egl'  # 有 GPU 用 egl；无 GPU 可改为 'osmesa'
+    os.environ['MUJOCO_GL'] = 'egl'  # Use egl with GPU; use 'osmesa' if no GPU.
 
 import sys
 import shutil
@@ -22,6 +22,8 @@ from einops import rearrange
 import h5py
 
 from constants import DT, DEFAULT_STATE_DIM, ROOT_DIM, STATE_DIM_ALLEGRO
+from constants import ENV_FAMILY_ALLEGRO, ENV_FAMILY_HMF_PROTO5_HAND, ENV_FAMILY_METAWORLD
+from constants import HMF_PROTO5_CTRL_DIM, HMF_PROTO5_STATE_DIM
 from constants import PUPPET_GRIPPER_JOINT_OPEN, PUPPET_GRIPPER_POSITION_UNNORMALIZE_FN
 from utils import load_data # data functions
 from utils import sample_box_pose, sample_insertion_pose # robot functions
@@ -37,22 +39,22 @@ e = IPython.embed
 
 def _save_hydra_config_to_dir(hydra_cfg, output_dir: str) -> None:
     """
-    将 Hydra 的 config（含插值解析版本）保存到指定结果目录，并尽量复制当前运行目录下的 .hydra 目录。
+    Save Hydra config (including resolved interpolations) to the result dir and copy cwd .hydra if present.
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1) 保存用户配置（原始 & resolve 后）
+    # 1) Save user config (raw and resolved)
     OmegaConf.save(hydra_cfg, os.path.join(output_dir, "config_hydra.yaml"))
     OmegaConf.save(hydra_cfg, os.path.join(output_dir, "config_hydra_resolved.yaml"), resolve=True)
 
-    # 2) 保存 Hydra 运行时信息（不保证一定可用）
+    # 2) Save Hydra runtime info (may be unavailable)
     try:
         runtime_cfg = HydraConfig.get()
         OmegaConf.save(runtime_cfg, os.path.join(output_dir, "hydra_runtime.yaml"), resolve=True)
     except Exception:
         pass
 
-    # 3) 复制当前工作目录下的 .hydra（如果存在）
+    # 3) Copy .hydra from cwd if it exists
     src_hydra_dir = os.path.join(os.getcwd(), ".hydra")
     if os.path.isdir(src_hydra_dir):
         dst_hydra_dir = os.path.join(output_dir, ".hydra")
@@ -60,7 +62,7 @@ def _save_hydra_config_to_dir(hydra_cfg, output_dir: str) -> None:
 
 
 def train_or_eval(args, hydra_cfg=None):
-    # 根据配置中的 seed 统一设置随机种子（影响 numpy / torch 以及数据划分等）
+    # Set RNG seed from config (numpy / torch / data splits)
     set_seed(args['seed'])
     # command line parameters
     is_eval = args['eval']
@@ -86,6 +88,7 @@ def train_or_eval(args, hydra_cfg=None):
     camera_names = task_config['camera_names']
     state_dim = task_config.get('state_dim', DEFAULT_STATE_DIM)
     action_dim = task_config.get('action_dim', state_dim)
+    env_family = task_config.get('env_family', None)
 
     # fixed parameters
     lr_backbone = 1e-5
@@ -129,6 +132,7 @@ def train_or_eval(args, hydra_cfg=None):
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
+        'env_family': env_family,
         'real_robot': not is_sim,
         # eval-only: user-specified latent z (fixed within rollout)
         'latent_z_sample': args.get('latent_z_sample', None),
@@ -137,27 +141,27 @@ def train_or_eval(args, hydra_cfg=None):
         'num_episodes': num_episodes,
         # whether to overwrite sim initial qpos from dataset
         'init_qpos_from_dataset': args.get('init_qpos_from_dataset', False),
-        # direct replay: 用数据集中某条轨迹的 action 序列直接控制 sim，不跑 policy
+        # direct replay: replay actions from dataset; no policy
         'direct_replay': args.get('direct_replay', False),
         'replay_episode': args.get('replay_episode', 0),
-        # eval 时最多保存多少条 rollout 的视频和 png；None 表示全部保存
+        # Eval: max rollouts whose video/png to save; None = all
         'max_save_episodes': args.get('max_save_episodes', None),
-        # eval 时总共运行多少条 rollout
+        # Eval: total rollouts to run
         'num_rollouts': args.get('num_rollouts', 50),
     }
 
     if is_eval:
-        # 为本次 eval 创建独立子目录：eval+时间戳
+        # Create eval subdir: eval+<timestamp>
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         eval_dir_name = f"eval_{timestamp}"
         eval_dir = os.path.join(ckpt_dir, eval_dir_name)
         os.makedirs(eval_dir, exist_ok=False)
 
-        # 保存本次 eval 使用的 config 参数，便于之后复现
+        # Save eval config for reproducibility
         eval_config_path = os.path.join(eval_dir, "eval_config.yaml")
         OmegaConf.save(OmegaConf.create(config), eval_config_path)
 
-        # 简单的 logger：既打印到 stdout，也写入 log 文件
+        # Logger: stdout + log file
         log_path = os.path.join(eval_dir, "eval.log")
         log_file = open(log_path, "w")
 
@@ -185,9 +189,9 @@ def train_or_eval(args, hydra_cfg=None):
         for ckpt_name, success_rate, avg_return in results:
             _log(f'{ckpt_name}: {success_rate=} {avg_return=}')
         _log(f"Total eval time: {eval_elapsed_sec:.2f} seconds")
-        _log("")  # 换行
+        _log("")  # blank line
 
-        # 额外保存一个 json，总结成功率等指标
+        # Extra JSON summary (success rate, etc.)
         summary_json = {
             "ckpt_dir": ckpt_dir,
             "eval_dir": eval_dir,
@@ -209,13 +213,13 @@ def train_or_eval(args, hydra_cfg=None):
         log_file.close()
         exit()
 
-    # train 模式：若 ckpt_dir 已存在则报错，避免覆盖
+    # Train: refuse to overwrite existing ckpt_dir
     if os.path.exists(ckpt_dir):
         raise FileExistsError(
             f'ckpt_dir already exists: {ckpt_dir}. Refusing to overwrite in train mode.'
         )
 
-    # 训练开始：先创建结果目录并保存 Hydra 配置
+    # Train: create result dir and save Hydra config
     os.makedirs(ckpt_dir, exist_ok=False)
     if hydra_cfg is not None:
         _save_hydra_config_to_dir(hydra_cfg, ckpt_dir)
@@ -279,18 +283,18 @@ def get_image(ts, camera_names):
     return curr_image
 
 
-def overwrite_sim_qpos_from_dataset(env, task_name, dataset_qpos):
+def overwrite_sim_qpos_from_dataset(env, task_name, dataset_qpos, env_family=None):
     """
-    将模拟环境的初始关节位置，用数据集中某条轨迹起点的 qpos 覆盖。
-    只对 sim 环境生效，对 real_robot 不做任何事。
+    Override sim initial joint positions with dataset trajectory start qpos.
+    Sim only; no-op for real_robot.
     """
     physics = env._physics
 
-    # bi-manual 14-dim 任务（transfer_cube / insertion）
-    if 'sim_transfer_cube' in task_name or 'sim_insertion' in task_name:
+    # Bi-manual 14-dim tasks (transfer_cube / insertion)
+    if env_family == ENV_FAMILY_METAWORLD or 'sim_transfer_cube' in task_name or 'sim_insertion' in task_name:
         q = np.asarray(dataset_qpos, dtype=np.float32)
         if q.shape[0] < 14:
-            raise ValueError(f"数据集 qpos 维度 {q.shape[0]} < 14，无法映射到模拟关节。")
+            raise ValueError(f"Dataset qpos dim {q.shape[0]} < 14; cannot map to sim joints.")
         q = q[:14]
         left_arm = q[:6]
         left_grip_norm = q[6]
@@ -309,14 +313,28 @@ def overwrite_sim_qpos_from_dataset(env, task_name, dataset_qpos):
             physics.data.qpos[15] = -right_grip_pos
             np.copyto(physics.data.ctrl, physics.data.qpos[:16])
 
-    elif 'dex' in task_name:
+    elif env_family == ENV_FAMILY_ALLEGRO:
         q = np.asarray(dataset_qpos, dtype=np.float32)
         if q.shape[0] < 22:
-            raise ValueError(f"dex 任务期望至少 22 维手部 qpos，但数据集给了 {q.shape[0]} 维。")
+            raise ValueError(f"dex task expects at least 22-dim hand qpos; dataset has {q.shape[0]}.")
         hand_qpos = q[:22]
         with physics.reset_context():
             physics.data.qpos[:22] = hand_qpos
             np.copyto(physics.data.ctrl, physics.data.qpos[:22])
+
+    elif env_family == ENV_FAMILY_HMF_PROTO5_HAND:
+        q = np.asarray(dataset_qpos, dtype=np.float32)
+        if q.shape[0] < HMF_PROTO5_STATE_DIM:
+            raise ValueError(
+                f"hmf_proto5_hand expects at least {HMF_PROTO5_STATE_DIM}-dim qpos; dataset has {q.shape[0]}."
+            )
+        robot_qpos = q[:HMF_PROTO5_STATE_DIM]
+        finger_qpos = robot_qpos[-HMF_PROTO5_CTRL_DIM:]
+        with physics.reset_context():
+            physics.data.qpos[:HMF_PROTO5_STATE_DIM] = robot_qpos
+            if physics.model.nu != HMF_PROTO5_CTRL_DIM:
+                raise ValueError(f"hmf_proto5_hand expects nu={HMF_PROTO5_CTRL_DIM}, got {physics.model.nu}.")
+            physics.data.ctrl[:] = finger_qpos
 
 
 def sample_dataset_start_qpos(dataset_dir, num_episodes):
@@ -327,24 +345,26 @@ def sample_dataset_start_qpos(dataset_dir, num_episodes):
     return np.array(qpos0, dtype=np.float32)
 
 
-def apply_object_pose_for_reset(task_name, fixed_object_pose):
+def apply_object_pose_for_reset(task_name, fixed_object_pose, env_family=None):
     """
-    在 env.reset() 前设置 BOX_POSE[0] 或 DEX_OBJECT_POSE[0]。
-    fixed_object_pose: None 时按任务随机采样；否则为固定长度向量（transfer 7, insertion 14, dex 7）。
+    Set BOX_POSE[0] or DEX_OBJECT_POSE[0] before env.reset().
+    fixed_object_pose None: task-specific random sample; else fixed vector (transfer 7, insertion 14, dex 7).
     """
     if fixed_object_pose is not None:
         arr = np.asarray(fixed_object_pose, dtype=np.float64).reshape(-1)
+        if env_family == ENV_FAMILY_HMF_PROTO5_HAND:
+            raise NotImplementedError("hmf_proto5_hand does not support fixed_object_pose override.")
         if 'sim_transfer_cube' in task_name:
             if arr.size != 7:
-                raise ValueError(f"sim_transfer_cube 需要 7 维 object pose，got {arr.size}")
+                raise ValueError(f"sim_transfer_cube needs 7-dim object pose, got {arr.size}")
             BOX_POSE[0] = arr
         elif 'sim_insertion' in task_name:
             if arr.size != 14:
-                raise ValueError(f"sim_insertion 需要 14 维 object pose，got {arr.size}")
+                raise ValueError(f"sim_insertion needs 14-dim object pose, got {arr.size}")
             BOX_POSE[0] = arr
-        elif 'dex' in task_name:
+        elif env_family == ENV_FAMILY_ALLEGRO:
             if arr.size != 7:
-                raise ValueError(f"dex 任务需要 7 维 object pose，got {arr.size}")
+                raise ValueError(f"dex task needs 7-dim object pose, got {arr.size}")
             DEX_OBJECT_POSE[0] = arr
         else:
             raise NotImplementedError(f"apply_object_pose_for_reset: {task_name}")
@@ -353,7 +373,7 @@ def apply_object_pose_for_reset(task_name, fixed_object_pose):
             BOX_POSE[0] = sample_box_pose()
         elif 'sim_insertion' in task_name:
             BOX_POSE[0] = np.concatenate(sample_insertion_pose())
-        elif 'dex' in task_name:
+        elif env_family == ENV_FAMILY_ALLEGRO:
             DEX_OBJECT_POSE[0] = sample_dex_object_pose()
 
 
@@ -385,8 +405,8 @@ def rollout_single_episode_return(
     quiet=False,
 ):
     """
-    单次 rollout，返回 (episode_return, episode_highest_reward)。
-    sim 时在 reset 前根据 fixed_object_pose 设置物体位姿；可选 fixed_init_qpos 或 init_qpos_from_dataset。
+    One rollout; returns (episode_return, episode_highest_reward).
+    Sim: object pose from fixed_object_pose before reset; optional fixed_init_qpos or init_qpos_from_dataset.
     """
     real_robot = config['real_robot']
     policy_class = config['policy_class']
@@ -395,9 +415,15 @@ def rollout_single_episode_return(
     state_dim = config['state_dim']
     action_dim = config.get('action_dim', state_dim)
     task_name = config['task_name']
+    env_family = config.get('env_family', None)
     temporal_agg = config['temporal_agg']
     max_timesteps_cfg = config['episode_len']
-    onscreen_cam = 'default_cam' if 'dex' in task_name else 'angle'
+    if env_family == ENV_FAMILY_ALLEGRO:
+        onscreen_cam = 'default_cam'
+    elif env_family == ENV_FAMILY_HMF_PROTO5_HAND:
+        onscreen_cam = 'topview'
+    else:
+        onscreen_cam = 'angle'
 
     max_timesteps = int(max_timesteps_cfg * 2)
     query_frequency = policy_config['num_queries']
@@ -407,20 +433,20 @@ def rollout_single_episode_return(
 
     ### direct replay
     if direct_replay and real_robot:
-        raise ValueError('direct_replay 仅支持 sim')
+        raise ValueError('direct_replay is sim-only')
 
     if not real_robot:
-        apply_object_pose_for_reset(task_name, fixed_object_pose)
+        apply_object_pose_for_reset(task_name, fixed_object_pose, env_family=env_family)
     ts = env.reset()
 
     if not real_robot and fixed_init_qpos is not None:
         try:
-            overwrite_sim_qpos_from_dataset(env, task_name, fixed_init_qpos)
+            overwrite_sim_qpos_from_dataset(env, task_name, fixed_init_qpos, env_family=env_family)
             new_obs = env._task.get_observation(env._physics)
             ts = ts._replace(observation=new_obs)
             logger("Initialized sim qpos from fixed_init_qpos.")
         except Exception as ex:
-            logger(f"[WARN] fixed_init_qpos 失败: {ex}")
+            logger(f"[WARN] fixed_init_qpos failed: {ex}")
     elif not real_robot and (init_qpos_from_dataset or direct_replay):
         try:
             if direct_replay:
@@ -428,12 +454,12 @@ def rollout_single_episode_return(
             else:
                 assert dataset_dir is not None and num_episodes is not None
                 dataset_qpos0 = sample_dataset_start_qpos(dataset_dir, num_episodes)
-            overwrite_sim_qpos_from_dataset(env, task_name, dataset_qpos0)
+            overwrite_sim_qpos_from_dataset(env, task_name, dataset_qpos0, env_family=env_family)
             new_obs = env._task.get_observation(env._physics)
             ts = ts._replace(observation=new_obs)
             logger("Initialized sim qpos from dataset start qpos.")
         except Exception as ex:
-            logger(f"[WARN] 初始化 qpos 从数据集失败，使用默认初始化. error={ex}")
+            logger(f"[WARN] init qpos from dataset failed; using default init. error={ex}")
 
     if onscreen_render:
         ax = plt.subplot()
@@ -553,7 +579,7 @@ def rollout_single_episode_return(
 
 
 def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print, max_save_episodes=None):
-    # eval 阶段也使用同一个 seed，保证可复现；如需单独 eval seed，可在 config 中扩展
+    # Eval uses same seed for reproducibility; extend config for a separate eval seed if needed
     set_seed(config.get('seed', 0))
     ckpt_dir = config['ckpt_dir']
     state_dim = config['state_dim']
@@ -565,6 +591,7 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
     camera_names = config['camera_names']
     max_timesteps = config['episode_len']
     task_name = config['task_name']
+    env_family = config.get('env_family', None)
     temporal_agg = config['temporal_agg']
     dataset_dir = config.get('dataset_dir', None)
     num_episodes = config.get('num_episodes', None)
@@ -573,7 +600,7 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
     replay_episode = config.get('replay_episode', 0)
     num_rollouts_cfg = int(config.get('num_rollouts', 50))
 
-    use_pca_action = ('dex' in task_name and action_dim < STATE_DIM_ALLEGRO and not direct_replay)
+    use_pca_action = (env_family == ENV_FAMILY_ALLEGRO and action_dim < STATE_DIM_ALLEGRO and not direct_replay)
 
     latent_z_sample_str = config.get('latent_z_sample', None)
     latent_z_dim = int(policy_config.get('latent_z_dim', 32)) if isinstance(policy_config, dict) else 32
@@ -590,22 +617,22 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
             else:
                 arr = [float(x) for x in s.split(",")]
         except Exception as ex:
-            raise ValueError(f"无法解析 --latent_z_sample: {s!r}. 期望 'v1,v2,...' 或 JSON 列表字符串。error={ex}")
+            raise ValueError(f"Cannot parse --latent_z_sample: {s!r}. Expected 'v1,v2,...' or JSON list string. error={ex}")
         if not isinstance(arr, (list, tuple)):
-            raise ValueError(f"--latent_z_sample 解析结果不是 list/tuple: {type(arr)}")
+            raise ValueError(f"--latent_z_sample parsed value is not list/tuple: {type(arr)}")
         if len(arr) != latent_z_dim:
-            raise ValueError(f"--latent_z_sample 维度不匹配: got {len(arr)}, expected latent_z_dim={latent_z_dim}")
+            raise ValueError(f"--latent_z_sample dim mismatch: got {len(arr)}, expected latent_z_dim={latent_z_dim}")
         return torch.tensor(arr, dtype=torch.float32).cuda()
 
     base_latent_z = _parse_latent_z_sample(latent_z_sample_str)
 
     if direct_replay and real_robot:
-        raise ValueError('direct_replay 仅支持 sim 环境，不能用于 real_robot。')
+        raise ValueError('direct_replay is sim-only; not for real_robot.')
     if direct_replay:
         assert dataset_dir is not None and num_episodes is not None, \
-            "direct_replay 需要 dataset_dir 和 num_episodes。"
+            "direct_replay requires dataset_dir and num_episodes."
 
-    # 若未显式指定 output_dir，则默认仍写入 ckpt_dir（兼容旧逻辑）
+    # Default output_dir to ckpt_dir if unset (legacy)
     if output_dir is None:
         output_dir = ckpt_dir
 
@@ -646,8 +673,8 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
 
     def load_episode_for_replay(episode_idx):
         """
-        加载指定 episode 的 qpos[0] 和整条 action 序列，用于 direct replay。
-        返回 (qpos0, actions)，actions 形状 (T, action_dim)，为原始未归一化。
+        Load qpos[0] and full action sequence for an episode (direct replay).
+        Returns (qpos0, actions) with actions shape (T, action_dim), raw unnormalized.
         """
         dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}.hdf5')
         with h5py.File(dataset_path, 'r') as root:
@@ -839,19 +866,19 @@ def _parse_eval_args():
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--onscreen_render', action='store_true')
     parser.add_argument('--init_qpos_from_dataset', action='store_true',
-                        help='在 eval（模拟环境）时，用数据集中随机一条轨迹的起始 qpos 覆盖模拟环境初始姿态')
+                        help='Eval (sim): override init qpos with a random trajectory start from the dataset')
     parser.add_argument('--direct_replay', action='store_true',
-                        help='eval 时用数据集中某条轨迹的 action 序列直接控制 sim，不跑 policy；会同时用该条轨迹的 qpos[0] 初始化')
+                        help='Eval: replay dataset actions in sim (no policy); init from that trajectory qpos[0]')
     parser.add_argument('--replay_episode', type=int, default=0,
-                        help='direct_replay 时从第几条轨迹开始回放（rollout i 回放 episode replay_episode+i）')
+                        help='direct_replay start episode index (rollout i replays episode replay_episode+i)')
     parser.add_argument('--temporal_agg', action='store_true',
-                        help='eval 时使用 temporal aggregation 平滑 ACT 输出')
+                        help='Eval: temporal aggregation to smooth ACT output')
     parser.add_argument('--max_save_episodes', type=int, default=None,
-                        help='eval 时只保存前 N 条 rollout 的视频和 png，后续不再保存以节省时间；默认保存全部')
+                        help='Eval: only save video/png for first N rollouts; default all')
     parser.add_argument('--num_rollouts', type=int, default=50,
-                        help='eval 时总共跑多少条 rollout（默认 50；direct_replay 时会再取 min(num_rollouts, num_episodes)）')
+                        help='Eval total rollouts (default 50; direct_replay uses min(num_rollouts, num_episodes))')
     parser.add_argument('--latent_z_sample', type=str, default=None,
-                        help='(eval only) 手动指定 latent z 向量，整个 rollout 固定。格式: "v1,v2,...,vD" 或 JSON 列表字符串，例如 "[0, 0.1, ...]". 维度需等于 latent_z_dim。')
+                        help='(eval only) Fixed latent z for whole rollout. Format: "v1,...,vD" or JSON list e.g. "[0,0.1,...]". Dim = latent_z_dim.')
     parser.add_argument('--ckpt_dir', type=str, required=True,
                         help='checkpoint dir (required; provided via CLI only)')
     eval_args, unknown = parser.parse_known_args()

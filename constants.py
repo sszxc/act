@@ -6,8 +6,15 @@ DEFAULT_STATE_DIM = 14
 STATE_DIM_ALLEGRO = 22
 ROOT_DIM = 6   # allegro hand root 6dof (x,y,z,rx,ry,rz)
 FINGER_DIM = 16  # allegro finger joints
+ENV_FAMILY_METAWORLD = "metaworld"
+ENV_FAMILY_ALLEGRO = "allegro"
+ENV_FAMILY_HMF_PROTO5_HAND = "hmf_proto5_hand"
 DEX_ALLEGRO_XML_PATH = '/mnt/1tb1/xuechao/MuJoCo-Asset-Pipeline/asset/scene/freejoint/teleop_scene_left_077_rubiks_cube/teleop_scene_left_077_rubiks_cube.xml'
 # DEX_ALLEGRO_XML_PATH = "/mnt/1tb1/xuechao/MuJoCo-Asset-Pipeline/asset/scene/freejoint/teleop_scene_left_035_power_drill/teleop_scene_left_035_power_drill.xml"
+HMF_PROTO5_XML_PATH = "/home/lab/Documents/proto5_description/mjcf/hmf_hand_proto5_release_right_ur7e_scene.xml"
+HMF_PROTO5_STATE_DIM = 24
+HMF_PROTO5_ACTION_DIM = 23  # mocap_pos(3) + mocap_quat(4, wxyz) + finger_ctrl(16)
+HMF_PROTO5_CTRL_DIM = 16
 
 SIM_TASK_CONFIGS = {
     "sim_transfer_cube_scripted": {
@@ -15,24 +22,28 @@ SIM_TASK_CONFIGS = {
         "num_episodes": 50,
         "episode_len": 400,
         "camera_names": ["top"],
+        "env_family": ENV_FAMILY_METAWORLD,
     },
     "sim_transfer_cube_human": {
         "dataset_dir": DATA_DIR + "/sim_transfer_cube_human",
         "num_episodes": 50,
         "episode_len": 400,
         "camera_names": ["top"],
+        "env_family": ENV_FAMILY_METAWORLD,
     },
     "sim_insertion_scripted": {
         "dataset_dir": DATA_DIR + "/sim_insertion_scripted",
         "num_episodes": 50,
         "episode_len": 400,
         "camera_names": ["top"],
+        "env_family": ENV_FAMILY_METAWORLD,
     },
     "sim_insertion_human": {
         "dataset_dir": DATA_DIR + "/sim_insertion_human",
         "num_episodes": 50,
         "episode_len": 500,
         "camera_names": ["top"],
+        "env_family": ENV_FAMILY_METAWORLD,
     },
     "sim_dexgrasp_cube_teleop_wrong_offset": {
         "dataset_dir": DATA_DIR + "/sim_dexgrasp_cube_teleop/20260304_123721",
@@ -40,6 +51,7 @@ SIM_TASK_CONFIGS = {
         "episode_len": 400,
         "camera_names": ["default_cam", "wrist_cam"],
         "state_dim": STATE_DIM_ALLEGRO,
+        "env_family": ENV_FAMILY_ALLEGRO,
     },
     "sim_dexgrasp_cube_teleop_minimal": {
         "dataset_dir": DATA_DIR + "/sim_dexgrasp_cube_teleop/20260306_152210",
@@ -47,6 +59,7 @@ SIM_TASK_CONFIGS = {
         "episode_len": 400,
         "camera_names": ["default_cam", "wrist_cam"],
         "state_dim": STATE_DIM_ALLEGRO,
+        "env_family": ENV_FAMILY_ALLEGRO,
     },
     "sim_dexgrasp_cube_teleop": {
         "dataset_dir": DATA_DIR + "/sim_dexgrasp_cube_teleop/20260306_153749",
@@ -54,6 +67,7 @@ SIM_TASK_CONFIGS = {
         "episode_len": 400,
         "camera_names": ["default_cam", "wrist_cam"],
         "state_dim": STATE_DIM_ALLEGRO,
+        "env_family": ENV_FAMILY_ALLEGRO,
     },
     "sim_dexgrasp_pca_cube_teleop": {
         "dataset_dir": DATA_DIR + "/sim_dexgrasp_cube_teleop/20260306_153749",
@@ -63,14 +77,17 @@ SIM_TASK_CONFIGS = {
         "state_dim": STATE_DIM_ALLEGRO,
         "action_dim": ROOT_DIM + 3,  # root 6 + finger 3 PCs
         "pca_finger_dim": 3,
+        "env_family": ENV_FAMILY_ALLEGRO,
     },
     "sim_hmf_proto5_manipulation": {
-        "dataset_dir": DATA_DIR + "/sim_hmf_proto5_teleop/pick_place_v3/20260422_123320",
-        "num_episodes": 10,
+        "dataset_dir": DATA_DIR + "/sim_hmf_proto5_teleop/pick_place_v3/20260427_175415_50traj",
+        "num_episodes": 50,
         "episode_len": 400,
-        "camera_names": ["corner3", "lhand_palm_right_cam"],
-        "state_dim": 24,
-        "action_dim": 25,
+        "camera_names": ["topview", "corner"],
+        "state_dim": HMF_PROTO5_STATE_DIM,
+        "action_dim": HMF_PROTO5_ACTION_DIM,
+        "env_family": ENV_FAMILY_HMF_PROTO5_HAND,
+        "xml_path": HMF_PROTO5_XML_PATH,
     },
 }
 

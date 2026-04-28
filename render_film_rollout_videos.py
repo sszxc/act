@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-从某次 FiLM 搜参目录读取 run_meta.json 与 best_film_only.pt，录制两条对比 rollout 视频：
-  - 优化后的 FiLM（best_film_only.pt）
-  - 架构默认 FiLM（gamma=1, beta=0）
+Read run_meta.json and best_film_only.pt from a FiLM search dir and record two rollout videos:
+  - Optimized FiLM (best_film_only.pt)
+  - Architectural default FiLM (gamma=1, beta=0)
 
-输出写到 run_dir 下的子目录（默认 rollout_videos/）。
+Writes output under run_dir subdirectory (default rollout_videos/).
 
-示例：
+Example:
   python render_film_rollout_videos.py --run_dir tmp/film_search_cma --seed 0
 
-注意：chunk_size / hidden_dim / temporal_agg 等需与训练及搜参时一致（run_meta 未保存时用本脚本默认或 CLI 覆盖）。
+chunk_size / hidden_dim / temporal_agg etc. must match training/search (defaults or CLI override if missing in run_meta).
 """
 from __future__ import annotations
 
@@ -64,13 +64,13 @@ def _safe_rename(src: Path, dst: Path) -> None:
 
 
 def main():
-    p = argparse.ArgumentParser(description="FiLM best vs identity 对比 rollout 视频")
-    p.add_argument("--run_dir", type=str, required=True, help="含 run_meta.json 与 best_film_only.pt 的目录")
+    p = argparse.ArgumentParser(description="FiLM best vs identity rollout videos")
+    p.add_argument("--run_dir", type=str, required=True, help="Directory with run_meta.json and best_film_only.pt")
     p.add_argument(
         "--videos_subdir",
         type=str,
         default="rollout_videos",
-        help="相对于 run_dir 的输出子目录",
+        help="Output subdirectory under run_dir",
     )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--stats_path", type=str, default=None)
@@ -78,7 +78,7 @@ def main():
         "--ckpt_override",
         type=str,
         default=None,
-        help="覆盖 run_meta 中的 ckpt 路径",
+        help="Override ckpt path from run_meta",
     )
     p.add_argument("--temporal_agg", action="store_true")
     p.add_argument("--latent_z_sample", type=str, default=None)
@@ -86,7 +86,7 @@ def main():
         "--fixed_init_qpos",
         type=str,
         default=None,
-        help="逗号或 JSON 列表，和搜参时一致",
+        help="Comma or JSON list; same as during search",
     )
     p.add_argument(
         "--init_qpos_from_dataset",
@@ -98,21 +98,21 @@ def main():
     p.add_argument("--dim_feedforward", type=int, default=3200)
     p.add_argument("--latent_z_dim", type=int, default=32)
     p.add_argument("--kl_weight", type=float, default=10.0)
-    p.add_argument("--quiet_rollout", action="store_true", help="关闭 rollout 步进 tqdm")
+    p.add_argument("--quiet_rollout", action="store_true", help="Silence rollout step tqdm")
     args = p.parse_args()
 
     if args.policy_class != "ACT":
-        print("FiLM 仅适用于 ACT", file=sys.stderr)
+        print("FiLM applies only to ACT", file=sys.stderr)
         sys.exit(1)
 
     run_dir = Path(args.run_dir).resolve()
     meta_path = run_dir / "run_meta.json"
     film_pt = run_dir / "best_film_only.pt"
     if not meta_path.is_file():
-        print(f"缺少 {meta_path}", file=sys.stderr)
+        print(f"Missing {meta_path}", file=sys.stderr)
         sys.exit(1)
     if not film_pt.is_file():
-        print(f"缺少 {film_pt}", file=sys.stderr)
+        print(f"Missing {film_pt}", file=sys.stderr)
         sys.exit(1)
 
     with open(meta_path, "r", encoding="utf-8") as f:
@@ -120,7 +120,7 @@ def main():
 
     task_name = meta["task_name"]
     if task_name not in SIM_TASK_CONFIGS:
-        print(f"未知 task_name: {task_name}", file=sys.stderr)
+        print(f"Unknown task_name: {task_name}", file=sys.stderr)
         sys.exit(1)
     task_cfg = SIM_TASK_CONFIGS[task_name]
 
@@ -128,7 +128,7 @@ def main():
     meta_ckpt_resolved = Path(meta["ckpt"]).resolve()
     if args.ckpt_override and ckpt_path != meta_ckpt_resolved:
         warnings.warn(
-            f"--ckpt_override ({ckpt_path}) 与 run_meta.ckpt ({meta_ckpt_resolved}) 不同。",
+            f"--ckpt_override ({ckpt_path}) differs from run_meta.ckpt ({meta_ckpt_resolved}).",
             UserWarning,
             stacklevel=1,
         )
@@ -258,8 +258,8 @@ def main():
         "fixed_object_pose": fixed_object_pose.tolist(),
         "baseline_description": "identity FiLM: gamma=1, beta=0 (DETRVAE buffer default)",
         "policy_overrides_note": (
-            "chunk_size, hidden_dim, temporal_agg, latent_z 等需与搜参/训练一致；"
-            "本 summary 记录本次 CLI 所用值。"
+            "chunk_size, hidden_dim, temporal_agg, latent_z, etc. must match search/train; "
+            "this summary records CLI values used in this run."
         ),
         "cli": {
             "chunk_size": args.chunk_size,

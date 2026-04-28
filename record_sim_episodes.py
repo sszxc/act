@@ -36,7 +36,7 @@ def main(args):
 
     if onscreen_render and plt is None:
         raise ModuleNotFoundError(
-            "matplotlib 未安装，但你启用了 --onscreen_render。请安装 matplotlib 或去掉该参数。"
+            "matplotlib is not installed but --onscreen_render was set. Install matplotlib or drop the flag."
         )
 
     if not os.path.isdir(dataset_dir):
@@ -180,7 +180,7 @@ def main(args):
                     dtype='uint8',
                     chunks=(1, 480, 640, 3),
                 )
-                # 标记为 HDF5 IMAGE，方便可视化工具（如 H5Web）识别为 RGB 图像
+                # HDF5 IMAGE tag for viewers (e.g. H5Web) to treat as RGB
                 dset.attrs['CLASS'] = np.bytes_('IMAGE')
             # compression='gzip',compression_opts=2,)
             # compression=32001, compression_opts=(0, 0, 0, 0, 9, 1, 1), shuffle=False)

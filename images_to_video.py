@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-将指定文件夹下的图片按文件名排序后合成 MP4，复用 visualize_episodes._save_video。
+Stitch images in a folder (sorted by filename) into MP4 using visualize_episodes._save_video.
 
-用法（建议在工程根 act/ 下执行，或任意目录用绝对路径调用本脚本）:
+Run from repo root act/ or call with absolute paths:
   python images_to_video.py tmp/film_features_after_film -o tmp/film_mean.mp4 --fps 10
   python images_to_video.py tmp/film_features_after_film -o out.mp4 --resize-1280x480
 """
@@ -21,7 +21,7 @@ from visualize_episodes import _save_video  # noqa: E402
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 
-# 可选：最近邻缩放到此尺寸 (width, height)
+# Optional nearest-neighbor resize to (width, height)
 _RESIZE_1280x480_WH = (1280, 480)
 
 
@@ -48,31 +48,31 @@ def _load_frames_rgb_uint8(paths, resize_wh=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="文件夹内图片 → MP4（使用 visualize_episodes._save_video）")
-    parser.add_argument("input_dir", help="包含图片的目录")
+    parser = argparse.ArgumentParser(description="Folder of images → MP4 (via visualize_episodes._save_video)")
+    parser.add_argument("input_dir", help="Directory containing images")
     parser.add_argument(
         "-o",
         "--output",
         default=None,
-        help="输出视频路径，默认 <input_dir>/stitched.mp4",
+        help="Output video path; default <input_dir>/stitched.mp4",
     )
-    parser.add_argument("--fps", type=float, default=30.0, help="帧率")
+    parser.add_argument("--fps", type=float, default=30.0, help="FPS")
     parser.add_argument(
         "--resize-1280x480",
         action="store_true",
-        help="每帧用最近邻插值缩放到 1280×480（宽×高）",
+        help="Nearest-neighbor resize each frame to 1280×480 (width×height)",
     )
-    parser.add_argument("-v", "--verbose", action="store_true", help="打印详情")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     args = parser.parse_args()
 
     input_dir = os.path.abspath(args.input_dir)
     if not os.path.isdir(input_dir):
-        print(f"错误: 不是目录: {input_dir}", file=sys.stderr)
+        print(f"Error: not a directory: {input_dir}", file=sys.stderr)
         sys.exit(1)
 
     paths = _collect_image_paths(input_dir)
     if not paths:
-        print(f"错误: 目录内没有支持的图片 ({', '.join(sorted(_IMAGE_EXTS))}): {input_dir}", file=sys.stderr)
+        print(f"Error: no supported images ({', '.join(sorted(_IMAGE_EXTS))}) in: {input_dir}", file=sys.stderr)
         sys.exit(1)
 
     output_path = args.output
@@ -82,9 +82,9 @@ def main():
 
     resize_wh = _RESIZE_1280x480_WH if args.resize_1280x480 else None
     if args.verbose:
-        print(f"读取 {len(paths)} 张: 首 {paths[0]} … 尾 {paths[-1]}")
+        print(f"Loaded {len(paths)} images: first {paths[0]} … last {paths[-1]}")
         if resize_wh is not None:
-            print(f"缩放: 最近邻 → {resize_wh[0]}×{resize_wh[1]} (宽×高)")
+            print(f"Resize (nearest-neighbor): {resize_wh[0]}×{resize_wh[1]} (W×H)")
 
     frames = _load_frames_rgb_uint8(paths, resize_wh=resize_wh)
     _save_video(frames, output_path, fps=args.fps, verbose=args.verbose)

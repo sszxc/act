@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-在固定物体初始位姿下，用 CMA-ES 或 ARS 搜索 ACT 策略中 FiLM（visual gamma/beta）参数，以最大化单局 episode_return。
+Search FiLM (visual gamma/beta) parameters in ACT with CMA-ES or ARS under fixed object pose to maximize episode_return.
 
-可选 Random Subspace Projection（RSP）：在随机低维子空间中优化 z，使 theta = theta_base + P @ z（P 固定），
-默认子空间维度 16；--rsp_subspace_dim 0 表示在全维 FiLM 上优化（与旧行为一致）。
+Optional Random Subspace Projection (RSP): optimize z in a random low-dim subspace with theta = theta_base + P @ z (fixed P),
+default subspace dim 16; --rsp_subspace_dim 0 optimizes full FiLM (legacy behavior).
 
-依赖：
-  - 必选：numpy, torch, matplotlib
-  - CMA-ES：pip install cma（仅 --method cma 时需要）
+Requires:
+  - numpy, torch, matplotlib
+  - CMA-ES: pip install cma (only for --method cma)
 
-示例：
+Examples:
   python optimize_film_params.py --ckpt /path/to/policy_best.ckpt --task_name sim_transfer_cube_human \\
     --fixed_object_pose "0.1,0.5,0.05,1,0,0,0" --method ars --ars_iters 3 --ars_pairs 2 --output_dir tmp/film_search
 
-  # 与旧版一致：全维 FiLM 搜索（关闭 RSP）
+  # Full FiLM search without RSP (match old behavior)
   python optimize_film_params.py ... --rsp_subspace_dim 0 ...
 
   python optimize_film_params.py --ckpt ... --method cma --cma_maxiter 5 --cma_popsize 8 ...
@@ -30,7 +30,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-# 与 imitate_episodes 一致：无显示器时 EGL
+# Match imitate_episodes: EGL when headless
 if "MUJOCO_GL" not in os.environ:
     os.environ["MUJOCO_GL"] = "egl"
 
@@ -54,7 +54,7 @@ def _parse_latent_z(s: str | None, latent_z_dim: int):
         return None
     arr = _parse_float_list(s)
     if arr.size != latent_z_dim:
-        raise ValueError(f"latent_z_sample 维度 {arr.size} != {latent_z_dim}")
+        raise ValueError(f"latent_z_sample dim {arr.size} != {latent_z_dim}")
     return torch.tensor(arr, dtype=torch.float32).cuda()
 
 
@@ -97,11 +97,11 @@ def _make_rsp_projection(
     *,
     orthogonal: bool,
 ) -> np.ndarray:
-    """返回 P，形状 (film_dim, subspace_dim)，列满秩；theta = theta_base + P @ z。"""
+    """Return P with shape (film_dim, subspace_dim), full column rank; theta = theta_base + P @ z."""
     if subspace_dim <= 0:
-        raise ValueError("subspace_dim 须为正")
+        raise ValueError("subspace_dim must be positive")
     if subspace_dim > film_dim:
-        raise ValueError(f"rsp_subspace_dim={subspace_dim} 不能大于 film_dim={film_dim}")
+        raise ValueError(f"rsp_subspace_dim={subspace_dim} cannot exceed film_dim={film_dim}")
     a = rng.standard_normal((film_dim, subspace_dim))
     if orthogonal:
         q, _ = np.linalg.qr(a, mode="reduced")
@@ -112,7 +112,7 @@ def _make_rsp_projection(
 def _rsp_decode(theta_base: np.ndarray, proj: np.ndarray, z: np.ndarray) -> np.ndarray:
     z = np.asarray(z, dtype=np.float64).reshape(-1)
     if z.shape[0] != proj.shape[1]:
-        raise ValueError(f"z 维 {z.shape[0]} != rsp 维 {proj.shape[1]}")
+        raise ValueError(f"z dim {z.shape[0]} != rsp dim {proj.shape[1]}")
     return theta_base + proj @ z
 
 
@@ -121,7 +121,7 @@ def _rsp_decode_batch(theta_base: np.ndarray, proj: np.ndarray, z_batch: np.ndar
     if zb.ndim == 1:
         zb = zb.reshape(1, -1)
     if zb.shape[1] != proj.shape[1]:
-        raise ValueError(f"z_batch 形状 {zb.shape} 与 proj 列数 {proj.shape[1]} 不符")
+        raise ValueError(f"z_batch shape {zb.shape} does not match proj columns {proj.shape[1]}")
     return theta_base + zb @ proj.T
 
 
@@ -168,8 +168,8 @@ def rollout_batch_episode_returns(
     num_episodes: int | None,
 ) -> np.ndarray:
     """
-    同步推进多个 env（每个 env 对应一个 theta），按时间步将观测拼 batch 在单 GPU 上推理。
-    返回每条轨迹的 episode_return（shape: (B,)）。
+    Step multiple envs in parallel (one theta each), batch observations per timestep on one GPU.
+    Returns episode_return per trajectory (shape: (B,)).
     """
     B = len(envs)
     if thetas.shape[0] != B:
@@ -191,7 +191,7 @@ def rollout_batch_episode_returns(
             ts = ts._replace(observation=new_obs)
         elif init_qpos_from_dataset:
             if dataset_dir is None or num_episodes is None:
-                raise ValueError("init_qpos_from_dataset 需要 dataset_dir/num_episodes")
+                raise ValueError("init_qpos_from_dataset requires dataset_dir/num_episodes")
             qpos0 = sample_dataset_start_qpos(dataset_dir, num_episodes)
             overwrite_sim_qpos_from_dataset(env, eval_cfg["task_name"], qpos0)
             new_obs = env._task.get_observation(env._physics)
@@ -214,8 +214,8 @@ def rollout_batch_episode_returns(
 
     rewards_sum = np.zeros(B, dtype=np.float64)
 
-    # imitation_episodes eval 同样用 inference_mode：避免 temporal_agg 把多步 policy 输出拼进
-    # all_time_actions 时保留整段 episode 的 autograd 图导致显存爆炸
+    # Same as imitate_episodes eval: inference_mode so temporal_agg does not keep
+    # autograd over the full episode when stitching multi-step policy outputs into all_time_actions
     with torch.inference_mode():
         for t in range(max_timesteps):
             # build batch obs
@@ -389,7 +389,7 @@ def run_ars_batched(
     batch_size: int,
 ):
     """
-    ARS，但用 batch fitness 一次评估多个候选（单 GPU 前向批处理）。
+    ARS with batched fitness over multiple candidates (single-GPU batched forward).
     fitness_batch_fn: (N,dim)->(N,) episode_return
     """
     rng = np.random.default_rng(seed)
@@ -580,10 +580,10 @@ def _save_curve_png(path: Path, y1: np.ndarray, y1_label: str, y2: np.ndarray | 
 
 
 def main():
-    p = argparse.ArgumentParser(description="FiLM gamma/beta 搜索（CMA-ES 或 ARS）")
-    p.add_argument("--ckpt", type=str, required=True, help="policy .ckpt 路径")
-    p.add_argument("--stats_path", type=str, default=None, help="dataset_stats.pkl，默认与 ckpt 同目录")
-    p.add_argument("--task_name", type=str, required=True, help="SIM_TASK_CONFIGS 中的任务名")
+    p = argparse.ArgumentParser(description="FiLM gamma/beta search (CMA-ES or ARS)")
+    p.add_argument("--ckpt", type=str, required=True, help="path to policy .ckpt")
+    p.add_argument("--stats_path", type=str, default=None, help="dataset_stats.pkl; defaults next to ckpt")
+    p.add_argument("--task_name", type=str, required=True, help="task name in SIM_TASK_CONFIGS")
     p.add_argument("--output_dir", type=str, default="tmp/film_param_search")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--temporal_agg", action="store_true")
@@ -592,18 +592,18 @@ def main():
         "--fixed_object_pose",
         type=str,
         required=True,
-        help="固定物体位姿：逗号分隔或 JSON 列表（transfer 7 维 / insertion 14 维 / dex 7 维）",
+        help="Fixed object pose: comma or JSON list (transfer 7 / insertion 14 / dex 7)",
     )
     p.add_argument(
         "--fixed_init_qpos",
         type=str,
         default=None,
-        help="可选：固定机械臂初始 qpos（与 eval 中数据集格式一致）",
+        help="Optional fixed arm init qpos (same format as eval dataset)",
     )
     p.add_argument(
         "--init_qpos_from_dataset",
         action="store_true",
-        help="从数据集随机一条轨迹的起点初始化 qpos（与固定物体可同时用）",
+        help="Init qpos from a random trajectory start in the dataset (combines with fixed object)",
     )
     p.add_argument("--method", type=str, choices=("cma", "ars"), required=True)
     # policy architecture (must match training)
@@ -615,7 +615,7 @@ def main():
     p.add_argument("--kl_weight", type=float, default=10.0)
     # ARS
     p.add_argument("--ars_iters", type=int, default=50)
-    p.add_argument("--ars_pairs", type=int, default=4, help="每轮对称扰动对数（每轮 2*pairs 次仿真）")
+    p.add_argument("--ars_pairs", type=int, default=4, help="Symmetric perturbation pairs per iter (2*pairs sim calls per iter)")
     p.add_argument("--ars_sigma", type=float, default=0.05)
     p.add_argument("--ars_alpha", type=float, default=0.1)
     # CMA
@@ -626,34 +626,34 @@ def main():
         "--parallel",
         type=int,
         default=1,
-        help="并行评估候选数（一次 batch 同步推进多少条轨迹；单 GPU 批量推理）",
+        help="Parallel candidates to evaluate (batch rollout count; single-GPU batched inference)",
     )
     p.add_argument(
         "--rsp_subspace_dim",
         type=int,
         default=16,
-        help="FiLM 随机子空间维度；z 经 P 映射到全维。0 表示不用 RSP，直接在全维优化",
+        help="FiLM RSP subspace dim; z maps via P to full dim. 0 disables RSP (full-dim opt)",
     )
     p.add_argument(
         "--rsp_seed",
         type=int,
         default=None,
-        help="生成投影矩阵的随机种子；默认与 --seed 相同",
+        help="RNG seed for projection matrix; defaults to --seed",
     )
     p.add_argument(
         "--rsp_raw_gaussian",
         action="store_true",
-        help="投影列用高斯 i.i.d.，不做 QR 正交化（默认 QR 得到列正交基）",
+        help="Gaussian i.i.d. columns without QR orthogonalization (default: QR for orthonormal columns)",
     )
 
     args = p.parse_args()
     if args.policy_class != "ACT":
-        print("FiLM 仅存在于 ACT (DETRVAE)，请使用 --policy_class ACT", file=sys.stderr)
+        print("FiLM exists only on ACT (DETRVAE); use --policy_class ACT", file=sys.stderr)
         sys.exit(1)
 
     task_name = args.task_name
     if task_name not in SIM_TASK_CONFIGS:
-        print(f"未知 task_name: {task_name}. 可选: {list(SIM_TASK_CONFIGS.keys())}", file=sys.stderr)
+        print(f"Unknown task_name: {task_name}. Options: {list(SIM_TASK_CONFIGS.keys())}", file=sys.stderr)
         sys.exit(1)
     task_cfg = SIM_TASK_CONFIGS[task_name]
 
@@ -689,20 +689,20 @@ def main():
     film_dim = 2 * hidden_dim
     rsp_dim = int(args.rsp_subspace_dim)
     if rsp_dim < 0:
-        print(f"非法 --rsp_subspace_dim={rsp_dim}", file=sys.stderr)
+        print(f"Invalid --rsp_subspace_dim={rsp_dim}", file=sys.stderr)
         sys.exit(1)
     if rsp_dim >= film_dim:
         print(
-            f"警告: rsp_subspace_dim={rsp_dim} >= film_dim={film_dim}，改为全维优化",
+            f"Warning: rsp_subspace_dim={rsp_dim} >= film_dim={film_dim}; falling back to full-dim optimization",
             file=sys.stderr,
         )
         rsp_dim = 0
     use_rsp = 0 < rsp_dim < film_dim
-    print(f"Loaded {ckpt_loaded}, FiLM 参数维度 = {film_dim} (hidden_dim={hidden_dim})")
+    print(f"Loaded {ckpt_loaded}, FiLM param dim = {film_dim} (hidden_dim={hidden_dim})")
     if use_rsp:
-        print(f"RSP: 优化维度 = {rsp_dim}（映射到 {film_dim}）")
+        print(f"RSP: optimize dim = {rsp_dim} (maps to {film_dim})")
     else:
-        print("RSP: 关闭，全维优化")
+        print("RSP: disabled (full-dim optimization)")
 
     latent_z = _parse_latent_z(args.latent_z_sample, args.latent_z_dim)
 
@@ -872,7 +872,7 @@ def main():
     print(f"Done. Best episode_return in log ≈ {best_logged}")
     print(f"Saved: {out_dir / 'best_film_only.pt'}, {out_dir / 'reward_curve.png'}")
     if use_rsp:
-        print(f"RSP 产物: {out_dir / 'rsp_projection.npy'}, {out_dir / 'best_rsp_z.npy'}")
+        print(f"RSP outputs: {out_dir / 'rsp_projection.npy'}, {out_dir / 'best_rsp_z.npy'}")
 
 
 if __name__ == "__main__":

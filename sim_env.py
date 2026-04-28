@@ -1,5 +1,5 @@
 import os
-# 无显示器时使用离屏渲染（必须在 import dm_control 之前设置）
+# Headless/offscreen rendering (must be set before importing dm_control)
 if 'MUJOCO_GL' not in os.environ:
     os.environ['MUJOCO_GL'] = 'egl'
 
@@ -9,7 +9,8 @@ from dm_control import mujoco
 from dm_control.rl import control
 from dm_control.suite import base
 
-from constants import DT, XML_DIR, START_ARM_POSE, DEX_ALLEGRO_XML_PATH
+from constants import DT, XML_DIR, START_ARM_POSE, DEX_ALLEGRO_XML_PATH, HMF_PROTO5_XML_PATH
+from constants import HMF_PROTO5_CTRL_DIM, HMF_PROTO5_STATE_DIM
 from constants import PUPPET_GRIPPER_POSITION_UNNORMALIZE_FN
 from constants import MASTER_GRIPPER_POSITION_NORMALIZE_FN
 from constants import PUPPET_GRIPPER_POSITION_NORMALIZE_FN
@@ -75,9 +76,9 @@ def make_sim_env(task_name, time_limit=20):
         env = control.Environment(physics, task, time_limit=time_limit, control_timestep=DT,
                                   n_sub_steps=None, flat_observation=False)
     elif 'sim_hmf_proto5_manipulation' in task_name:
-        # UR5e + Honda hand (left) pick&place v3 with mocap-welded wrist.
-        # Action 25d: mocap_pos(3) + mocap_quat(4) + hand_ctrl(18).
-        xml_path = '/home/lab/Documents/proto5_description/Metaworld/metaworld/assets/ur5e_honda_hand/ur5e_hand_pick_place_v3.xml'
+        # Right HMF proto5 hand with mocap-welded wrist.
+        # Action 23d: mocap_pos(3) + mocap_quat(4) + finger_ctrl(16).
+        xml_path = HMF_PROTO5_XML_PATH
         physics = mujoco.Physics.from_xml_path(xml_path)
         task = Proto5PickPlaceV3Task(random=False)
         env = control.Environment(physics, task, time_limit=time_limit, control_timestep=DT,
@@ -344,20 +345,20 @@ class AllegroDexGraspTask(base.Task):
 
 class Proto5PickPlaceV3Task(base.Task):
     """
-    UR5e + Honda hand (left) with mocap welded to wrist.
+    HMF proto5 right hand with mocap welded to wrist.
 
-    - Action (25,): mocap_pos(3), mocap_quat(4) (wxyz), ctrl(18)
+    - Action (23,): mocap_pos(3), mocap_quat(4) (wxyz), finger_ctrl(16)
     - Observation:
-        - qpos: robot qpos (24,) = ur5e(6) + hand(18)
+        - qpos: robot qpos (24,) = arm(6) + wrist(2) + fingers(16)
         - qvel: robot qvel (24,)
         - env_state: object free joint pose (7,) = xyz + quat(wxyz)
-        - images: corner3, lhand_palm_right_cam
+        - images: topview, corner
     """
 
     MOCAP_BODY_NAME = 'mocap'
-    ROBOT_QPOS_SIZE = 24
+    ROBOT_QPOS_SIZE = HMF_PROTO5_STATE_DIM
     OBJECT_QPOS_SIZE = 7
-    CTRL_SIZE = 18
+    CTRL_SIZE = HMF_PROTO5_CTRL_DIM
     KEYFRAME_NAME = 'home'
 
     def __init__(self, random=None):
@@ -405,7 +406,7 @@ class Proto5PickPlaceV3Task(base.Task):
                 if getattr(physics.model, 'key_qvel', None) is not None and physics.model.key_qvel.shape[0] > key_id:
                     physics.data.qvel[:] = physics.model.key_qvel[key_id]
                 if getattr(physics.model, 'key_ctrl', None) is not None and physics.model.key_ctrl.shape[0] > key_id:
-                    # key_ctrl length should match nu (=18)
+                    # key_ctrl length should match nu (=16)
                     physics.data.ctrl[:] = physics.model.key_ctrl[key_id]
                 if getattr(physics.model, 'key_mpos', None) is not None and physics.model.key_mpos.shape[0] > key_id:
                     mocap_id = self._get_mocap_id(physics)
@@ -439,8 +440,8 @@ class Proto5PickPlaceV3Task(base.Task):
         obs['qvel'] = self.get_qvel(physics)
         obs['env_state'] = self.get_env_state(physics)
         obs['images'] = dict()
-        obs['images']['corner3'] = physics.render(height=480, width=640, camera_id='corner3')
-        obs['images']['lhand_palm_right_cam'] = physics.render(height=480, width=640, camera_id='lhand_palm_right_cam')
+        obs['images']['topview'] = physics.render(height=480, width=640, camera_id='topview')
+        obs['images']['corner'] = physics.render(height=480, width=640, camera_id='corner')
         return obs
 
     def get_reward(self, physics):
