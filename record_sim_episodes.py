@@ -2,13 +2,17 @@ import time
 import os
 import numpy as np
 import argparse
-import matplotlib.pyplot as plt
 import h5py
 
 from constants import PUPPET_GRIPPER_POSITION_NORMALIZE_FN, SIM_TASK_CONFIGS
 from ee_sim_env import make_ee_sim_env
 from sim_env import make_sim_env, BOX_POSE
 from scripted_policy import PickAndTransferPolicy, InsertionPolicy
+
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:  # matplotlib is only needed for onscreen_render
+    plt = None
 
 import IPython
 e = IPython.embed
@@ -29,6 +33,11 @@ def main(args):
     onscreen_render = args['onscreen_render']
     inject_noise = False
     render_cam_name = 'angle'
+
+    if onscreen_render and plt is None:
+        raise ModuleNotFoundError(
+            "matplotlib 未安装，但你启用了 --onscreen_render。请安装 matplotlib 或去掉该参数。"
+        )
 
     if not os.path.isdir(dataset_dir):
         os.makedirs(dataset_dir, exist_ok=True)
@@ -63,7 +72,8 @@ def main(args):
             if onscreen_render:
                 plt_img.set_data(ts.observation['images'][render_cam_name])
                 plt.pause(0.002)
-        plt.close()
+        if onscreen_render:
+            plt.close()
 
         episode_return = np.sum([ts.reward for ts in episode[1:]])
         episode_max_reward = np.max([ts.reward for ts in episode[1:]])
@@ -117,7 +127,8 @@ def main(args):
             success.append(0)
             print(f"{episode_idx=} Failed")
 
-        plt.close()
+        if onscreen_render:
+            plt.close()
 
         """
         For each timestep:
@@ -170,7 +181,7 @@ def main(args):
                     chunks=(1, 480, 640, 3),
                 )
                 # 标记为 HDF5 IMAGE，方便可视化工具（如 H5Web）识别为 RGB 图像
-                dset.attrs['CLASS'] = np.string_('IMAGE')
+                dset.attrs['CLASS'] = np.bytes_('IMAGE')
             # compression='gzip',compression_opts=2,)
             # compression=32001, compression_opts=(0, 0, 0, 0, 9, 1, 1), shuffle=False)
             qpos = obs.create_dataset('qpos', (max_timesteps, 14))
