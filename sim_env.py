@@ -21,6 +21,35 @@ e = IPython.embed
 
 BOX_POSE = [None] # to be changed from outside
 DEX_OBJECT_POSE = [None]  # for Allegro dex task: object (x,y,z,qw,qx,qy,qz)
+HMF_PROTO5_OBJ_GOAL_POSE = [None]  # dict with obj_pos and goal_pos, changed from outside
+
+HMF_PROTO5_RANDOM_OBJ_GOAL_CONFIG = {
+    "obj_body_name": "obj",
+    "goal_site_name": "goal",
+    "obj_position_ranges": [[-0.2, 0.2], [0.5, 0.8], [0.66, 0.66]],
+    "goal_position_ranges": [[-0.3, 0.3], [0.5, 0.8], [0.7, 0.9]],
+}
+
+
+def _sample_xyz(ranges):
+    arr = np.asarray(ranges, dtype=np.float64)
+    return np.array(
+        [
+            np.random.uniform(arr[0, 0], arr[0, 1]),
+            np.random.uniform(arr[1, 0], arr[1, 1]),
+            np.random.uniform(arr[2, 0], arr[2, 1]),
+        ],
+        dtype=np.float64,
+    )
+
+
+def sample_hmf_proto5_obj_goal_pose():
+    """Sample random HMF proto5 object and goal positions."""
+    cfg = HMF_PROTO5_RANDOM_OBJ_GOAL_CONFIG
+    return {
+        "obj_pos": _sample_xyz(cfg["obj_position_ranges"]),
+        "goal_pos": _sample_xyz(cfg["goal_position_ranges"]),
+    }
 
 def sample_dex_object_pose():
     """Sample random object pose for dex eval. Returns (7,) array: x,y,z, qw,qx,qy,qz."""
@@ -360,6 +389,8 @@ class Proto5PickPlaceV3Task(base.Task):
     OBJECT_QPOS_SIZE = 7
     CTRL_SIZE = HMF_PROTO5_CTRL_DIM
     KEYFRAME_NAME = 'home'
+    OBJ_BODY_NAME = HMF_PROTO5_RANDOM_OBJ_GOAL_CONFIG["obj_body_name"]
+    GOAL_SITE_NAME = HMF_PROTO5_RANDOM_OBJ_GOAL_CONFIG["goal_site_name"]
 
     def __init__(self, random=None):
         super().__init__(random=random)
@@ -390,6 +421,30 @@ class Proto5PickPlaceV3Task(base.Task):
             raise ValueError(f"Expected nu={self.CTRL_SIZE} actuators, got {physics.model.nu}.")
         physics.data.ctrl[:] = ctrl
 
+    @staticmethod
+    def _apply_body_position(physics, body_name, pos):
+        body_id = physics.model.name2id(body_name, 'body')
+        body_joint_num = int(physics.model.body_jntnum[body_id])
+        body_joint_adr = int(physics.model.body_jntadr[body_id])
+        if body_joint_num > 0 and body_joint_adr >= 0:
+            joint_id = body_joint_adr
+            joint_type = int(physics.model.jnt_type[joint_id])
+            if joint_type == 0:  # mjJNT_FREE
+                qadr = int(physics.model.jnt_qposadr[joint_id])
+                dadr = int(physics.model.jnt_dofadr[joint_id])
+                physics.data.qpos[qadr:qadr + 3] = pos
+                physics.data.qvel[dadr:dadr + 6] = 0.0
+                return
+        physics.model.body_pos[body_id] = pos
+
+    @classmethod
+    def _apply_obj_goal_pose(cls, physics, pose):
+        obj_pos = np.asarray(pose["obj_pos"], dtype=np.float64).reshape(3)
+        goal_pos = np.asarray(pose["goal_pos"], dtype=np.float64).reshape(3)
+        cls._apply_body_position(physics, cls.OBJ_BODY_NAME, obj_pos)
+        goal_site_id = physics.model.name2id(cls.GOAL_SITE_NAME, 'site')
+        physics.model.site_pos[goal_site_id] = goal_pos
+
     def initialize_episode(self, physics):
         with physics.reset_context():
             # Prefer named keyframe init if present; fallback to first keyframe if any.
@@ -414,6 +469,9 @@ class Proto5PickPlaceV3Task(base.Task):
                 if getattr(physics.model, 'key_mquat', None) is not None and physics.model.key_mquat.shape[0] > key_id:
                     mocap_id = self._get_mocap_id(physics)
                     physics.data.mocap_quat[mocap_id][:] = physics.model.key_mquat[key_id]
+
+            if HMF_PROTO5_OBJ_GOAL_POSE[0] is not None:
+                self._apply_obj_goal_pose(physics, HMF_PROTO5_OBJ_GOAL_POSE[0])
 
         super().initialize_episode(physics)
 

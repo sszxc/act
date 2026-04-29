@@ -31,7 +31,8 @@ from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from policy import ACTPolicy, CNNMLPPolicy
 from visualize_episodes import save_videos, visualize_joints
 
-from sim_env import BOX_POSE, DEX_OBJECT_POSE, sample_dex_object_pose
+from sim_env import BOX_POSE, DEX_OBJECT_POSE, HMF_PROTO5_OBJ_GOAL_POSE
+from sim_env import sample_dex_object_pose, sample_hmf_proto5_obj_goal_pose
 
 import IPython
 e = IPython.embed
@@ -347,14 +348,19 @@ def sample_dataset_start_qpos(dataset_dir, num_episodes):
 
 def apply_object_pose_for_reset(task_name, fixed_object_pose, env_family=None):
     """
-    Set BOX_POSE[0] or DEX_OBJECT_POSE[0] before env.reset().
-    fixed_object_pose None: task-specific random sample; else fixed vector (transfer 7, insertion 14, dex 7).
+    Set task-specific object/goal pose before env.reset().
+    fixed_object_pose None: task-specific random sample; else fixed vector.
     """
     if fixed_object_pose is not None:
         arr = np.asarray(fixed_object_pose, dtype=np.float64).reshape(-1)
         if env_family == ENV_FAMILY_HMF_PROTO5_HAND:
-            raise NotImplementedError("hmf_proto5_hand does not support fixed_object_pose override.")
-        if 'sim_transfer_cube' in task_name:
+            if arr.size != 6:
+                raise ValueError(f"hmf_proto5_hand needs 6-dim fixed pose (obj xyz + goal xyz), got {arr.size}")
+            HMF_PROTO5_OBJ_GOAL_POSE[0] = {
+                "obj_pos": arr[:3],
+                "goal_pos": arr[3:6],
+            }
+        elif 'sim_transfer_cube' in task_name:
             if arr.size != 7:
                 raise ValueError(f"sim_transfer_cube needs 7-dim object pose, got {arr.size}")
             BOX_POSE[0] = arr
@@ -375,6 +381,8 @@ def apply_object_pose_for_reset(task_name, fixed_object_pose, env_family=None):
             BOX_POSE[0] = np.concatenate(sample_insertion_pose())
         elif env_family == ENV_FAMILY_ALLEGRO:
             DEX_OBJECT_POSE[0] = sample_dex_object_pose()
+        elif env_family == ENV_FAMILY_HMF_PROTO5_HAND:
+            HMF_PROTO5_OBJ_GOAL_POSE[0] = sample_hmf_proto5_obj_goal_pose()
 
 
 def rollout_single_episode_return(
