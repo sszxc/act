@@ -1,5 +1,35 @@
 # ACT: Action Chunking with Transformers
 
+
+## Installation
+
+```
+conda create -n aloha -f environment.yml
+conda activate aloha
+cd act/detr && pip install -e .
+```
+
+
+## Training with Teleoperation Data from Dex-Retargeting
+
+Use `visualize_episodes.py` to generate videos and qpos plots for quick sanity checking of your data.  
+The dataset path for each task is configured in `constants.py`.  
+Evaluation results will be stored in a subfolder in the directory specified by `ckpt_dir`.
+
+```
+# for visualization
+python visualize_episodes.py --dataset_dir <data save dir> --episode_idx 0
+# for training
+python imitate_episodes.py --ckpt_dir results/sim_transfer_cube_scripted task_name=sim_transfer_cube_scripted policy_class=ACT kl_weight=10 chunk_size=100 hidden_dim=512 batch_size=8 dim_feedforward=3200 num_epochs=200 lr=1e-5 seed=0
+# for evaluation
+<training command> --eval --temporal_agg
+```
+
+
+<div align="center">
+  <h1 align="center"> 「Original」 </h1>
+</div>
+
 ### *New*: [ACT tuning tips](https://docs.google.com/document/d/1FVIZfoALXg_ZkYKaYVh-qOlaXveq5CtvJHXkY25eYhs/edit?usp=sharing)
 TL;DR: if your ACT policy is jerky or pauses in the middle of an episode, just train for longer! Success rate and smoothness can improve way after loss plateaus.
 
