@@ -11,10 +11,59 @@ ENV_FAMILY_ALLEGRO = "allegro"
 ENV_FAMILY_HMF_PROTO5_HAND = "hmf_proto5_hand"
 DEX_ALLEGRO_XML_PATH = '/mnt/1tb1/xuechao/MuJoCo-Asset-Pipeline/asset/scene/freejoint/teleop_scene_left_077_rubiks_cube/teleop_scene_left_077_rubiks_cube.xml'
 # DEX_ALLEGRO_XML_PATH = "/mnt/1tb1/xuechao/MuJoCo-Asset-Pipeline/asset/scene/freejoint/teleop_scene_left_035_power_drill/teleop_scene_left_035_power_drill.xml"
-HMF_PROTO5_XML_PATH = "/home/lab/Documents/proto5_description/mjcf/hmf_hand_proto5_release_right_ur7e_scene.xml"
 HMF_PROTO5_STATE_DIM = 24
 HMF_PROTO5_ACTION_DIM = 23  # mocap_pos(3) + mocap_quat(4, wxyz) + finger_ctrl(16)
 HMF_PROTO5_CTRL_DIM = 16
+
+HMF_PROTO5_RANDOM_RESET_CONFIGS = {
+    "pick_place_v3": {
+        "random_obj_goal": [
+            {
+                "name": "obj",
+                "type": "body",
+                "position_ranges": [[-0.2, 0.2], [0.5, 0.8], [0.66, 0.66]],
+            },
+            {
+                "name": "goal",
+                "type": "site",
+                "position_ranges": [[-0.3, 0.3], [0.5, 0.8], [0.7, 0.9]],
+            },
+        ],
+    },
+    "drawer": {
+        "random_obj_goal": [
+            {
+                "name": "drawer",
+                "type": "body",
+                "position_ranges": [[-0.2, 0.2], [0.8, 1.0], [0.6, 0.6]],
+            },
+            {
+                "name": "goal",
+                "type": "site",
+                "position_ranges": [[-0.3, 0.3], [0.5, 0.8], [0.7, 0.9]],
+            },
+        ],
+        "task_reset_joint": {
+            "enabled": True,
+            "name": "goal_slidey",
+            "value": 0.0,
+        },
+    },
+    "basketball": {
+        "random_obj_goal": [
+            {
+                "name": "ball",
+                "type": "body",
+                "position_ranges": [[-0.2, 0.2], [0.5, 0.7], [0.6, 0.6]],
+            },
+            {
+                "name": "goal",
+                "type": "body",
+                "position_ranges": [[-0.3, 0.3], [0.7, 0.8], [0.6, 0.6]],
+            },
+        ],
+    },
+}
 
 SIM_TASK_CONFIGS = {
     "sim_transfer_cube_scripted": {
@@ -79,7 +128,8 @@ SIM_TASK_CONFIGS = {
         "pca_finger_dim": 3,
         "env_family": ENV_FAMILY_ALLEGRO,
     },
-    "sim_hmf_proto5_manipulation": {
+    # HMF proto5 tasks share the same env family but load task-specific XMLs.
+    "sim_hmf_proto5_pick_place_v3": {
         "dataset_dir": DATA_DIR + "/sim_hmf_proto5_teleop/pick_place_v3/20260427_175415_50traj",
         "num_episodes": 50,
         "episode_len": 400,
@@ -87,7 +137,30 @@ SIM_TASK_CONFIGS = {
         "state_dim": HMF_PROTO5_STATE_DIM,
         "action_dim": HMF_PROTO5_ACTION_DIM,
         "env_family": ENV_FAMILY_HMF_PROTO5_HAND,
-        "xml_path": HMF_PROTO5_XML_PATH,
+        "xml_path": "/home/lab/Documents/proto5_description/mjcf/hmf_hand_proto5_release_right_ur7e_scene_pick_place_v3.xml",
+        "random_reset": HMF_PROTO5_RANDOM_RESET_CONFIGS["pick_place_v3"],
+    },
+    "sim_hmf_proto5_drawer": {
+        "dataset_dir": DATA_DIR + "/sim_hmf_proto5_teleop/drawer/20260429_141927_30traj",
+        "num_episodes": 30,
+        "episode_len": 400,
+        "camera_names": ["topview", "corner"],
+        "state_dim": HMF_PROTO5_STATE_DIM,
+        "action_dim": HMF_PROTO5_ACTION_DIM,
+        "env_family": ENV_FAMILY_HMF_PROTO5_HAND,
+        "xml_path": "/home/lab/Documents/proto5_description/mjcf/hmf_hand_proto5_release_right_ur7e_scene_drawer.xml",
+        "random_reset": HMF_PROTO5_RANDOM_RESET_CONFIGS["drawer"],
+    },
+    "sim_hmf_proto5_basketball": {
+        "dataset_dir": DATA_DIR + "/sim_hmf_proto5_teleop/basketball/20260429_152808_20traj",
+        "num_episodes": 20,
+        "episode_len": 400,
+        "camera_names": ["topview", "corner"],
+        "state_dim": HMF_PROTO5_STATE_DIM,
+        "action_dim": HMF_PROTO5_ACTION_DIM,
+        "env_family": ENV_FAMILY_HMF_PROTO5_HAND,
+        "xml_path": "/home/lab/Documents/proto5_description/mjcf/hmf_hand_proto5_release_right_ur7e_scene_basketball.xml",
+        "random_reset": HMF_PROTO5_RANDOM_RESET_CONFIGS["basketball"],
     },
 }
 

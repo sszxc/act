@@ -9,7 +9,8 @@ from dm_control import mujoco
 from dm_control.rl import control
 from dm_control.suite import base
 
-from constants import DT, XML_DIR, START_ARM_POSE, DEX_ALLEGRO_XML_PATH, HMF_PROTO5_XML_PATH
+from constants import DT, XML_DIR, START_ARM_POSE, DEX_ALLEGRO_XML_PATH, SIM_TASK_CONFIGS
+from constants import ENV_FAMILY_HMF_PROTO5_HAND
 from constants import HMF_PROTO5_CTRL_DIM, HMF_PROTO5_STATE_DIM
 from constants import PUPPET_GRIPPER_POSITION_UNNORMALIZE_FN
 from constants import MASTER_GRIPPER_POSITION_NORMALIZE_FN
@@ -21,14 +22,8 @@ e = IPython.embed
 
 BOX_POSE = [None] # to be changed from outside
 DEX_OBJECT_POSE = [None]  # for Allegro dex task: object (x,y,z,qw,qx,qy,qz)
-HMF_PROTO5_OBJ_GOAL_POSE = [None]  # dict with obj_pos and goal_pos, changed from outside
-
-HMF_PROTO5_RANDOM_OBJ_GOAL_CONFIG = {
-    "obj_body_name": "obj",
-    "goal_site_name": "goal",
-    "obj_position_ranges": [[-0.2, 0.2], [0.5, 0.8], [0.66, 0.66]],
-    "goal_position_ranges": [[-0.3, 0.3], [0.5, 0.8], [0.7, 0.9]],
-}
+HMF_PROTO5_RANDOM_RESET_STATE = [None]  # sampled body/site/joint reset, changed from outside
+HMF_PROTO5_OBJ_GOAL_POSE = HMF_PROTO5_RANDOM_RESET_STATE  # backward-compatible alias
 
 
 def _sample_xyz(ranges):
@@ -43,13 +38,25 @@ def _sample_xyz(ranges):
     )
 
 
-def sample_hmf_proto5_obj_goal_pose():
-    """Sample random HMF proto5 object and goal positions."""
-    cfg = HMF_PROTO5_RANDOM_OBJ_GOAL_CONFIG
-    return {
-        "obj_pos": _sample_xyz(cfg["obj_position_ranges"]),
-        "goal_pos": _sample_xyz(cfg["goal_position_ranges"]),
-    }
+def sample_hmf_proto5_random_reset(task_name):
+    """Sample task-specific random body/site reset targets for an HMF proto5 task."""
+    random_reset = SIM_TASK_CONFIGS.get(task_name, {}).get("random_reset", {})
+    state = {"random_obj_goal": []}
+
+    for target in random_reset.get("random_obj_goal", []):
+        state["random_obj_goal"].append({
+            "name": target["name"],
+            "type": target["type"],
+            "position": _sample_xyz(target["position_ranges"]),
+        })
+
+    task_reset_joint = random_reset.get("task_reset_joint")
+    if task_reset_joint and task_reset_joint.get("enabled", False):
+        state["task_reset_joint"] = dict(task_reset_joint)
+
+    if not state["random_obj_goal"] and "task_reset_joint" not in state:
+        return None
+    return state
 
 def sample_dex_object_pose():
     """Sample random object pose for dex eval. Returns (7,) array: x,y,z, qw,qx,qy,qz."""
@@ -86,6 +93,9 @@ def make_sim_env(task_name, time_limit=20):
                                         right_gripper_qvel (1)]     # normalized gripper velocity (pos: opening, neg: closing)
                         "images": {"main": (480x640x3)}        # h, w, c, dtype='uint8'
     """
+    task_config = SIM_TASK_CONFIGS.get(task_name, {})
+    env_family = task_config.get("env_family")
+
     if 'sim_transfer_cube' in task_name:
         xml_path = os.path.join(XML_DIR, f'bimanual_viperx_transfer_cube.xml')
         physics = mujoco.Physics.from_xml_path(xml_path)
@@ -104,16 +114,18 @@ def make_sim_env(task_name, time_limit=20):
         task = AllegroDexGraspTask(random=False)
         env = control.Environment(physics, task, time_limit=time_limit, control_timestep=DT,
                                   n_sub_steps=None, flat_observation=False)
-    elif 'sim_hmf_proto5_manipulation' in task_name:
+    elif env_family == ENV_FAMILY_HMF_PROTO5_HAND:
         # Right HMF proto5 hand with mocap-welded wrist.
         # Action 23d: mocap_pos(3) + mocap_quat(4) + finger_ctrl(16).
-        xml_path = HMF_PROTO5_XML_PATH
+        xml_path = task_config.get("xml_path")
+        if xml_path is None:
+            raise ValueError(f"HMF proto5 task '{task_name}' must define xml_path in SIM_TASK_CONFIGS.")
         physics = mujoco.Physics.from_xml_path(xml_path)
         task = Proto5PickPlaceV3Task(random=False)
         env = control.Environment(physics, task, time_limit=time_limit, control_timestep=DT,
                                   n_sub_steps=None, flat_observation=False)
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f"Unknown sim task: {task_name}")
     return env
 
 class BimanualViperXTask(base.Task):
@@ -389,8 +401,6 @@ class Proto5PickPlaceV3Task(base.Task):
     OBJECT_QPOS_SIZE = 7
     CTRL_SIZE = HMF_PROTO5_CTRL_DIM
     KEYFRAME_NAME = 'home'
-    OBJ_BODY_NAME = HMF_PROTO5_RANDOM_OBJ_GOAL_CONFIG["obj_body_name"]
-    GOAL_SITE_NAME = HMF_PROTO5_RANDOM_OBJ_GOAL_CONFIG["goal_site_name"]
 
     def __init__(self, random=None):
         super().__init__(random=random)
@@ -438,12 +448,50 @@ class Proto5PickPlaceV3Task(base.Task):
         physics.model.body_pos[body_id] = pos
 
     @classmethod
-    def _apply_obj_goal_pose(cls, physics, pose):
-        obj_pos = np.asarray(pose["obj_pos"], dtype=np.float64).reshape(3)
-        goal_pos = np.asarray(pose["goal_pos"], dtype=np.float64).reshape(3)
-        cls._apply_body_position(physics, cls.OBJ_BODY_NAME, obj_pos)
-        goal_site_id = physics.model.name2id(cls.GOAL_SITE_NAME, 'site')
-        physics.model.site_pos[goal_site_id] = goal_pos
+    def _apply_random_target(cls, physics, target):
+        name = str(target["name"])
+        target_type = str(target["type"])
+        pos = np.asarray(target["position"], dtype=np.float64).reshape(3)
+        if target_type == "body":
+            cls._apply_body_position(physics, name, pos)
+        elif target_type == "site":
+            site_id = physics.model.name2id(name, 'site')
+            physics.model.site_pos[site_id] = pos
+        else:
+            raise ValueError(f"Unsupported HMF proto5 random reset target type: {target_type}")
+
+    @staticmethod
+    def _apply_task_reset_joint(physics, cfg):
+        if not cfg or not cfg.get("enabled", False):
+            return
+
+        joint_name = str(cfg["name"])
+        joint_id = physics.model.name2id(joint_name, 'joint')
+        qadr = int(physics.model.jnt_qposadr[joint_id])
+        dadr = int(physics.model.jnt_dofadr[joint_id])
+        joint_type = int(physics.model.jnt_type[joint_id])
+        if joint_type == 0:  # mjJNT_FREE
+            qwidth, dwidth = 7, 6
+        elif joint_type == 1:  # mjJNT_BALL
+            qwidth, dwidth = 4, 3
+        else:
+            qwidth, dwidth = 1, 1
+
+        value = np.asarray(cfg["value"], dtype=np.float64).reshape(-1)
+        if value.size == 1 and qwidth == 1:
+            value = np.full(qwidth, float(value[0]), dtype=np.float64)
+        if value.size != qwidth:
+            raise ValueError(f"Joint '{joint_name}' expects {qwidth} qpos value(s), got {value.size}.")
+
+        physics.data.qpos[qadr:qadr + qwidth] = value
+        physics.data.qvel[dadr:dadr + dwidth] = 0.0
+
+    @classmethod
+    def _apply_random_reset(cls, physics, state):
+        for target in state.get("random_obj_goal", []):
+            cls._apply_random_target(physics, target)
+        cls._apply_task_reset_joint(physics, state.get("task_reset_joint"))
+        physics.forward()
 
     def initialize_episode(self, physics):
         with physics.reset_context():
@@ -470,8 +518,8 @@ class Proto5PickPlaceV3Task(base.Task):
                     mocap_id = self._get_mocap_id(physics)
                     physics.data.mocap_quat[mocap_id][:] = physics.model.key_mquat[key_id]
 
-            if HMF_PROTO5_OBJ_GOAL_POSE[0] is not None:
-                self._apply_obj_goal_pose(physics, HMF_PROTO5_OBJ_GOAL_POSE[0])
+            if HMF_PROTO5_RANDOM_RESET_STATE[0] is not None:
+                self._apply_random_reset(physics, HMF_PROTO5_RANDOM_RESET_STATE[0])
 
         super().initialize_episode(physics)
 

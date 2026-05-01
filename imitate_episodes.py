@@ -21,7 +21,7 @@ from tqdm import tqdm
 from einops import rearrange
 import h5py
 
-from constants import DT, DEFAULT_STATE_DIM, ROOT_DIM, STATE_DIM_ALLEGRO
+from constants import DT, DEFAULT_STATE_DIM, ROOT_DIM, STATE_DIM_ALLEGRO, SIM_TASK_CONFIGS
 from constants import ENV_FAMILY_ALLEGRO, ENV_FAMILY_HMF_PROTO5_HAND, ENV_FAMILY_METAWORLD
 from constants import HMF_PROTO5_CTRL_DIM, HMF_PROTO5_STATE_DIM
 from constants import PUPPET_GRIPPER_JOINT_OPEN, PUPPET_GRIPPER_POSITION_UNNORMALIZE_FN
@@ -31,8 +31,8 @@ from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from policy import ACTPolicy, CNNMLPPolicy
 from visualize_episodes import save_videos, visualize_joints
 
-from sim_env import BOX_POSE, DEX_OBJECT_POSE, HMF_PROTO5_OBJ_GOAL_POSE
-from sim_env import sample_dex_object_pose, sample_hmf_proto5_obj_goal_pose
+from sim_env import BOX_POSE, DEX_OBJECT_POSE, HMF_PROTO5_RANDOM_RESET_STATE
+from sim_env import sample_dex_object_pose, sample_hmf_proto5_random_reset
 
 import IPython
 e = IPython.embed
@@ -346,20 +346,43 @@ def sample_dataset_start_qpos(dataset_dir, num_episodes):
     return np.array(qpos0, dtype=np.float32)
 
 
+def build_fixed_hmf_proto5_random_reset(task_name, fixed_object_pose):
+    random_reset = SIM_TASK_CONFIGS.get(task_name, {}).get("random_reset", {})
+    targets = random_reset.get("random_obj_goal", [])
+    expected_dim = 3 * len(targets)
+    arr = np.asarray(fixed_object_pose, dtype=np.float64).reshape(-1)
+    if arr.size != expected_dim:
+        raise ValueError(
+            f"{task_name} needs {expected_dim}-dim fixed pose "
+            f"(3 xyz values per random_reset target), got {arr.size}"
+        )
+
+    state = {"random_obj_goal": []}
+    for i, target in enumerate(targets):
+        state["random_obj_goal"].append({
+            "name": target["name"],
+            "type": target["type"],
+            "position": arr[3 * i:3 * i + 3],
+        })
+
+    task_reset_joint = random_reset.get("task_reset_joint")
+    if task_reset_joint and task_reset_joint.get("enabled", False):
+        state["task_reset_joint"] = dict(task_reset_joint)
+    return state
+
+
 def apply_object_pose_for_reset(task_name, fixed_object_pose, env_family=None):
     """
     Set task-specific object/goal pose before env.reset().
     fixed_object_pose None: task-specific random sample; else fixed vector.
     """
+    if env_family is None:
+        env_family = SIM_TASK_CONFIGS.get(task_name, {}).get("env_family")
+
     if fixed_object_pose is not None:
         arr = np.asarray(fixed_object_pose, dtype=np.float64).reshape(-1)
         if env_family == ENV_FAMILY_HMF_PROTO5_HAND:
-            if arr.size != 6:
-                raise ValueError(f"hmf_proto5_hand needs 6-dim fixed pose (obj xyz + goal xyz), got {arr.size}")
-            HMF_PROTO5_OBJ_GOAL_POSE[0] = {
-                "obj_pos": arr[:3],
-                "goal_pos": arr[3:6],
-            }
+            HMF_PROTO5_RANDOM_RESET_STATE[0] = build_fixed_hmf_proto5_random_reset(task_name, arr)
         elif 'sim_transfer_cube' in task_name:
             if arr.size != 7:
                 raise ValueError(f"sim_transfer_cube needs 7-dim object pose, got {arr.size}")
@@ -382,7 +405,7 @@ def apply_object_pose_for_reset(task_name, fixed_object_pose, env_family=None):
         elif env_family == ENV_FAMILY_ALLEGRO:
             DEX_OBJECT_POSE[0] = sample_dex_object_pose()
         elif env_family == ENV_FAMILY_HMF_PROTO5_HAND:
-            HMF_PROTO5_OBJ_GOAL_POSE[0] = sample_hmf_proto5_obj_goal_pose()
+            HMF_PROTO5_RANDOM_RESET_STATE[0] = sample_hmf_proto5_random_reset(task_name)
 
 
 def rollout_single_episode_return(
