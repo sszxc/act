@@ -33,6 +33,7 @@ from visualize_episodes import save_videos, visualize_joints
 
 from sim_env import BOX_POSE, DEX_OBJECT_POSE, HMF_PROTO5_RANDOM_RESET_STATE
 from sim_env import sample_dex_object_pose, sample_hmf_proto5_random_reset
+from sim_env import episode_reward_meets_success
 
 import IPython
 e = IPython.embed
@@ -765,12 +766,17 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
         )
         episode_returns.append(episode_return)
         highest_rewards.append(episode_highest_reward)
-        logger(f'Rollout {rollout_id}\n{episode_return=}, {episode_highest_reward=}, {env_max_reward=}, Success: {episode_highest_reward==env_max_reward}')
+        ok = episode_reward_meets_success(task_name, episode_highest_reward, env_max_reward)
+        logger(f'Rollout {rollout_id}\n{episode_return=}, {episode_highest_reward=}, {env_max_reward=}, Success: {ok}')
 
-    success_rate = np.mean(np.array(highest_rewards) == env_max_reward)
+    success_flags = np.array(
+        [episode_reward_meets_success(task_name, h, env_max_reward) for h in highest_rewards],
+        dtype=np.float64,
+    )
+    success_rate = float(np.mean(success_flags))
     avg_return = np.mean(episode_returns)
     summary_str = f'\nSuccess rate: {success_rate}\nAverage return: {avg_return}\n\n'
-    for r in range(env_max_reward+1):
+    for r in range(int(env_max_reward) + 1):
         more_or_equal_r = (np.array(highest_rewards) >= r).sum()
         more_or_equal_r_rate = more_or_equal_r / num_rollouts
         summary_str += f'Reward >= {r}: {more_or_equal_r}/{num_rollouts} = {more_or_equal_r_rate*100}%\n'

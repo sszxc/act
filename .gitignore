@@ -1,6 +1,9 @@
 .hydra
 AGENTS.md
 tmp
+.env
+.env.*
+!.env.example
 
 bin
 logs

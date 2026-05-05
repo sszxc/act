@@ -139,6 +139,7 @@ SIM_TASK_CONFIGS = {
         "env_family": ENV_FAMILY_HMF_PROTO5_HAND,
         "xml_path": "/home/lab/Documents/proto5_description/mjcf/hmf_hand_proto5_release_right_ur7e_scene_pick_place_v3.xml",
         "random_reset": HMF_PROTO5_RANDOM_RESET_CONFIGS["pick_place_v3"],
+        # Per-step reward r = -||obj - goal||; max_reward = 0 (see Proto5PickPlaceV3Task).
     },
     "sim_hmf_proto5_drawer": {
         "dataset_dir": DATA_DIR + "/sim_hmf_proto5_teleop/drawer/20260429_141927_30traj",

@@ -121,7 +121,17 @@ def make_sim_env(task_name, time_limit=20):
         if xml_path is None:
             raise ValueError(f"HMF proto5 task '{task_name}' must define xml_path in SIM_TASK_CONFIGS.")
         physics = mujoco.Physics.from_xml_path(xml_path)
-        task = Proto5PickPlaceV3Task(random=False)
+        if task_name == "sim_hmf_proto5_pick_place_v3":
+            task = Proto5PickPlaceV3Task(random=False)
+        elif task_name == "sim_hmf_proto5_drawer":
+            task = Proto5DrawerTask(random=False)
+        elif task_name == "sim_hmf_proto5_basketball":
+            task = Proto5BasketballTask(random=False)
+        else:
+            raise NotImplementedError(
+                f"Unknown HMF proto5 task_name '{task_name}'. "
+                "Expected sim_hmf_proto5_pick_place_v3, sim_hmf_proto5_drawer, or sim_hmf_proto5_basketball."
+            )
         env = control.Environment(physics, task, time_limit=time_limit, control_timestep=DT,
                                   n_sub_steps=None, flat_observation=False)
     else:
@@ -384,9 +394,9 @@ class AllegroDexGraspTask(base.Task):
         return reward
 
 
-class Proto5PickPlaceV3Task(base.Task):
+class Proto5HMFMocapTask(base.Task):
     """
-    HMF proto5 right hand with mocap welded to wrist.
+    HMF proto5 right hand with mocap welded to wrist (shared by pick-place, drawer, basketball).
 
     - Action (23,): mocap_pos(3), mocap_quat(4) (wxyz), finger_ctrl(16)
     - Observation:
@@ -408,10 +418,10 @@ class Proto5PickPlaceV3Task(base.Task):
 
     @staticmethod
     def _get_mocap_id(physics):
-        body_id = physics.model.name2id(Proto5PickPlaceV3Task.MOCAP_BODY_NAME, 'body')
+        body_id = physics.model.name2id(Proto5HMFMocapTask.MOCAP_BODY_NAME, 'body')
         mocap_id = int(physics.model.body_mocapid[body_id])
         if mocap_id < 0:
-            raise ValueError(f"Body '{Proto5PickPlaceV3Task.MOCAP_BODY_NAME}' is not a mocap body in this XML.")
+            raise ValueError(f"Body '{Proto5HMFMocapTask.MOCAP_BODY_NAME}' is not a mocap body in this XML.")
         return mocap_id
 
     def before_step(self, action, physics):
@@ -526,18 +536,18 @@ class Proto5PickPlaceV3Task(base.Task):
     @staticmethod
     def get_qpos(physics):
         qpos = physics.data.qpos.copy()
-        return qpos[:Proto5PickPlaceV3Task.ROBOT_QPOS_SIZE]
+        return qpos[:Proto5HMFMocapTask.ROBOT_QPOS_SIZE]
 
     @staticmethod
     def get_qvel(physics):
         qvel = physics.data.qvel.copy()
-        return qvel[:Proto5PickPlaceV3Task.ROBOT_QPOS_SIZE]
+        return qvel[:Proto5HMFMocapTask.ROBOT_QPOS_SIZE]
 
     @staticmethod
     def get_env_state(physics):
         qpos = physics.data.qpos.copy()
-        start = Proto5PickPlaceV3Task.ROBOT_QPOS_SIZE
-        end = start + Proto5PickPlaceV3Task.OBJECT_QPOS_SIZE
+        start = Proto5HMFMocapTask.ROBOT_QPOS_SIZE
+        end = start + Proto5HMFMocapTask.OBJECT_QPOS_SIZE
         return qpos[start:end]
 
     def get_observation(self, physics):
@@ -552,6 +562,64 @@ class Proto5PickPlaceV3Task(base.Task):
 
     def get_reward(self, physics):
         return 0
+
+
+# Success if min object–goal distance over the episode is within this (meters).
+PICK_PLACE_V3_SUCCESS_DIST_ATOL = 0.02
+
+
+class Proto5PickPlaceV3Task(Proto5HMFMocapTask):
+    """Pick-place: per-step reward is negative obj–goal distance (world frame).
+
+    r_t = -||p_obj - p_goal||, so max_reward = 0 when d = 0. Episode return is
+    -sum_t d_t; dividing by horizon gives negative mean distance.
+    """
+
+    OBJECT_BODY_NAME = "obj"
+    GOAL_SITE_NAME = "goal"
+
+    def __init__(self, random=None):
+        super().__init__(random=random)
+        self.max_reward = 0.0
+
+    def get_reward(self, physics):
+        physics.forward()
+        obj_body = physics.model.name2id(self.OBJECT_BODY_NAME, "body")
+        goal_site = physics.model.name2id(self.GOAL_SITE_NAME, "site")
+        p_obj = np.asarray(physics.data.xpos[obj_body], dtype=np.float64).reshape(3)
+        p_goal = np.asarray(physics.data.site_xpos[goal_site], dtype=np.float64).reshape(3)
+        d = float(np.linalg.norm(p_obj - p_goal))
+        return float(-d)
+
+
+class Proto5DrawerTask(Proto5HMFMocapTask):
+    """Drawer task: reward not implemented yet (returns 0)."""
+
+    pass
+
+
+class Proto5BasketballTask(Proto5HMFMocapTask):
+    """Basketball task: reward not implemented yet (returns 0)."""
+
+    pass
+
+
+def episode_reward_meets_success(task_name, episode_highest_reward, env_max_reward):
+    """
+    Whether a rollout counts as success vs env.task.max_reward.
+    Pick-place v3: per-step reward is -distance; episode_highest_reward = max_t(-d_t) = -min_t(d_t).
+    Success when min distance is within PICK_PLACE_V3_SUCCESS_DIST_ATOL of the goal.
+    """
+    if task_name == "sim_hmf_proto5_pick_place_v3":
+        return bool(
+            np.isclose(
+                episode_highest_reward,
+                0.0,
+                rtol=0.0,
+                atol=PICK_PLACE_V3_SUCCESS_DIST_ATOL,
+            )
+        )
+    return bool(episode_highest_reward == env_max_reward)
 
 
 def get_action(master_bot_left, master_bot_right):

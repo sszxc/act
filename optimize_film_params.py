@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import pickle
+import re
 import sys
 from pathlib import Path
 
@@ -579,6 +580,236 @@ def _save_curve_png(path: Path, y1: np.ndarray, y1_label: str, y2: np.ndarray | 
     plt.close(fig)
 
 
+def _load_num_optim_prompt_template(path: Path) -> str:
+    text = path.read_text(encoding="utf-8")
+    m = re.search(r'system_prompt\s*=\s*"""(.*?)"""', text, flags=re.S)
+    if m is None:
+        raise ValueError(f"Cannot find `system_prompt` triple-quoted string in {path}")
+    return m.group(1).strip()
+
+
+def _format_reward_history_for_prompt(history: list[dict], rank: int) -> str:
+    if not history:
+        return "No previous samples yet."
+    lines = []
+    for rec in history:
+        params = rec["params"]
+        params_str = ", ".join([f"params[{i}]: {params[i]:.1f}" for i in range(rank)])
+        lines.append(f"iter {rec['iter']}: {params_str}, f(params): {rec['reward']:.6f}")
+    return "\n".join(lines)
+
+
+def _render_num_optim_prompt(
+    template: str,
+    *,
+    rank: int,
+    optimum: float,
+    step_size: float,
+    step_number: int,
+    max_steps: int,
+    episode_reward_buffer_string: str,
+) -> str:
+    rendered = template
+    rendered = rendered.replace("{{ rank - 1 }}", str(rank - 1))
+    rendered = rendered.replace("{{ rank }}", str(rank))
+    rendered = rendered.replace("{{ optimum }}", f"{float(optimum):.4f}")
+    rendered = rendered.replace("{{ step_size }}", f"{float(step_size):.1f}")
+    rendered = rendered.replace("{{ episode_reward_buffer_string }}", episode_reward_buffer_string)
+    rendered = rendered.replace("{{step_number}}", str(step_number))
+    rendered = rendered.replace("MAX_STEPS (400)", f"MAX_STEPS ({max_steps})")
+    rendered = rendered.replace("out of 400", f"out of {max_steps}")
+    return rendered
+
+
+def _parse_llm_params_response(text: str, rank: int) -> np.ndarray | None:
+    if not text:
+        return None
+    matches = re.findall(r"params\[(\d+)\]\s*:\s*([-+]?\d*\.?\d+)", text)
+    if matches:
+        vals = np.full(rank, np.nan, dtype=np.float64)
+        for idx_str, val_str in matches:
+            idx = int(idx_str)
+            if 0 <= idx < rank and np.isnan(vals[idx]):
+                vals[idx] = float(val_str)
+        if np.all(np.isfinite(vals)):
+            return vals
+    raw_nums = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", text)
+    if len(raw_nums) >= rank:
+        return np.asarray([float(x) for x in raw_nums[:rank]], dtype=np.float64)
+    return None
+
+
+def _clip_quantize_params(x: np.ndarray, low: float = -6.0, high: float = 6.0, decimals: int = 1) -> np.ndarray:
+    return np.round(np.clip(np.asarray(x, dtype=np.float64), low, high), decimals)
+
+
+def _sample_unseen_params(rng: np.random.Generator, rank: int, seen: set[tuple[float, ...]]) -> np.ndarray:
+    for _ in range(4096):
+        cand = rng.integers(-60, 61, size=rank).astype(np.float64) / 10.0
+        key = tuple(float(v) for v in cand.tolist())
+        if key not in seen:
+            return cand
+    # Extremely unlikely fallback.
+    cand = rng.uniform(-6.0, 6.0, size=rank)
+    return _clip_quantize_params(cand)
+
+
+def _init_openai_compatible_client(base_url: str, api_key: str):
+    try:
+        from openai import OpenAI
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("Please install openai package for --method llm: `pip install openai`") from e
+    return OpenAI(base_url=base_url, api_key=api_key)
+
+
+def _maybe_load_dotenv():
+    # Optional: allow local `.env` without forcing a dependency.
+    try:
+        from dotenv import load_dotenv  # type: ignore
+    except Exception:
+        return
+    load_dotenv(override=False)
+
+
+def _get_env(name: str) -> str | None:
+    v = os.getenv(name)
+    if v is None:
+        return None
+    v = str(v).strip()
+    return v if v else None
+
+
+def _call_llm_next_params(client, *, model: str, prompt: str, temperature: float) -> str:
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=float(temperature),
+    )
+    content = resp.choices[0].message.content
+    return content if content is not None else ""
+
+
+def run_llm(
+    fitness_fn,
+    x0: np.ndarray,
+    *,
+    maxiter: int,
+    seed: int,
+    log_path: Path,
+    llm_model: str,
+    llm_temperature: float,
+    llm_max_retries: int,
+    llm_history_window: int,
+    llm_step_size_hint: float,
+    llm_optimum_hint: float,
+    prompt_template_path: Path,
+):
+    rank = int(np.asarray(x0).size)
+    rng = np.random.default_rng(seed)
+    _maybe_load_dotenv()
+    base_url = _get_env("OPENAI_BASE_URL") or "https://openai.rc.asu.edu/v1"
+    api_key = _get_env("OPENAI_API_KEY")
+    if api_key is None:
+        raise RuntimeError(
+            "Missing OPENAI_API_KEY. Set it in your shell (recommended) or in a local `.env` file.\n"
+            "Example:\n"
+            "  export OPENAI_API_KEY='...'\n"
+            "Optional:\n"
+            "  export OPENAI_BASE_URL='https://openai.rc.asu.edu/v1'"
+        )
+    client = _init_openai_compatible_client(
+        base_url=base_url,
+        api_key=api_key,
+    )
+    template = _load_num_optim_prompt_template(prompt_template_path)
+    seen: set[tuple[float, ...]] = set()
+    history: list[dict] = []
+    history_best = []
+    history_iter_reward = []
+    best_so_far = -np.inf
+    best_x = _clip_quantize_params(x0)
+
+    with open(log_path, "w", encoding="utf-8") as flog:
+        flog.write(
+            f"# LLM dim={rank} maxiter={maxiter} model={llm_model} temp={llm_temperature} "
+            f"max_retries={llm_max_retries}\n"
+        )
+
+    for it in range(maxiter):
+        raw_response = ""
+        source = "seed"
+        if it == 0:
+            cand = _clip_quantize_params(x0)
+        else:
+            prompt_hist = history[-llm_history_window:] if llm_history_window > 0 else history
+            episode_reward_buffer_string = _format_reward_history_for_prompt(prompt_hist, rank)
+            prompt = _render_num_optim_prompt(
+                template,
+                rank=rank,
+                optimum=llm_optimum_hint,
+                step_size=llm_step_size_hint,
+                step_number=it + 1,
+                max_steps=maxiter,
+                episode_reward_buffer_string=episode_reward_buffer_string,
+            )
+            cand = None
+            for retry in range(max(1, llm_max_retries)):
+                try:
+                    raw_response = _call_llm_next_params(
+                        client,
+                        model=llm_model,
+                        prompt=prompt,
+                        temperature=llm_temperature,
+                    )
+                    parsed = _parse_llm_params_response(raw_response, rank)
+                    if parsed is None:
+                        continue
+                    parsed = _clip_quantize_params(parsed)
+                    key = tuple(float(v) for v in parsed.tolist())
+                    if key in seen:
+                        continue
+                    cand = parsed
+                    source = f"llm_success_after_retry_{retry}" if retry > 0 else "llm_success"
+                    break
+                except Exception as e:
+                    raw_response = f"__llm_error__: {e}"
+            if cand is None:
+                cand = _sample_unseen_params(rng, rank, seen)
+                source = "fallback_random"
+
+        cand = _clip_quantize_params(cand)
+        key = tuple(float(v) for v in cand.tolist())
+        if key in seen:
+            cand = _sample_unseen_params(rng, rank, seen)
+            key = tuple(float(v) for v in cand.tolist())
+            source = f"{source}_dedup"
+        reward = float(fitness_fn(cand))
+        seen.add(key)
+
+        if reward > best_so_far:
+            best_so_far = reward
+            best_x = cand.copy()
+
+        history.append(
+            {
+                "iter": it,
+                "params": [float(v) for v in cand.tolist()],
+                "reward": reward,
+                "best_so_far": float(best_so_far),
+                "source": source,
+                "raw_response": raw_response,
+            }
+        )
+        history_best.append(float(best_so_far))
+        history_iter_reward.append(float(reward))
+
+        with open(log_path, "a", encoding="utf-8") as flog:
+            flog.write(json.dumps(history[-1], ensure_ascii=False) + "\n")
+        print(f"LLM iter {it}: reward={reward:.4f} best_so_far={best_so_far:.4f} source={source}")
+
+    return best_x, np.asarray(history_best), np.asarray(history_iter_reward)
+
+
 def main():
     p = argparse.ArgumentParser(description="FiLM gamma/beta search (CMA-ES or ARS)")
     p.add_argument("--ckpt", type=str, required=True, help="path to policy .ckpt")
@@ -605,7 +836,7 @@ def main():
         action="store_true",
         help="Init qpos from a random trajectory start in the dataset (combines with fixed object)",
     )
-    p.add_argument("--method", type=str, choices=("cma", "ars"), required=True)
+    p.add_argument("--method", type=str, choices=("cma", "ars", "llm"), required=True)
     # policy architecture (must match training)
     p.add_argument("--policy_class", type=str, default="ACT")
     p.add_argument("--chunk_size", type=int, default=100)
@@ -644,6 +875,25 @@ def main():
         "--rsp_raw_gaussian",
         action="store_true",
         help="Gaussian i.i.d. columns without QR orthogonalization (default: QR for orthonormal columns)",
+    )
+    # LLM optimizer
+    p.add_argument("--llm_model", type=str, default="llama4-scout-17b", help="LLM model name")
+    p.add_argument("--llm_maxiter", type=int, default=50, help="LLM optimization iterations")
+    p.add_argument("--llm_temperature", type=float, default=0.2, help="LLM sampling temperature")
+    p.add_argument("--llm_max_retries", type=int, default=3, help="LLM retries per iteration for valid unseen params")
+    p.add_argument("--llm_history_window", type=int, default=40, help="How many past samples to include in each prompt")
+    p.add_argument("--llm_step_size_hint", type=float, default=0.5, help="Exploration step-size hint in prompt")
+    p.add_argument(
+        "--llm_optimum_hint",
+        type=float,
+        default=None,
+        help="Optional optimum hint used in prompt (default: env_max_reward)",
+    )
+    p.add_argument(
+        "--llm_prompt_template",
+        type=str,
+        default=None,
+        help="Prompt template python file (defaults to prompts/num_optim.py)",
     )
 
     args = p.parse_args()
@@ -794,6 +1044,18 @@ def main():
         meta["rsp_seed"] = int(args.rsp_seed) if args.rsp_seed is not None else int(args.seed)
         meta["rsp_orthogonal"] = not args.rsp_raw_gaussian
         meta["theta_base"] = theta_base.tolist()
+    if args.method == "llm":
+        meta["llm_model"] = args.llm_model
+        meta["llm_maxiter"] = int(args.llm_maxiter)
+        meta["llm_temperature"] = float(args.llm_temperature)
+        meta["llm_max_retries"] = int(args.llm_max_retries)
+        meta["llm_history_window"] = int(args.llm_history_window)
+        meta["llm_step_size_hint"] = float(args.llm_step_size_hint)
+        meta["llm_optimum_hint"] = (
+            float(args.llm_optimum_hint) if args.llm_optimum_hint is not None else float(env_max_reward)
+        )
+        meta["llm_param_clip"] = [-6.0, 6.0]
+        meta["llm_param_decimals"] = 1
     with open(out_dir / "run_meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
     if use_rsp and rsp_proj is not None:
@@ -826,7 +1088,7 @@ def main():
             )
         np.savez(out_dir / "ars_curves.npz", best_so_far=h_best, iter_max=h_iter)
         _save_curve_png(out_dir / "reward_curve.png", h_best, "best_so_far", h_iter, "iter_max")
-    else:
+    elif args.method == "cma":
         log_path = out_dir / "cma_history.jsonl"
         if int(args.parallel) > 1:
             best_x, h_best, h_gen = run_cma_batched(
@@ -851,6 +1113,31 @@ def main():
             )
         np.savez(out_dir / "cma_curves.npz", best_so_far=h_best, gen_max=h_gen)
         _save_curve_png(out_dir / "reward_curve.png", h_best, "best_so_far", h_gen, "gen_max")
+    else:
+        if int(args.parallel) > 1:
+            print("Warning: --method llm currently evaluates one candidate per iteration; extra parallel envs stay idle.")
+        prompt_template_path = (
+            Path(args.llm_prompt_template).resolve()
+            if args.llm_prompt_template
+            else (Path(__file__).resolve().parent / "prompts" / "num_optim.py")
+        )
+        optimum_hint = float(args.llm_optimum_hint) if args.llm_optimum_hint is not None else float(env_max_reward)
+        best_x, h_best, h_iter = run_llm(
+            fitness,
+            opt_x0,
+            maxiter=int(args.llm_maxiter),
+            seed=args.seed,
+            log_path=out_dir / "llm_trace.jsonl",
+            llm_model=args.llm_model,
+            llm_temperature=float(args.llm_temperature),
+            llm_max_retries=int(args.llm_max_retries),
+            llm_history_window=int(args.llm_history_window),
+            llm_step_size_hint=float(args.llm_step_size_hint),
+            llm_optimum_hint=optimum_hint,
+            prompt_template_path=prompt_template_path,
+        )
+        np.savez(out_dir / "llm_curves.npz", best_so_far=h_best, iter_reward=h_iter)
+        _save_curve_png(out_dir / "reward_curve.png", h_best, "best_so_far", h_iter, "iter_reward")
 
     if use_rsp and rsp_proj is not None:
         best_theta = _rsp_decode(theta_base, rsp_proj, best_x)
