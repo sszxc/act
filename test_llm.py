@@ -22,12 +22,12 @@ if not api_key:
 client = OpenAI(base_url=base_url, api_key=api_key)
 
 response = client.chat.completions.create(
-    model="qwen3-30b-a3b-thinking-2507", messages=[{"role": "user", "content": "Hello!"}]
+    model="llama4-maverick-17b", messages=[{"role": "user", "content": "Hello!"}]
 )
 
 print(response.choices[0].message.content)
 
 
 # gemma4-31b-it
-# llama4-scout-17b
+# llama4-maverick-17b
 # qwen3-30b-a3b-thinking-2507

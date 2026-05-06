@@ -25,7 +25,9 @@ import json
 import os
 import pickle
 import re
+import shutil
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +41,16 @@ from constants import DT, SIM_TASK_CONFIGS, DEFAULT_STATE_DIM
 from policy import ACTPolicy
 from imitate_episodes import make_policy, set_seed
 from sim_env import make_sim_env
+
+
+def _progress(seq, *, enabled: bool, desc: str, total: int | None = None):
+    if not enabled:
+        return seq
+    try:
+        from tqdm import tqdm  # type: ignore
+    except Exception:
+        return seq
+    return tqdm(seq, desc=desc, total=total, dynamic_ncols=True, leave=False)
 
 
 def _parse_float_list(s: str) -> np.ndarray:
@@ -167,6 +179,8 @@ def rollout_batch_episode_returns(
     init_qpos_from_dataset: bool,
     dataset_dir: str | None,
     num_episodes: int | None,
+    show_rollout_progress: bool = False,
+    rollout_desc: str = "rollout",
 ) -> np.ndarray:
     """
     Step multiple envs in parallel (one theta each), batch observations per timestep on one GPU.
@@ -218,7 +232,13 @@ def rollout_batch_episode_returns(
     # Same as imitate_episodes eval: inference_mode so temporal_agg does not keep
     # autograd over the full episode when stitching multi-step policy outputs into all_time_actions
     with torch.inference_mode():
-        for t in range(max_timesteps):
+        it = _progress(
+            range(max_timesteps),
+            enabled=bool(show_rollout_progress),
+            desc=str(rollout_desc),
+            total=max_timesteps,
+        )
+        for t in it:
             # build batch obs
             qpos_batch = []
             img_batch = []
@@ -343,6 +363,8 @@ def run_ars(
         flog.write(f"# ARS dim={dim} sigma={sigma} alpha={alpha} n_pairs={n_pairs}\n")
 
     for it in range(n_iters):
+        t0 = time.perf_counter()
+        print(f"[ARS] iter {it}/{n_iters-1} starting; will eval ≈ {2*n_pairs + 1} rollouts")
         grad = np.zeros(dim, dtype=np.float64)
         iter_best = -np.inf
         snap = theta.copy()
@@ -372,7 +394,8 @@ def run_ars(
         history_iter_max.append(float(iter_best))
         with open(log_path, "a", encoding="utf-8") as flog:
             flog.write(json.dumps({"iter": it, "best_so_far": best_so_far, "iter_best": iter_best}) + "\n")
-        print(f"ARS iter {it}: iter_best={iter_best:.4f} best_so_far={best_so_far:.4f}")
+        dt = time.perf_counter() - t0
+        print(f"[ARS] iter {it}: iter_best={iter_best:.4f} best_so_far={best_so_far:.4f} wall={dt:.2f}s")
 
     return best_theta, np.array(history_best), np.array(history_iter_max)
 
@@ -407,12 +430,14 @@ def run_ars_batched(
         )
 
     for it in range(n_iters):
+        t0 = time.perf_counter()
         eps_list = [rng.standard_normal(dim) for _ in range(n_pairs)]
         cand = []
         for eps in eps_list:
             cand.append(theta + sigma * eps)
             cand.append(theta - sigma * eps)
         # evaluate all perturbations
+        print(f"[ARS(batched)] iter {it}/{n_iters-1} evaluating {len(cand)} candidates (batch_size={batch_size})")
         rewards = []
         for i in range(0, len(cand), batch_size):
             tb = np.stack(cand[i : i + batch_size], axis=0)
@@ -445,7 +470,13 @@ def run_ars_batched(
         history_iter_best.append(iter_best)
         with open(log_path, "a", encoding="utf-8") as flog:
             flog.write(json.dumps({"iter": it, "best_so_far": best_so_far, "iter_best": iter_best}) + "\n")
-        print(f"ARS(batched) iter {it}: iter_best={iter_best:.4f} best_so_far={best_so_far:.4f}")
+        dt = time.perf_counter() - t0
+        r_mean = float(np.mean(rewards)) if rewards.size else float("nan")
+        r_std = float(np.std(rewards)) if rewards.size else float("nan")
+        print(
+            f"[ARS(batched)] iter {it}: iter_best={iter_best:.4f} best_so_far={best_so_far:.4f} "
+            f"mean±std={r_mean:.4f}±{r_std:.4f} wall={dt:.2f}s"
+        )
 
     return best_theta, np.asarray(history_best), np.asarray(history_iter_best)
 
@@ -482,12 +513,15 @@ def run_cma(
         )
 
     while not es.stop():
+        t0 = time.perf_counter()
         xs = es.ask()
-        rewards = [fitness_fn(np.asarray(x, dtype=np.float64)) for x in xs]
-        es.tell(xs, [-float(r) for r in rewards])
-        gen_max = float(np.max(rewards))
         gen = int(es.countiter)
-        ib = int(np.argmax(rewards))
+        print(f"[CMA] gen {gen}/{maxiter-1} evaluating pop={len(xs)} (waiting for rollouts)")
+        rewards = [fitness_fn(np.asarray(x, dtype=np.float64)) for x in xs]
+        r_arr = np.asarray(list(map(float, rewards)), dtype=np.float64)
+        es.tell(xs, [-float(r) for r in rewards])
+        gen_max = float(np.max(r_arr)) if r_arr.size else float("nan")
+        ib = int(np.argmax(r_arr)) if r_arr.size else 0
         if rewards[ib] > best_so_far:
             best_so_far = float(rewards[ib])
             best_x = np.asarray(xs[ib], dtype=np.float64).copy()
@@ -498,13 +532,20 @@ def run_cma(
                 json.dumps(
                     {
                         "generation": gen,
+                        "params": np.asarray(xs[ib], dtype=np.float64).tolist(),
                         "gen_max": gen_max,
                         "best_so_far": best_so_far,
                     }
                 )
                 + "\n"
             )
-        print(f"CMA gen {gen}: gen_max={gen_max:.4f} best_so_far={best_so_far:.4f}")
+        dt = time.perf_counter() - t0
+        r_mean = float(np.mean(r_arr)) if r_arr.size else float("nan")
+        r_std = float(np.std(r_arr)) if r_arr.size else float("nan")
+        print(
+            f"[CMA] gen {gen}: gen_max={gen_max:.4f} best_so_far={best_so_far:.4f} "
+            f"mean±std={r_mean:.4f}±{r_std:.4f} wall={dt:.2f}s"
+        )
 
     return best_x, np.array(history_best), np.array(history_gen_max)
 
@@ -538,8 +579,11 @@ def run_cma_batched(
         )
 
     while not es.stop():
+        t0 = time.perf_counter()
         xs = es.ask()
         rewards = []
+        gen = int(es.countiter)
+        print(f"[CMA(batched)] gen {gen}/{maxiter-1} evaluating pop={len(xs)} (batch_size={batch_size})")
         for i in range(0, len(xs), batch_size):
             tb = np.stack([np.asarray(x, dtype=np.float64) for x in xs[i : i + batch_size]], axis=0)
             rewards.extend(list(map(float, fitness_batch_fn(tb))))
@@ -547,7 +591,6 @@ def run_cma_batched(
         es.tell(xs, list((-rewards).astype(float)))
 
         gen_max = float(np.max(rewards))
-        gen = int(es.countiter)
         ib = int(np.argmax(rewards))
         if rewards[ib] > best_so_far:
             best_so_far = float(rewards[ib])
@@ -555,8 +598,24 @@ def run_cma_batched(
         history_best.append(best_so_far)
         history_gen_max.append(gen_max)
         with open(log_path, "a", encoding="utf-8") as flog:
-            flog.write(json.dumps({"generation": gen, "gen_max": gen_max, "best_so_far": best_so_far}) + "\n")
-        print(f"CMA(batched) gen {gen}: gen_max={gen_max:.4f} best_so_far={best_so_far:.4f}")
+            flog.write(
+                json.dumps(
+                    {
+                        "generation": gen,
+                        "params": np.asarray(xs[ib], dtype=np.float64).tolist(),
+                        "gen_max": gen_max,
+                        "best_so_far": best_so_far,
+                    }
+                )
+                + "\n"
+            )
+        dt = time.perf_counter() - t0
+        r_mean = float(np.mean(rewards)) if rewards.size else float("nan")
+        r_std = float(np.std(rewards)) if rewards.size else float("nan")
+        print(
+            f"[CMA(batched)] gen {gen}: gen_max={gen_max:.4f} best_so_far={best_so_far:.4f} "
+            f"mean±std={r_mean:.4f}±{r_std:.4f} wall={dt:.2f}s"
+        )
 
     return best_x, np.asarray(history_best), np.asarray(history_gen_max)
 
@@ -584,18 +643,22 @@ def _load_num_optim_prompt_template(path: Path) -> str:
     text = path.read_text(encoding="utf-8")
     m = re.search(r'system_prompt\s*=\s*"""(.*?)"""', text, flags=re.S)
     if m is None:
-        raise ValueError(f"Cannot find `system_prompt` triple-quoted string in {path}")
+        # Allow "raw prompt" files (plain text) too.
+        # This enables alternative prompt templates that are not wrapped in a python variable.
+        return text.strip()
     return m.group(1).strip()
 
 
-def _format_reward_history_for_prompt(history: list[dict], rank: int) -> str:
+def _format_history_text_for_prompt(history: list[dict], rank: int) -> str:
+    """Format past evaluations for prompts/num_optim_Pratyush.py (maximize episode return)."""
     if not history:
         return "No previous samples yet."
     lines = []
     for rec in history:
         params = rec["params"]
-        params_str = ", ".join([f"params[{i}]: {params[i]:.1f}" for i in range(rank)])
-        lines.append(f"iter {rec['iter']}: {params_str}, f(params): {rec['reward']:.6f}")
+        r = float(rec["reward"])
+        params_str = ", ".join([f"params[{i}]: {params[i]:.2f}" for i in range(rank)])
+        lines.append(f"iter {rec['iter']}: {params_str}, R(params): {r:.6f}")
     return "\n".join(lines)
 
 
@@ -603,28 +666,39 @@ def _render_num_optim_prompt(
     template: str,
     *,
     rank: int,
-    optimum: float,
+    optimum_reward: float,
     step_size: float,
-    step_number: int,
-    max_steps: int,
-    episode_reward_buffer_string: str,
+    episode_num: int,
+    total_episodes: int,
+    history_text: str,
 ) -> str:
+    """Fill placeholders for prompts/num_optim_Pratyush.py-style templates (no Jinja)."""
     rendered = template
     rendered = rendered.replace("{{ rank - 1 }}", str(rank - 1))
     rendered = rendered.replace("{{ rank }}", str(rank))
-    rendered = rendered.replace("{{ optimum }}", f"{float(optimum):.4f}")
-    rendered = rendered.replace("{{ step_size }}", f"{float(step_size):.1f}")
-    rendered = rendered.replace("{{ episode_reward_buffer_string }}", episode_reward_buffer_string)
-    rendered = rendered.replace("{{step_number}}", str(step_number))
-    rendered = rendered.replace("MAX_STEPS (400)", f"MAX_STEPS ({max_steps})")
-    rendered = rendered.replace("out of 400", f"out of {max_steps}")
+
+    rendered = re.sub(
+        r"\{\{\s*optimum_reward:\.1f\s*\}\}",
+        f"{float(optimum_reward):.1f}",
+        rendered,
+    )
+    rendered = re.sub(r"\{\{\s*optimum_reward\s*\}\}", f"{float(optimum_reward)}", rendered)
+
+    rendered = re.sub(r"\{\{\s*step_size\s*\}\}", str(float(step_size)), rendered)
+    rendered = re.sub(r"\{\{\s*episode_num\s*\}\}", str(int(episode_num)), rendered)
+    rendered = re.sub(r"\{\{\s*total_episodes\s*\}\}", str(int(total_episodes)), rendered)
+    rendered = re.sub(r"\{\{\s*history_text\s*\}\}", history_text, rendered)
+
+    rendered = re.sub(r"<start_of_turn>.*$", "", rendered, flags=re.M).strip()
     return rendered
 
 
 def _parse_llm_params_response(text: str, rank: int) -> np.ndarray | None:
     if not text:
         return None
-    matches = re.findall(r"params\[(\d+)\]\s*:\s*([-+]?\d*\.?\d+)", text)
+    m = re.search(r"<param\b[^>]*>(.*?)</param\s*>", text, flags=re.S | re.I)
+    scope = m.group(1) if m else text
+    matches = re.findall(r"params\[(\d+)\]\s*:\s*([-+]?\d*\.?\d+)", scope)
     if matches:
         vals = np.full(rank, np.nan, dtype=np.float64)
         for idx_str, val_str in matches:
@@ -633,7 +707,7 @@ def _parse_llm_params_response(text: str, rank: int) -> np.ndarray | None:
                 vals[idx] = float(val_str)
         if np.all(np.isfinite(vals)):
             return vals
-    raw_nums = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", text)
+    raw_nums = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", scope)
     if len(raw_nums) >= rank:
         return np.asarray([float(x) for x in raw_nums[:rank]], dtype=np.float64)
     return None
@@ -645,7 +719,7 @@ def _clip_quantize_params(x: np.ndarray, low: float = -6.0, high: float = 6.0, d
 
 def _sample_unseen_params(rng: np.random.Generator, rank: int, seen: set[tuple[float, ...]]) -> np.ndarray:
     for _ in range(4096):
-        cand = rng.integers(-60, 61, size=rank).astype(np.float64) / 10.0
+        cand = rng.integers(-600, 601, size=rank).astype(np.float64) / 100.0
         key = tuple(float(v) for v in cand.tolist())
         if key not in seen:
             return cand
@@ -722,6 +796,11 @@ def run_llm(
         api_key=api_key,
     )
     template = _load_num_optim_prompt_template(prompt_template_path)
+    prompt_backup_dir = log_path.parent / "llm_prompt_backups"
+    prompt_backup_dir.mkdir(parents=True, exist_ok=True)
+    if prompt_template_path.is_file():
+        shutil.copy2(prompt_template_path, prompt_backup_dir / prompt_template_path.name)
+
     seen: set[tuple[float, ...]] = set()
     history: list[dict] = []
     history_best = []
@@ -736,34 +815,45 @@ def run_llm(
         )
 
     for it in range(maxiter):
+        t0 = time.perf_counter()
         raw_response = ""
         source = "seed"
         if it == 0:
             cand = _clip_quantize_params(x0)
         else:
             prompt_hist = history[-llm_history_window:] if llm_history_window > 0 else history
-            episode_reward_buffer_string = _format_reward_history_for_prompt(prompt_hist, rank)
+            history_text = _format_history_text_for_prompt(prompt_hist, rank)
             prompt = _render_num_optim_prompt(
                 template,
                 rank=rank,
-                optimum=llm_optimum_hint,
+                optimum_reward=float(llm_optimum_hint),
                 step_size=llm_step_size_hint,
-                step_number=it + 1,
-                max_steps=maxiter,
-                episode_reward_buffer_string=episode_reward_buffer_string,
+                episode_num=it + 1,
+                total_episodes=maxiter,
+                history_text=history_text,
             )
+            (prompt_backup_dir / f"rendered_prompt_iter_{it:04d}.txt").write_text(prompt, encoding="utf-8")
             cand = None
-            for retry in range(max(1, llm_max_retries)):
+            n_tries = max(1, int(llm_max_retries))
+            every_call_raised = True
+            saw_parseable_vector = False
+            for retry in range(n_tries):
                 try:
+                    print(
+                        f"[LLM] iter {it}/{maxiter-1} requesting next params from model={llm_model} "
+                        f"(retry {retry}/{n_tries - 1}) — waiting for optimizer response"
+                    )
                     raw_response = _call_llm_next_params(
                         client,
                         model=llm_model,
                         prompt=prompt,
                         temperature=llm_temperature,
                     )
+                    every_call_raised = False
                     parsed = _parse_llm_params_response(raw_response, rank)
                     if parsed is None:
                         continue
+                    saw_parseable_vector = True
                     parsed = _clip_quantize_params(parsed)
                     key = tuple(float(v) for v in parsed.tolist())
                     if key in seen:
@@ -775,7 +865,13 @@ def run_llm(
                     raw_response = f"__llm_error__: {e}"
             if cand is None:
                 cand = _sample_unseen_params(rng, rank, seen)
-                source = "fallback_random"
+                # Distinguish why the LLM path failed (logged in source / optional fallback_reason).
+                if saw_parseable_vector:
+                    source = "duplicate_after_retries"
+                elif every_call_raised:
+                    source = "api_error"
+                else:
+                    source = "parse_failure"
 
         cand = _clip_quantize_params(cand)
         key = tuple(float(v) for v in cand.tolist())
@@ -805,7 +901,8 @@ def run_llm(
 
         with open(log_path, "a", encoding="utf-8") as flog:
             flog.write(json.dumps(history[-1], ensure_ascii=False) + "\n")
-        print(f"LLM iter {it}: reward={reward:.4f} best_so_far={best_so_far:.4f} source={source}")
+        dt = time.perf_counter() - t0
+        print(f"[LLM] iter {it}: reward={reward:.4f} best_so_far={best_so_far:.4f} source={source} wall={dt:.2f}s")
 
     return best_x, np.asarray(history_best), np.asarray(history_iter_reward)
 
@@ -854,6 +951,11 @@ def main():
     p.add_argument("--cma_maxiter", type=int, default=50)
     p.add_argument("--cma_popsize", type=int, default=None)
     p.add_argument(
+        "--show_rollout_progress",
+        action="store_true",
+        help="Show tqdm-style progress bar for each simulation rollout (requires tqdm; otherwise no-op)",
+    )
+    p.add_argument(
         "--parallel",
         type=int,
         default=1,
@@ -887,13 +989,13 @@ def main():
         "--llm_optimum_hint",
         type=float,
         default=None,
-        help="Optional optimum hint used in prompt (default: env_max_reward)",
+        help="Approx best episode return R for the prompt hint (default: env task max_reward)",
     )
     p.add_argument(
         "--llm_prompt_template",
         type=str,
         default=None,
-        help="Prompt template python file (defaults to prompts/num_optim.py)",
+        help="Prompt template python file (defaults to prompts/num_optim_Pratyush.py)",
     )
 
     args = p.parse_args()
@@ -1001,6 +1103,8 @@ def main():
             init_qpos_from_dataset=args.init_qpos_from_dataset,
             dataset_dir=task_cfg.get("dataset_dir"),
             num_episodes=task_cfg.get("num_episodes"),
+            show_rollout_progress=bool(args.show_rollout_progress),
+            rollout_desc=f"sim rollout x{theta_batch.shape[0]}",
         )
 
     theta_base = _film_theta_from_policy(policy).astype(np.float64, copy=False)
@@ -1056,6 +1160,7 @@ def main():
         )
         meta["llm_param_clip"] = [-6.0, 6.0]
         meta["llm_param_decimals"] = 1
+        meta["llm_prompt_backups_dir"] = "llm_prompt_backups"
     with open(out_dir / "run_meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
     if use_rsp and rsp_proj is not None:
@@ -1119,7 +1224,7 @@ def main():
         prompt_template_path = (
             Path(args.llm_prompt_template).resolve()
             if args.llm_prompt_template
-            else (Path(__file__).resolve().parent / "prompts" / "num_optim.py")
+            else (Path(__file__).resolve().parent / "prompts" / "num_optim_Pratyush.py")
         )
         optimum_hint = float(args.llm_optimum_hint) if args.llm_optimum_hint is not None else float(env_max_reward)
         best_x, h_best, h_iter = run_llm(
