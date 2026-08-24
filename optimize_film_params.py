@@ -28,6 +28,7 @@ import re
 import shutil
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -41,6 +42,7 @@ from constants import DT, SIM_TASK_CONFIGS, DEFAULT_STATE_DIM
 from policy import ACTPolicy
 from imitate_episodes import make_policy, set_seed
 from sim_env import make_sim_env
+from visualize_episodes import save_videos
 
 
 def _progress(seq, *, enabled: bool, desc: str, total: int | None = None):
@@ -181,10 +183,15 @@ def rollout_batch_episode_returns(
     num_episodes: int | None,
     show_rollout_progress: bool = False,
     rollout_desc: str = "rollout",
+    video_dir: Path | None = None,
+    round_label: str = "round",
 ) -> np.ndarray:
     """
     Step multiple envs in parallel (one theta each), batch observations per timestep on one GPU.
     Returns episode_return per trajectory (shape: (B,)).
+
+    If video_dir is not None, records one video per env (all camera_names side by side) to
+    video_dir / f"{round_label}_env{i}.mp4".
     """
     B = len(envs)
     if thetas.shape[0] != B:
@@ -228,6 +235,8 @@ def rollout_batch_episode_returns(
         all_time_actions = None
 
     rewards_sum = np.zeros(B, dtype=np.float64)
+    record_video = video_dir is not None
+    image_lists: list[list[dict]] | None = [[] for _ in range(B)] if record_video else None
 
     # Same as imitate_episodes eval: inference_mode so temporal_agg does not keep
     # autograd over the full episode when stitching multi-step policy outputs into all_time_actions
@@ -242,10 +251,13 @@ def rollout_batch_episode_returns(
             # build batch obs
             qpos_batch = []
             img_batch = []
-            for ts in ts_list:
+            for i, ts in enumerate(ts_list):
                 obs = ts.observation
                 qpos_np = np.asarray(obs["qpos"], dtype=np.float32)[:state_dim]
                 qpos_batch.append(pre_process(qpos_np))
+
+                if record_video:
+                    image_lists[i].append(obs["images"])
 
                 # images: (num_cam, C, H, W) normalized to 0..1
                 cams = []
@@ -301,6 +313,12 @@ def rollout_batch_episode_returns(
                     rewards_sum[i] += float(r)
                 new_ts_list.append(ts)
             ts_list = new_ts_list
+
+    if record_video:
+        assert video_dir is not None and image_lists is not None
+        video_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(B):
+            save_videos(image_lists[i], DT, video_path=str(video_dir / f"{round_label}_env{i}.mp4"))
 
     return rewards_sum
 
@@ -837,6 +855,7 @@ def run_llm(
             n_tries = max(1, int(llm_max_retries))
             every_call_raised = True
             saw_parseable_vector = False
+            attempt_responses: list[str] = []
             for retry in range(n_tries):
                 try:
                     print(
@@ -849,6 +868,7 @@ def run_llm(
                         prompt=prompt,
                         temperature=llm_temperature,
                     )
+                    attempt_responses.append(f"--- retry {retry} ---\n{raw_response}")
                     every_call_raised = False
                     parsed = _parse_llm_params_response(raw_response, rank)
                     if parsed is None:
@@ -863,6 +883,10 @@ def run_llm(
                     break
                 except Exception as e:
                     raw_response = f"__llm_error__: {e}"
+                    attempt_responses.append(f"--- retry {retry} ---\n{raw_response}")
+            (prompt_backup_dir / f"rendered_response_iter_{it:04d}.txt").write_text(
+                "\n\n".join(attempt_responses), encoding="utf-8"
+            )
             if cand is None:
                 cand = _sample_unseen_params(rng, rank, seen)
                 # Distinguish why the LLM path failed (logged in source / optional fallback_reason).
@@ -912,8 +936,21 @@ def main():
     p.add_argument("--ckpt", type=str, required=True, help="path to policy .ckpt")
     p.add_argument("--stats_path", type=str, default=None, help="dataset_stats.pkl; defaults next to ckpt")
     p.add_argument("--task_name", type=str, required=True, help="task name in SIM_TASK_CONFIGS")
-    p.add_argument("--output_dir", type=str, default="tmp/film_param_search")
+    p.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Where to write search outputs; defaults to a new "
+        "<ckpt_dir>/icl_<timestamp>_<model_or_method> folder next to the ckpt "
+        "(alongside eval_* folders)",
+    )
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--save_videos",
+        action="store_true",
+        help="Render and save an mp4 per evaluated candidate per round to <output_dir>/videos/ "
+        "(off by default: adds per-step frame capture + encoding overhead)",
+    )
     p.add_argument("--temporal_agg", action="store_true")
     p.add_argument("--latent_z_sample", type=str, default=None)
     p.add_argument(
@@ -1003,6 +1040,12 @@ def main():
         print("FiLM exists only on ACT (DETRVAE); use --policy_class ACT", file=sys.stderr)
         sys.exit(1)
 
+    if args.output_dir is None:
+        ckpt_dir = Path(args.ckpt).resolve().parent
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        model_name = args.llm_model if args.method == "llm" else args.method
+        args.output_dir = str(ckpt_dir / f"icl_{timestamp}_{model_name}")
+
     task_name = args.task_name
     if task_name not in SIM_TASK_CONFIGS:
         print(f"Unknown task_name: {task_name}. Options: {list(SIM_TASK_CONFIGS.keys())}", file=sys.stderr)
@@ -1088,8 +1131,14 @@ def main():
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    video_dir = out_dir / "videos" if args.save_videos else None
+    if video_dir is not None:
+        video_dir.mkdir(parents=True, exist_ok=True)
+    _round_counter = {"n": 0}
 
     def eval_theta_batch(theta_batch: np.ndarray) -> np.ndarray:
+        round_idx = _round_counter["n"]
+        _round_counter["n"] += 1
         return rollout_batch_episode_returns(
             policy,
             envs[: theta_batch.shape[0]],
@@ -1105,6 +1154,8 @@ def main():
             num_episodes=task_cfg.get("num_episodes"),
             show_rollout_progress=bool(args.show_rollout_progress),
             rollout_desc=f"sim rollout x{theta_batch.shape[0]}",
+            video_dir=video_dir,
+            round_label=f"round_{round_idx:04d}",
         )
 
     theta_base = _film_theta_from_policy(policy).astype(np.float64, copy=False)
@@ -1144,6 +1195,8 @@ def main():
         "fixed_object_pose": fixed_object_pose.tolist(),
         "env_max_reward": env_max_reward,
     }
+    if args.save_videos:
+        meta["videos_dir"] = "videos"
     if use_rsp:
         meta["rsp_seed"] = int(args.rsp_seed) if args.rsp_seed is not None else int(args.seed)
         meta["rsp_orthogonal"] = not args.rsp_raw_gaussian
