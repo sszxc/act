@@ -1003,7 +1003,9 @@ def _call_llm_next_params(
     temperature: float,
     max_tokens: int | None = None,
     image_data_uri: str | None = None,
-) -> str:
+) -> tuple[str, str]:
+    """Returns (content, reasoning) — reasoning is the model's separate thinking-channel
+    text when the backend exposes one (see below), else ""."""
     if image_data_uri:
         content = [
             {"type": "text", "text": prompt},
@@ -1025,8 +1027,16 @@ def _call_llm_next_params(
         temperature=float(temperature),
         **kwargs,
     )
-    content_resp = resp.choices[0].message.content
-    return content_resp if content_resp is not None else ""
+    message = resp.choices[0].message
+    content_resp = message.content
+    # "Thinking" models served over OpenAI-compatible backends (vLLM/SGLang reasoning
+    # parsers, etc.) typically split their chain-of-thought out of `message.content` and
+    # into a separate field — most commonly `reasoning_content`, occasionally `reasoning`.
+    # Without capturing it, the logged response is just the bare <param> block with no way
+    # to audit whether the model actually engaged with the required <think> analysis (state/
+    # visual/trend/sensitivity/mode) or looked at the attached image.
+    reasoning_resp = getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)
+    return (content_resp if content_resp is not None else ""), (reasoning_resp or "")
 
 
 def run_llm(
@@ -1138,7 +1148,7 @@ def run_llm(
                             f"[LLM] iter {it}/{maxiter-1} requesting next params from model={llm_model} "
                             f"(retry {retry}/{n_tries - 1}, temp={retry_temperature:.2f}) — waiting for optimizer response"
                         )
-                        raw_response = _call_llm_next_params(
+                        raw_response, reasoning_response = _call_llm_next_params(
                             client,
                             model=llm_model,
                             prompt=prompt,
@@ -1146,7 +1156,13 @@ def run_llm(
                             max_tokens=llm_max_tokens,
                             image_data_uri=last_vlm_image_uri if use_vlm else None,
                         )
-                        attempt_responses.append(f"--- retry {retry} (temp={retry_temperature:.2f}) ---\n{raw_response}")
+                        attempt_log = f"--- retry {retry} (temp={retry_temperature:.2f}) ---\n"
+                        if reasoning_response:
+                            # Logged for audit only — never fed back into history_text or parsed
+                            # for <param>, so it can't change downstream behavior.
+                            attempt_log += f"--- reasoning ---\n{reasoning_response}\n--- content ---\n"
+                        attempt_log += raw_response
+                        attempt_responses.append(attempt_log)
                         every_call_raised = False
                         parsed = _parse_llm_params_response(raw_response, rank)
                         if parsed is None:
@@ -1329,7 +1345,7 @@ def main():
     p.add_argument(
         "--llm_max_tokens",
         type=int,
-        default=4096,
+        default=8192,
         help="Explicit max_tokens per LLM call. 'Thinking' models can burn the whole "
         "generation budget on their <think> block and return empty content if this is too "
         "small (or left to a stingy backend default); pass 0 to omit max_tokens entirely.",
