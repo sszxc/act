@@ -8,11 +8,16 @@ Usage:
     echo "Hello!" | python test_llm.py --model gemma4-31b-it
     python test_llm.py --model qwen3-vl-32b-thinking --image assets/example.jpg "What is in this image?"
     python test_llm.py --model qwen3-vl-32b-thinking -i img1.png -i img2.png "Compare these two images"
+    python test_llm.py --model qwen3-vl-32b-thinking --video clip.mp4 "What happens in this video?"
     python test_llm.py --list-models
 
 Images can be a local file path (base64-encoded automatically) or an
-http(s) URL. Requires OPENAI_API_KEY (and optionally OPENAI_BASE_URL) in the
-environment or a local `.env` file (see .env.example).
+http(s) URL. Native video inputs (video_url) are rejected by the current
+backend ("At most 0 video(s) may be provided"), so --video instead samples
+evenly-spaced frames from a local video file with OpenCV and sends them as
+a sequence of images, the same way -i/--image does. Requires OPENAI_API_KEY
+(and optionally OPENAI_BASE_URL) in the environment or a local `.env` file
+(see .env.example).
 """
 import argparse
 import base64
@@ -60,6 +65,45 @@ def encode_image(spec: str) -> str:
     return f"data:{mime};base64,{b64}"
 
 
+def extract_video_frames(path: str, num_frames: int) -> list[str]:
+    """Sample `num_frames` evenly-spaced frames from a local video file and
+    return them as base64-encoded JPEG data URIs (usable as `image_url` values).
+    """
+    import cv2  # local import: only needed when --video is used
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video file: {path}")
+
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total <= 0:
+        cap.release()
+        raise RuntimeError(f"Could not determine frame count for video: {path}")
+
+    n = max(1, min(num_frames, total))
+    if n == 1:
+        indices = [total // 2]
+    else:
+        indices = sorted({round(i * (total - 1) / (n - 1)) for i in range(n)})
+
+    frames = []
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        ok, buf = cv2.imencode(".jpg", frame)
+        if not ok:
+            continue
+        b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+        frames.append(f"data:image/jpeg;base64,{b64}")
+    cap.release()
+
+    if not frames:
+        raise RuntimeError(f"Failed to extract any frames from video: {path}")
+    return frames
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Send a prompt to an OpenAI-compatible LLM API and report latency."
@@ -76,6 +120,27 @@ def parse_args():
         default=None,
         metavar="PATH_OR_URL",
         help="Image to attach (local file path or URL). May be passed multiple times.",
+    )
+    parser.add_argument(
+        "--video",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Local video file to attach. Native video input isn't supported by the "
+            "backend, so this samples evenly-spaced frames (see --video-frames) and "
+            "sends them as images instead."
+        ),
+    )
+    parser.add_argument(
+        "--video-frames",
+        type=int,
+        default=4,
+        metavar="N",
+        help=(
+            "Number of frames to sample from --video (default: 4). Note: the "
+            "current backend caps requests at 4 images total (image + video "
+            "frames combined), so higher values will likely 400."
+        ),
     )
     parser.add_argument("--max-tokens", type=int, default=None, help="Optional max_tokens.")
     parser.add_argument("--temperature", type=float, default=None, help="Optional sampling temperature.")
@@ -115,17 +180,32 @@ def main():
 
     client = OpenAI(base_url=base_url, api_key=api_key)
 
-    if args.image and args.model not in VISION_MODELS:
+    if (args.image or args.video) and args.model not in VISION_MODELS:
         print(
             f"Warning: '{args.model}' isn't in the known VISION_MODELS list; "
-            "the API may reject the image input.",
+            "the API may reject the image/video input.",
             file=sys.stderr,
         )
 
-    if args.image:
+    video_frames = []
+    if args.video:
+        print(f"Extracting {args.video_frames} frame(s) from {args.video}...", file=sys.stderr)
+        video_frames = extract_video_frames(args.video, args.video_frames)
+
+    total_images = len(args.image or []) + len(video_frames)
+    if total_images > 4:
+        print(
+            f"Warning: sending {total_images} image(s) total; the current backend "
+            "caps requests at 4 images and will likely reject this.",
+            file=sys.stderr,
+        )
+
+    if args.image or video_frames:
         user_content = [{"type": "text", "text": prompt}]
-        for spec in args.image:
+        for spec in args.image or []:
             user_content.append({"type": "image_url", "image_url": {"url": encode_image(spec)}})
+        for frame_uri in video_frames:
+            user_content.append({"type": "image_url", "image_url": {"url": frame_uri}})
         user_message = {"role": "user", "content": user_content}
     else:
         user_message = {"role": "user", "content": prompt}
@@ -145,6 +225,8 @@ def main():
     print(f"Prompt: {prompt}")
     if args.image:
         print(f"Images: {', '.join(args.image)}")
+    if video_frames:
+        print(f"Video: {args.video} ({len(video_frames)} frame(s) sampled)")
     print("Waiting for response...")
 
     t0 = time.perf_counter()
