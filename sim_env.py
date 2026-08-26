@@ -121,16 +121,19 @@ def make_sim_env(task_name, time_limit=20):
         if xml_path is None:
             raise ValueError(f"HMF proto5 task '{task_name}' must define xml_path in SIM_TASK_CONFIGS.")
         physics = mujoco.Physics.from_xml_path(xml_path)
-        if task_name == "sim_hmf_proto5_pick_place_v3":
+        # Prefix match so eval-only scene variants (e.g. *_eval_cyl for shape
+        # generalization tests) reuse the same task/reward logic as the base task.
+        if task_name.startswith("sim_hmf_proto5_pick_place_v3"):
             task = Proto5PickPlaceV3Task(random=False)
-        elif task_name == "sim_hmf_proto5_drawer":
+        elif task_name.startswith("sim_hmf_proto5_drawer"):
             task = Proto5DrawerTask(random=False)
-        elif task_name == "sim_hmf_proto5_basketball":
+        elif task_name.startswith("sim_hmf_proto5_basketball"):
             task = Proto5BasketballTask(random=False)
         else:
             raise NotImplementedError(
                 f"Unknown HMF proto5 task_name '{task_name}'. "
-                "Expected sim_hmf_proto5_pick_place_v3, sim_hmf_proto5_drawer, or sim_hmf_proto5_basketball."
+                "Expected sim_hmf_proto5_pick_place_v3, sim_hmf_proto5_drawer, or sim_hmf_proto5_basketball "
+                "(optionally with a suffix, e.g. an eval-only scene variant)."
             )
         env = control.Environment(physics, task, time_limit=time_limit, control_timestep=DT,
                                   n_sub_steps=None, flat_observation=False)
@@ -610,7 +613,7 @@ def episode_reward_meets_success(task_name, episode_highest_reward, env_max_rewa
     Pick-place v3: per-step reward is -distance; episode_highest_reward = max_t(-d_t) = -min_t(d_t).
     Success when min distance is within PICK_PLACE_V3_SUCCESS_DIST_ATOL of the goal.
     """
-    if task_name == "sim_hmf_proto5_pick_place_v3":
+    if task_name.startswith("sim_hmf_proto5_pick_place_v3"):
         return bool(
             np.isclose(
                 episode_highest_reward,

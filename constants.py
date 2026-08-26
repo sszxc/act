@@ -141,6 +141,20 @@ SIM_TASK_CONFIGS = {
         "random_reset": HMF_PROTO5_RANDOM_RESET_CONFIGS["pick_place_v3"],
         # Per-step reward r = -||obj - goal||; max_reward = 0 (see Proto5PickPlaceV3Task).
     },
+    # Eval-only shape-generalization variant of pick_place_v3: same dataset/checkpoint,
+    # obj geom swapped box -> cylinder (color/material unchanged). No own dataset;
+    # eval with --task_name sim_hmf_proto5_pick_place_v3_eval --ckpt_dir <pick_place_v3 ckpt>.
+    "sim_hmf_proto5_pick_place_v3_eval": {
+        "dataset_dir": DATA_DIR + "/sim_hmf_proto5_teleop/pick_place_v3/20260427_175415_50traj",
+        "num_episodes": 50,
+        "episode_len": 400,
+        "camera_names": ["topview", "corner"],
+        "state_dim": HMF_PROTO5_STATE_DIM,
+        "action_dim": HMF_PROTO5_ACTION_DIM,
+        "env_family": ENV_FAMILY_HMF_PROTO5_HAND,
+        "xml_path": "/home/lab/Documents/proto5_description/mjcf/hmf_hand_proto5_release_right_ur7e_scene_pick_place_v3_eval.xml",
+        "random_reset": HMF_PROTO5_RANDOM_RESET_CONFIGS["pick_place_v3"],
+    },
     "sim_hmf_proto5_drawer": {
         "dataset_dir": DATA_DIR + "/sim_hmf_proto5_teleop/drawer/20260429_141927_30traj",
         "num_episodes": 30,
