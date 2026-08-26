@@ -944,7 +944,13 @@ def _encode_image_array_to_data_uri(img: np.ndarray, quality: int = 90) -> str:
 
 
 def _call_llm_next_params(
-    client, *, model: str, prompt: str, temperature: float, image_data_uri: str | None = None
+    client,
+    *,
+    model: str,
+    prompt: str,
+    temperature: float,
+    max_tokens: int | None = None,
+    image_data_uri: str | None = None,
 ) -> str:
     if image_data_uri:
         content = [
@@ -953,10 +959,19 @@ def _call_llm_next_params(
         ]
     else:
         content = prompt
+    kwargs = {}
+    if max_tokens is not None:
+        # "Thinking" models spend generation budget on a <think> block before the final
+        # answer; too small a budget (or an unset one, on some backends) truncates mid-thought
+        # and message.content comes back empty (finish_reason="length") even though the API
+        # call itself succeeded. An explicit, generous budget makes that failure mode rare and,
+        # when it still happens, distinguishable via finish_reason rather than silently empty.
+        kwargs["max_tokens"] = int(max_tokens)
     resp = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": content}],
         temperature=float(temperature),
+        **kwargs,
     )
     content_resp = resp.choices[0].message.content
     return content_resp if content_resp is not None else ""
@@ -972,6 +987,8 @@ def run_llm(
     llm_model: str,
     llm_temperature: float,
     llm_max_retries: int,
+    llm_max_tokens: int | None,
+    llm_retry_temperature_bump: float,
     llm_history_window: int,
     llm_step_size_hint: float,
     llm_optimum_hint: float,
@@ -1025,7 +1042,8 @@ def run_llm(
     with open(log_path, "w", encoding="utf-8") as flog:
         flog.write(
             f"# LLM dim={rank} maxiter={maxiter} model={llm_model} temp={llm_temperature} "
-            f"max_retries={llm_max_retries} start_time={datetime.now().isoformat()}\n"
+            f"max_retries={llm_max_retries} max_tokens={llm_max_tokens} "
+            f"retry_temperature_bump={llm_retry_temperature_bump} start_time={datetime.now().isoformat()}\n"
         )
 
     interrupted_exc: BaseException | None = None
@@ -1056,19 +1074,26 @@ def run_llm(
                 saw_parseable_vector = False
                 attempt_responses: list[str] = []
                 for retry in range(n_tries):
+                    # Retries reuse the exact same prompt, so at low temperature the model tends
+                    # to just repeat its previous (already-seen) answer, or the same truncated-
+                    # empty response, verbatim — bumping temperature per retry gives it a real
+                    # chance to land somewhere different instead of burning the retry budget on
+                    # a near-deterministic repeat.
+                    retry_temperature = min(2.0, llm_temperature + retry * llm_retry_temperature_bump)
                     try:
                         print(
                             f"[LLM] iter {it}/{maxiter-1} requesting next params from model={llm_model} "
-                            f"(retry {retry}/{n_tries - 1}) — waiting for optimizer response"
+                            f"(retry {retry}/{n_tries - 1}, temp={retry_temperature:.2f}) — waiting for optimizer response"
                         )
                         raw_response = _call_llm_next_params(
                             client,
                             model=llm_model,
                             prompt=prompt,
-                            temperature=llm_temperature,
+                            temperature=retry_temperature,
+                            max_tokens=llm_max_tokens,
                             image_data_uri=last_vlm_image_uri if use_vlm else None,
                         )
-                        attempt_responses.append(f"--- retry {retry} ---\n{raw_response}")
+                        attempt_responses.append(f"--- retry {retry} (temp={retry_temperature:.2f}) ---\n{raw_response}")
                         every_call_raised = False
                         parsed = _parse_llm_params_response(raw_response, rank)
                         if parsed is None:
@@ -1083,7 +1108,7 @@ def run_llm(
                         break
                     except Exception as e:
                         raw_response = f"__llm_error__: {e}"
-                        attempt_responses.append(f"--- retry {retry} ---\n{raw_response}")
+                        attempt_responses.append(f"--- retry {retry} (temp={retry_temperature:.2f}) ---\n{raw_response}")
                 (prompt_log_dir / f"rendered_response_iter_{it:04d}.txt").write_text(
                     "\n\n".join(attempt_responses), encoding="utf-8"
                 )
@@ -1241,6 +1266,22 @@ def main():
     p.add_argument("--llm_maxiter", type=int, default=50, help="LLM optimization iterations")
     p.add_argument("--llm_temperature", type=float, default=0.2, help="LLM sampling temperature")
     p.add_argument("--llm_max_retries", type=int, default=3, help="LLM retries per iteration for valid unseen params")
+    p.add_argument(
+        "--llm_max_tokens",
+        type=int,
+        default=4096,
+        help="Explicit max_tokens per LLM call. 'Thinking' models can burn the whole "
+        "generation budget on their <think> block and return empty content if this is too "
+        "small (or left to a stingy backend default); pass 0 to omit max_tokens entirely.",
+    )
+    p.add_argument(
+        "--llm_retry_temperature_bump",
+        type=float,
+        default=0.2,
+        help="Added to --llm_temperature on each retry within an iteration (capped at 2.0), so "
+        "a retry has a real chance of escaping a repeated duplicate/empty response instead of "
+        "resampling the same near-deterministic low-temperature output.",
+    )
     p.add_argument("--llm_history_window", type=int, default=40, help="How many past samples to include in each prompt")
     p.add_argument("--llm_step_size_hint", type=float, default=0.5, help="Exploration step-size hint in prompt")
     p.add_argument(
@@ -1454,6 +1495,8 @@ def main():
         meta["llm_maxiter"] = int(args.llm_maxiter)
         meta["llm_temperature"] = float(args.llm_temperature)
         meta["llm_max_retries"] = int(args.llm_max_retries)
+        meta["llm_max_tokens"] = int(args.llm_max_tokens) or None
+        meta["llm_retry_temperature_bump"] = float(args.llm_retry_temperature_bump)
         meta["llm_history_window"] = int(args.llm_history_window)
         meta["llm_step_size_hint"] = float(args.llm_step_size_hint)
         meta["llm_optimum_hint"] = (
@@ -1544,6 +1587,8 @@ def main():
             llm_model=args.llm_model,
             llm_temperature=float(args.llm_temperature),
             llm_max_retries=int(args.llm_max_retries),
+            llm_max_tokens=int(args.llm_max_tokens) or None,
+            llm_retry_temperature_bump=float(args.llm_retry_temperature_bump),
             llm_history_window=int(args.llm_history_window),
             llm_step_size_hint=float(args.llm_step_size_hint),
             llm_optimum_hint=optimum_hint,
