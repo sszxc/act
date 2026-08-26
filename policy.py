@@ -24,6 +24,8 @@ class ACTPolicy(nn.Module):
         latent_z_sample=None,
         film_gamma=None,
         film_beta=None,
+        film_pca_gamma=None,
+        film_pca_beta=None,
     ):
         env_state = None
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -41,6 +43,8 @@ class ACTPolicy(nn.Module):
                 is_pad,
                 film_gamma=film_gamma,
                 film_beta=film_beta,
+                film_pca_gamma=film_pca_gamma,
+                film_pca_beta=film_pca_beta,
             )
             total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
             loss_dict = dict()
@@ -58,6 +62,8 @@ class ACTPolicy(nn.Module):
                 latent_z_sample=latent_z_sample,
                 film_gamma=film_gamma,
                 film_beta=film_beta,
+                film_pca_gamma=film_pca_gamma,
+                film_pca_beta=film_pca_beta,
             ) # no action, sample from prior
             return a_hat
 

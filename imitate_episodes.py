@@ -420,6 +420,7 @@ def rollout_single_episode_return(
     use_pca_action,
     rollout_latent_z,
     film_theta=None,
+    film_pca_theta=None,
     fixed_object_pose=None,
     fixed_init_qpos=None,
     init_qpos_from_dataset=False,
@@ -439,6 +440,11 @@ def rollout_single_episode_return(
     """
     One rollout; returns (episode_return, episode_highest_reward).
     Sim: object pose from fixed_object_pose before reset; optional fixed_init_qpos or init_qpos_from_dataset.
+
+    film_theta: flat (2*hidden_dim,) [gamma, beta] for the plain per-channel FiLM path.
+    film_pca_theta: flat (2*k,) [gamma, beta] for the PCA-bottleneck FiLM path (see
+    detr_vae.py's load_film_pca()); caller must have already called policy.model.load_film_pca()
+    so policy.model.film_pca_k == k. Mutually exclusive with film_theta.
     """
     real_robot = config['real_robot']
     policy_class = config['policy_class']
@@ -544,6 +550,9 @@ def rollout_single_episode_return(
             else:
                 if policy_class == "ACT":
                     if t % query_frequency == 0:
+                        if film_theta is not None and film_pca_theta is not None:
+                            raise ValueError("film_theta and film_pca_theta are mutually exclusive")
+                        film_gamma = film_beta = film_pca_gamma = film_pca_beta = None
                         if film_theta is not None:
                             hdim = int(policy.model.visual_film_gamma.numel())
                             theta = np.asarray(film_theta, dtype=np.float32).reshape(-1)
@@ -551,15 +560,26 @@ def rollout_single_episode_return(
                                 raise ValueError(f"film_theta dim mismatch: got {theta.size}, expected {2*hdim}")
                             film_gamma = torch.from_numpy(theta[:hdim]).to(device=qpos.device, dtype=qpos.dtype).unsqueeze(0)
                             film_beta = torch.from_numpy(theta[hdim:]).to(device=qpos.device, dtype=qpos.dtype).unsqueeze(0)
-                        else:
-                            film_gamma = None
-                            film_beta = None
+                        elif film_pca_theta is not None:
+                            k = int(policy.model.film_pca_k)
+                            if k <= 0:
+                                raise ValueError(
+                                    "film_pca_theta given but policy.model has no PCA-bottleneck FiLM "
+                                    "basis loaded (film_pca_k=0); call policy.model.load_film_pca() first"
+                                )
+                            theta = np.asarray(film_pca_theta, dtype=np.float32).reshape(-1)
+                            if theta.size != 2 * k:
+                                raise ValueError(f"film_pca_theta dim mismatch: got {theta.size}, expected {2*k}")
+                            film_pca_gamma = torch.from_numpy(theta[:k]).to(device=qpos.device, dtype=qpos.dtype).unsqueeze(0)
+                            film_pca_beta = torch.from_numpy(theta[k:]).to(device=qpos.device, dtype=qpos.dtype).unsqueeze(0)
                         all_actions = policy(
                             qpos,
                             curr_image,
                             latent_z_sample=rollout_latent_z,
                             film_gamma=film_gamma,
                             film_beta=film_beta,
+                            film_pca_gamma=film_pca_gamma,
+                            film_pca_beta=film_pca_beta,
                         )
                     if temporal_agg:
                         all_time_actions[[t], t:t + num_queries] = all_actions
@@ -673,8 +693,13 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
     policy = make_policy(policy_class, policy_config)
     state_dict = torch.load(ckpt_path)
     loading_status = policy.load_state_dict(state_dict, strict=False)
-    # Backward-compat: allow missing FiLM buffers introduced later.
-    allowed_missing = {"model.visual_film_gamma", "model.visual_film_beta"}
+    # Backward-compat: allow missing FiLM buffers introduced later. film_pca_* default to
+    # a disabled no-op (film_pca_k=0) until load_film_pca() installs a basis, so it's safe
+    # for older checkpoints saved before this buffer existed to be missing them.
+    allowed_missing = {
+        "model.visual_film_gamma", "model.visual_film_beta",
+        "model.film_pca_W", "model.film_pca_mu", "model.film_pca_gamma", "model.film_pca_beta",
+    }
     missing = set(getattr(loading_status, "missing_keys", []))
     unexpected = set(getattr(loading_status, "unexpected_keys", []))
     missing_not_allowed = missing - allowed_missing

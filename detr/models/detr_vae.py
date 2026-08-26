@@ -82,6 +82,26 @@ class DETRVAE(nn.Module):
             # self.visual_film_gamma[hidden_dim // 2 :] = 0.5
             # self.visual_film_beta[hidden_dim // 2 :] += 0.01 * torch.randn(hidden_dim - hidden_dim // 2)
             self._film_viz_frame_idx = 0
+
+            # --- PCA-bottleneck FiLM (opt-in, independent of the plain per-channel FiLM above) ---
+            # Hard bottleneck: src is encoded into a k-dim PCA subspace (W, mu fit offline from
+            # recorded activations by fit_film_pca.py), FiLM-modulated there (film_pca_gamma/beta,
+            # k-dim each, are the only free/searched params), then decoded straight back to
+            # hidden_dim and used as `src` outright — it REPLACES src, it does not compose with
+            # visual_film_gamma/beta above. Disabled by default (film_pca_k == 0); see
+            # load_film_pca() to install a basis, and forward()'s film_pca_gamma/film_pca_beta args
+            # for per-sample batched search.
+            #
+            # NOTE: because the k-dim subspace only spans part of hidden_dim's variance,
+            # x_hat = W @ (W^T (x - mu)) + mu != x in general, even at the identity setting
+            # gamma=1, beta=0 — reconstruction loss is inherent to this hard bottleneck, not a
+            # bug. A residual/soft variant that preserves the orthogonal complement (x_hat = x +
+            # W @ ((gamma-1) * z + beta)) is a possible future extension, not implemented here.
+            self.film_pca_k = 0
+            self.register_buffer("film_pca_W", torch.zeros(hidden_dim, 0))
+            self.register_buffer("film_pca_mu", torch.zeros(hidden_dim))
+            self.register_buffer("film_pca_gamma", torch.zeros(0))
+            self.register_buffer("film_pca_beta", torch.zeros(0))
         else:
             self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)
             self.input_proj_env_state = nn.Linear(7, hidden_dim)
@@ -100,6 +120,28 @@ class DETRVAE(nn.Module):
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim) # project latent sample to embedding
         self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for proprio and latent
 
+    def load_film_pca(self, W: torch.Tensor, mu: torch.Tensor):
+        """Install a PCA-bottleneck FiLM basis (see the film_pca_* buffers set up in __init__).
+
+        W: (hidden_dim, k) principal directions (columns), mu: (hidden_dim,) mean — both fit
+        offline by fit_film_pca.py from recorded pre-FiLM activations. Replaces any previously
+        loaded basis; film_pca_gamma/beta reset to identity (1, 0). Pass k=0 (W with 0 columns)
+        to disable the PCA-bottleneck path and fall back to the plain FiLM above.
+        """
+        hidden_dim = self.visual_film_gamma.numel()
+        if W.ndim != 2 or W.shape[0] != hidden_dim:
+            raise ValueError(f"film_pca W shape {tuple(W.shape)} expected (hidden_dim={hidden_dim}, k)")
+        if mu.shape != (hidden_dim,):
+            raise ValueError(f"film_pca mu shape {tuple(mu.shape)} expected ({hidden_dim},)")
+        device = self.visual_film_gamma.device
+        dtype = self.visual_film_gamma.dtype
+        k = int(W.shape[1])
+        self.film_pca_k = k
+        self.film_pca_W = W.detach().to(device=device, dtype=dtype).clone()
+        self.film_pca_mu = mu.detach().to(device=device, dtype=dtype).clone()
+        self.film_pca_gamma = torch.ones(k, device=device, dtype=dtype)
+        self.film_pca_beta = torch.zeros(k, device=device, dtype=dtype)
+
     def forward(
         self,
         qpos,
@@ -110,12 +152,17 @@ class DETRVAE(nn.Module):
         latent_z_sample=None,
         film_gamma=None,
         film_beta=None,
+        film_pca_gamma=None,
+        film_pca_beta=None,
     ):
         """
         qpos: batch, qpos_dim
         image: batch, num_cam, channel, height, width
         env_state: None
         actions: batch, seq, action_dim
+        film_pca_gamma/film_pca_beta: optional (k,) or (bs, k) override for the PCA-bottleneck
+        FiLM path (only used when film_pca_k > 0; see load_film_pca()). Mirrors film_gamma/
+        film_beta's per-sample override convention.
         """
         is_training = actions is not None # train or val
         bs, _ = qpos.shape
@@ -184,32 +231,61 @@ class DETRVAE(nn.Module):
             src = torch.cat(all_cam_features, axis=3)
             pos = torch.cat(all_cam_pos, axis=3)
 
-            # FiLM (feature-wise affine): src = gamma * src + beta
-            # Default: use internal buffers (shared across batch).
-            # Optional: allow per-sample FiLM via film_gamma/film_beta of shape (bs, hidden_dim).
-            if film_gamma is None:
-                gamma = self.visual_film_gamma.view(1, -1, 1, 1).to(dtype=src.dtype, device=src.device)
-            else:
-                g = film_gamma
-                if not torch.is_tensor(g):
-                    g = torch.as_tensor(g, dtype=torch.float32)
-                g = g.to(device=src.device, dtype=src.dtype)
-                if g.ndim == 1:
-                    g = g.view(1, -1)
-                gamma = g.view(g.shape[0], -1, 1, 1)
+            if self.film_pca_k > 0:
+                # PCA-bottleneck FiLM (hard bottleneck): encode -> modulate -> decode, REPLACING
+                # src outright (does not compose with visual_film_gamma/beta below). See
+                # load_film_pca() / the film_pca_* buffer comments in __init__ for the math.
+                if film_pca_gamma is None:
+                    g_pca = self.film_pca_gamma.to(dtype=src.dtype, device=src.device)
+                else:
+                    g_pca = film_pca_gamma
+                    if not torch.is_tensor(g_pca):
+                        g_pca = torch.as_tensor(g_pca, dtype=torch.float32)
+                    g_pca = g_pca.to(device=src.device, dtype=src.dtype)
 
-            if film_beta is None:
-                beta = self.visual_film_beta.view(1, -1, 1, 1).to(dtype=src.dtype, device=src.device)
-            else:
-                b = film_beta
-                if not torch.is_tensor(b):
-                    b = torch.as_tensor(b, dtype=torch.float32)
-                b = b.to(device=src.device, dtype=src.dtype)
-                if b.ndim == 1:
-                    b = b.view(1, -1)
-                beta = b.view(b.shape[0], -1, 1, 1)
+                if film_pca_beta is None:
+                    b_pca = self.film_pca_beta.to(dtype=src.dtype, device=src.device)
+                else:
+                    b_pca = film_pca_beta
+                    if not torch.is_tensor(b_pca):
+                        b_pca = torch.as_tensor(b_pca, dtype=torch.float32)
+                    b_pca = b_pca.to(device=src.device, dtype=src.dtype)
 
-            src = src * gamma + beta
+                g_pca = g_pca.view(1, -1, 1, 1) if g_pca.ndim == 1 else g_pca.view(g_pca.shape[0], -1, 1, 1)
+                b_pca = b_pca.view(1, -1, 1, 1) if b_pca.ndim == 1 else b_pca.view(b_pca.shape[0], -1, 1, 1)
+
+                W = self.film_pca_W.to(dtype=src.dtype, device=src.device)  # (hidden_dim, k)
+                mu = self.film_pca_mu.to(dtype=src.dtype, device=src.device)  # (hidden_dim,)
+                z = torch.einsum("bchw,ck->bkhw", src - mu.view(1, -1, 1, 1), W)  # encode
+                z = z * g_pca + b_pca  # modulate (the only free params: film_pca_gamma/beta)
+                src = torch.einsum("bkhw,ck->bchw", z, W) + mu.view(1, -1, 1, 1)  # decode, replaces src
+            else:
+                # FiLM (feature-wise affine): src = gamma * src + beta
+                # Default: use internal buffers (shared across batch).
+                # Optional: allow per-sample FiLM via film_gamma/film_beta of shape (bs, hidden_dim).
+                if film_gamma is None:
+                    gamma = self.visual_film_gamma.view(1, -1, 1, 1).to(dtype=src.dtype, device=src.device)
+                else:
+                    g = film_gamma
+                    if not torch.is_tensor(g):
+                        g = torch.as_tensor(g, dtype=torch.float32)
+                    g = g.to(device=src.device, dtype=src.dtype)
+                    if g.ndim == 1:
+                        g = g.view(1, -1)
+                    gamma = g.view(g.shape[0], -1, 1, 1)
+
+                if film_beta is None:
+                    beta = self.visual_film_beta.view(1, -1, 1, 1).to(dtype=src.dtype, device=src.device)
+                else:
+                    b = film_beta
+                    if not torch.is_tensor(b):
+                        b = torch.as_tensor(b, dtype=torch.float32)
+                    b = b.to(device=src.device, dtype=src.dtype)
+                    if b.ndim == 1:
+                        b = b.view(1, -1)
+                    beta = b.view(b.shape[0], -1, 1, 1)
+
+                src = src * gamma + beta
 
             if _FILM_VIZ_SAVE and not self.training:
                 with torch.no_grad():

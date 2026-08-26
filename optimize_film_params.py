@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
 """
-Search FiLM (visual gamma/beta) parameters in ACT with CMA-ES or ARS under fixed object pose to maximize episode_return.
+Search PCA-bottleneck FiLM parameters in ACT with CMA-ES, ARS, or an LLM optimizer, under a fixed
+object pose, to maximize episode_return.
 
-Optional Random Subspace Projection (RSP): optimize z in a random low-dim subspace with theta = theta_base + P @ z (fixed P),
-default subspace dim 16; --rsp_subspace_dim 0 optimizes full FiLM (legacy behavior).
+The search space is theta = [gamma, beta], each k-dim, where k = --film_bottleneck_dim. These are
+NOT raw per-channel FiLM values: they modulate a k-dim PCA subspace of the hidden_dim visual
+feature (see detr_vae.py's load_film_pca()/forward()), fit offline from recorded activations by
+fit_film_pca.py. --film_pca_path points at that fit's .npz output; k is sliced from its stored
+basis (k <= max_k used when fitting).
 
 Requires:
   - numpy, torch, matplotlib
   - CMA-ES: pip install cma (only for --method cma)
 
 Examples:
+  # 1) Fit the PCA basis once per ckpt/task (no sim rollout needed):
+  python fit_film_pca.py --ckpt /path/to/policy_best.ckpt --task_name sim_transfer_cube_human \\
+    --max_k 64 --output tmp/film_pca/sim_transfer_cube_human.npz
+
+  # 2) Search theta (gamma, beta) in the resulting k-dim bottleneck:
   python optimize_film_params.py --ckpt /path/to/policy_best.ckpt --task_name sim_transfer_cube_human \\
+    --film_pca_path tmp/film_pca/sim_transfer_cube_human.npz --film_bottleneck_dim 8 \\
     --fixed_object_pose "0.1,0.5,0.05,1,0,0,0" --method ars --ars_iters 3 --ars_pairs 2 --output_dir tmp/film_search
 
-  # Full FiLM search without RSP (match old behavior)
-  python optimize_film_params.py ... --rsp_subspace_dim 0 ...
-
-  python optimize_film_params.py --ckpt ... --method cma --cma_maxiter 5 --cma_popsize 8 ...
+  python optimize_film_params.py --ckpt ... --film_pca_path ... --film_bottleneck_dim 8 --method cma --cma_maxiter 5 --cma_popsize 8 ...
 """
 from __future__ import annotations
 
@@ -88,7 +95,16 @@ def _load_policy_and_stats(
     policy = make_policy(policy_class, policy_config)
     state_dict = torch.load(ckpt_path, map_location="cuda")
     loading_status = policy.load_state_dict(state_dict, strict=False)
-    allowed_missing = {"model.visual_film_gamma", "model.visual_film_beta"}
+    allowed_missing = {
+        "model.visual_film_gamma",
+        "model.visual_film_beta",
+        # PCA-bottleneck FiLM buffers: absent from any ckpt saved before this feature (and from
+        # ckpts saved without --film_pca_path); load_film_pca() populates them post-hoc.
+        "model.film_pca_W",
+        "model.film_pca_mu",
+        "model.film_pca_gamma",
+        "model.film_pca_beta",
+    }
     missing = set(getattr(loading_status, "missing_keys", []))
     unexpected = set(getattr(loading_status, "unexpected_keys", []))
     if unexpected or (missing - allowed_missing):
@@ -101,70 +117,40 @@ def _load_policy_and_stats(
 
 
 def _film_theta_from_policy(policy: ACTPolicy) -> np.ndarray:
-    g = policy.model.visual_film_gamma.detach().float().cpu().numpy()
-    b = policy.model.visual_film_beta.detach().float().cpu().numpy()
+    """theta = [film_pca_gamma, film_pca_beta] (each k-dim) — the only free params under the
+    PCA-bottleneck FiLM mode (see detr_vae.py's load_film_pca()). Requires load_film_pca() to
+    have been called already (film_pca_k > 0)."""
+    if int(policy.model.film_pca_k) <= 0:
+        raise RuntimeError("policy.model has no PCA-bottleneck FiLM basis loaded; call load_film_pca() first")
+    g = policy.model.film_pca_gamma.detach().float().cpu().numpy()
+    b = policy.model.film_pca_beta.detach().float().cpu().numpy()
     return np.concatenate([g, b], axis=0)
 
 
-def _make_rsp_projection(
-    film_dim: int,
-    subspace_dim: int,
-    rng: np.random.Generator,
-    *,
-    orthogonal: bool,
-) -> np.ndarray:
-    """Return P with shape (film_dim, subspace_dim), full column rank; theta = theta_base + P @ z."""
-    if subspace_dim <= 0:
-        raise ValueError("subspace_dim must be positive")
-    if subspace_dim > film_dim:
-        raise ValueError(f"rsp_subspace_dim={subspace_dim} cannot exceed film_dim={film_dim}")
-    a = rng.standard_normal((film_dim, subspace_dim))
-    if orthogonal:
-        q, _ = np.linalg.qr(a, mode="reduced")
-        return q.astype(np.float64, copy=False)
-    return a.astype(np.float64, copy=False)
-
-
-def _rsp_decode(theta_base: np.ndarray, proj: np.ndarray, z: np.ndarray) -> np.ndarray:
-    z = np.asarray(z, dtype=np.float64).reshape(-1)
-    if z.shape[0] != proj.shape[1]:
-        raise ValueError(f"z dim {z.shape[0]} != rsp dim {proj.shape[1]}")
-    return theta_base + proj @ z
-
-
-def _rsp_decode_batch(theta_base: np.ndarray, proj: np.ndarray, z_batch: np.ndarray) -> np.ndarray:
-    zb = np.asarray(z_batch, dtype=np.float64)
-    if zb.ndim == 1:
-        zb = zb.reshape(1, -1)
-    if zb.shape[1] != proj.shape[1]:
-        raise ValueError(f"z_batch shape {zb.shape} does not match proj columns {proj.shape[1]}")
-    return theta_base + zb @ proj.T
-
-
-def _apply_film_theta(policy: ACTPolicy, theta: np.ndarray, hidden_dim: int):
-    g = torch.from_numpy(theta[:hidden_dim]).to(
-        device=policy.model.visual_film_gamma.device,
-        dtype=policy.model.visual_film_gamma.dtype,
+def _apply_film_theta(policy: ACTPolicy, theta: np.ndarray, k: int):
+    g = torch.from_numpy(theta[:k]).to(
+        device=policy.model.film_pca_gamma.device,
+        dtype=policy.model.film_pca_gamma.dtype,
     )
-    b = torch.from_numpy(theta[hidden_dim : 2 * hidden_dim]).to(
-        device=policy.model.visual_film_beta.device,
-        dtype=policy.model.visual_film_beta.dtype,
+    b = torch.from_numpy(theta[k : 2 * k]).to(
+        device=policy.model.film_pca_beta.device,
+        dtype=policy.model.film_pca_beta.dtype,
     )
     with torch.no_grad():
-        policy.model.visual_film_gamma.copy_(g)
-        policy.model.visual_film_beta.copy_(b)
+        policy.model.film_pca_gamma.copy_(g)
+        policy.model.film_pca_beta.copy_(b)
 
 
-def _split_film_theta_batch(theta_batch: np.ndarray, hidden_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _split_film_theta_batch(theta_batch: np.ndarray, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    theta_batch: (B, 2*hidden_dim) float64/float32 numpy.
-    returns: (film_gamma, film_beta) as torch tensors on CUDA of shape (B, hidden_dim)
+    theta_batch: (B, 2*k) float64/float32 numpy.
+    returns: (film_pca_gamma, film_pca_beta) as torch tensors on CUDA of shape (B, k)
     """
     tb = np.asarray(theta_batch, dtype=np.float32)
-    if tb.ndim != 2 or tb.shape[1] != 2 * hidden_dim:
-        raise ValueError(f"theta_batch shape {tb.shape} expected (B, {2*hidden_dim})")
-    g = torch.from_numpy(tb[:, :hidden_dim]).cuda()
-    b = torch.from_numpy(tb[:, hidden_dim:]).cuda()
+    if tb.ndim != 2 or tb.shape[1] != 2 * k:
+        raise ValueError(f"theta_batch shape {tb.shape} expected (B, {2*k})")
+    g = torch.from_numpy(tb[:, :k]).cuda()
+    b = torch.from_numpy(tb[:, k:]).cuda()
     return g, b
 
 
@@ -205,8 +191,8 @@ def rollout_batch_episode_returns(
     if thetas.shape[0] != B:
         raise ValueError(f"thetas batch {thetas.shape[0]} != envs {B}")
 
-    hidden_dim = int(policy.model.visual_film_gamma.numel())
-    film_gamma, film_beta = _split_film_theta_batch(thetas, hidden_dim)
+    k = int(policy.model.film_pca_k)
+    film_pca_gamma, film_pca_beta = _split_film_theta_batch(thetas, k)
 
     # reset all envs with fixed object pose
     from imitate_episodes import apply_object_pose_for_reset, overwrite_sim_qpos_from_dataset, sample_dataset_start_qpos
@@ -285,8 +271,8 @@ def rollout_batch_episode_returns(
                     qpos_t,
                     img_t,
                     latent_z_sample=latent_z,
-                    film_gamma=film_gamma,
-                    film_beta=film_beta,
+                    film_pca_gamma=film_pca_gamma,
+                    film_pca_beta=film_pca_beta,
                 )
 
             if temporal_agg:
@@ -1245,21 +1231,17 @@ def main():
         help="Parallel candidates to evaluate (batch rollout count; single-GPU batched inference)",
     )
     p.add_argument(
-        "--rsp_subspace_dim",
-        type=int,
-        default=16,
-        help="FiLM RSP subspace dim; z maps via P to full dim. 0 disables RSP (full-dim opt)",
+        "--film_pca_path",
+        type=str,
+        required=True,
+        help="Path to a fit_film_pca.py .npz output (W, mu, explained_variance_ratio, meta)",
     )
     p.add_argument(
-        "--rsp_seed",
+        "--film_bottleneck_dim",
         type=int,
-        default=None,
-        help="RNG seed for projection matrix; defaults to --seed",
-    )
-    p.add_argument(
-        "--rsp_raw_gaussian",
-        action="store_true",
-        help="Gaussian i.i.d. columns without QR orthogonalization (default: QR for orthonormal columns)",
+        required=True,
+        help="k: PCA-bottleneck FiLM dim to search (theta = [gamma, beta], each k-dim). "
+        "Must be <= max_k stored in --film_pca_path; W is sliced to W[:, :k]",
     )
     # LLM optimizer
     p.add_argument("--llm_model", type=str, default="llama4-scout-17b", help="LLM model name")
@@ -1351,23 +1333,29 @@ def main():
     )
 
     hidden_dim = int(policy.model.visual_film_gamma.numel())
-    film_dim = 2 * hidden_dim
-    rsp_dim = int(args.rsp_subspace_dim)
-    if rsp_dim < 0:
-        print(f"Invalid --rsp_subspace_dim={rsp_dim}", file=sys.stderr)
-        sys.exit(1)
-    if rsp_dim >= film_dim:
+
+    film_pca_path = Path(args.film_pca_path).resolve()
+    pca_npz = np.load(film_pca_path, allow_pickle=False)
+    pca_W_full = pca_npz["W"]  # (hidden_dim, max_k)
+    pca_mu = pca_npz["mu"]  # (hidden_dim,)
+    max_k = int(pca_W_full.shape[1])
+    if pca_W_full.shape[0] != hidden_dim:
         print(
-            f"Warning: rsp_subspace_dim={rsp_dim} >= film_dim={film_dim}; falling back to full-dim optimization",
+            f"--film_pca_path hidden_dim={pca_W_full.shape[0]} != model hidden_dim={hidden_dim}; "
+            "was it fit against a different --hidden_dim / architecture?",
             file=sys.stderr,
         )
-        rsp_dim = 0
-    use_rsp = 0 < rsp_dim < film_dim
-    print(f"Loaded {ckpt_loaded}, FiLM param dim = {film_dim} (hidden_dim={hidden_dim})")
-    if use_rsp:
-        print(f"RSP: optimize dim = {rsp_dim} (maps to {film_dim})")
-    else:
-        print("RSP: disabled (full-dim optimization)")
+        sys.exit(1)
+    k = int(args.film_bottleneck_dim)
+    if k <= 0 or k > max_k:
+        print(f"--film_bottleneck_dim={k} must be in [1, {max_k}] (max_k stored in {film_pca_path})", file=sys.stderr)
+        sys.exit(1)
+    policy.model.load_film_pca(
+        torch.from_numpy(np.ascontiguousarray(pca_W_full[:, :k])).float(),
+        torch.from_numpy(np.ascontiguousarray(pca_mu)).float(),
+    )
+    film_dim = 2 * k
+    print(f"Loaded {ckpt_loaded}, PCA-bottleneck FiLM: k={k} (max_k={max_k} in {film_pca_path}), film_dim={film_dim}")
 
     latent_z = _parse_latent_z(args.latent_z_sample, args.latent_z_dim)
 
@@ -1430,58 +1418,34 @@ def main():
         )
 
     theta_base = _film_theta_from_policy(policy).astype(np.float64, copy=False)
-    rsp_proj: np.ndarray | None = None
-    if use_rsp:
-        rsp_seed_used = int(args.rsp_seed) if args.rsp_seed is not None else int(args.seed)
-        rng_p = np.random.default_rng(rsp_seed_used)
-        rsp_proj = _make_rsp_projection(
-            film_dim, rsp_dim, rng_p, orthogonal=not args.rsp_raw_gaussian
-        )
-        z0 = np.zeros(rsp_dim, dtype=np.float64)
 
-        def fitness_batch(z_batch: np.ndarray) -> np.ndarray:
-            return eval_theta_batch(_rsp_decode_batch(theta_base, rsp_proj, z_batch))
+    def fitness_batch(theta_batch: np.ndarray) -> np.ndarray:
+        return eval_theta_batch(theta_batch)
 
-        def fitness(z: np.ndarray) -> float:
-            return float(fitness_batch(np.asarray(z, dtype=np.float64).reshape(1, -1))[0])
+    def fitness(theta: np.ndarray) -> float:
+        return float(fitness_batch(np.asarray(theta, dtype=np.float64).reshape(1, -1))[0])
 
-        def fitness_and_frames(z: np.ndarray) -> tuple[float, list[dict]]:
-            theta_batch = _rsp_decode_batch(theta_base, rsp_proj, np.asarray(z, dtype=np.float64).reshape(1, -1))
-            rewards, image_lists = eval_theta_batch(theta_batch, capture_frames=True)
-            return float(rewards[0]), image_lists[0]
+    def fitness_and_frames(theta: np.ndarray) -> tuple[float, list[dict]]:
+        theta_batch = np.asarray(theta, dtype=np.float64).reshape(1, -1)
+        rewards, image_lists = eval_theta_batch(theta_batch, capture_frames=True)
+        return float(rewards[0]), image_lists[0]
 
-        opt_x0 = z0
-    else:
-
-        def fitness_batch(theta_batch: np.ndarray) -> np.ndarray:
-            return eval_theta_batch(theta_batch)
-
-        def fitness(theta: np.ndarray) -> float:
-            return float(fitness_batch(np.asarray(theta, dtype=np.float64).reshape(1, -1))[0])
-
-        def fitness_and_frames(theta: np.ndarray) -> tuple[float, list[dict]]:
-            theta_batch = np.asarray(theta, dtype=np.float64).reshape(1, -1)
-            rewards, image_lists = eval_theta_batch(theta_batch, capture_frames=True)
-            return float(rewards[0]), image_lists[0]
-
-        opt_x0 = theta_base
+    opt_x0 = theta_base
 
     meta = {
         "ckpt": ckpt_loaded,
         "task_name": task_name,
         "method": args.method,
+        "film_pca_path": str(film_pca_path),
+        "film_bottleneck_dim": k,
+        "film_pca_max_k": max_k,
         "film_dim": film_dim,
-        "rsp_subspace_dim": rsp_dim,
-        "rsp_enabled": use_rsp,
+        "theta_base": theta_base.tolist(),
         "fixed_object_pose": fixed_object_pose.tolist(),
         "env_max_reward": env_max_reward,
     }
     if args.save_videos:
         meta["videos_dir"] = "videos"
-    if use_rsp:
-        meta["rsp_seed"] = int(args.rsp_seed) if args.rsp_seed is not None else int(args.seed)
-        meta["rsp_orthogonal"] = not args.rsp_raw_gaussian
-        meta["theta_base"] = theta_base.tolist()
     prompt_template_path: Path | None = None
     use_vlm = False
     if args.method == "llm":
@@ -1516,8 +1480,6 @@ def main():
             )
     with open(out_dir / "run_meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
-    if use_rsp and rsp_proj is not None:
-        np.save(out_dir / "rsp_projection.npy", rsp_proj)
 
     interrupted_exc: BaseException | None = None
     elapsed_sec: float = 0.0
@@ -1608,27 +1570,21 @@ def main():
     with open(out_dir / "run_meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
-    if use_rsp and rsp_proj is not None:
-        best_theta = _rsp_decode(theta_base, rsp_proj, best_x)
-        np.save(out_dir / "best_rsp_z.npy", np.asarray(best_x, dtype=np.float64))
-    else:
-        best_theta = np.asarray(best_x, dtype=np.float64)
+    best_theta = np.asarray(best_x, dtype=np.float64)
 
-    _apply_film_theta(policy, best_theta, hidden_dim)
+    _apply_film_theta(policy, best_theta, k)
     film_ckpt = {
-        "visual_film_gamma": policy.model.visual_film_gamma.cpu(),
-        "visual_film_beta": policy.model.visual_film_beta.cpu(),
+        "film_pca_W": policy.model.film_pca_W.cpu(),
+        "film_pca_mu": policy.model.film_pca_mu.cpu(),
+        "film_pca_gamma": policy.model.film_pca_gamma.cpu(),
+        "film_pca_beta": policy.model.film_pca_beta.cpu(),
         "best_theta": torch.from_numpy(best_theta.astype(np.float32)),
+        "film_bottleneck_dim": k,
     }
-    if use_rsp and rsp_proj is not None:
-        film_ckpt["best_rsp_z"] = torch.from_numpy(np.asarray(best_x, dtype=np.float32))
-        film_ckpt["rsp_projection"] = torch.from_numpy(rsp_proj.astype(np.float32))
     torch.save(film_ckpt, out_dir / "best_film_only.pt")
     best_logged = float(np.max(h_best)) if len(h_best) else float("nan")
     print(f"Done. Best episode_return in log ≈ {best_logged}, total time {_format_duration(elapsed_sec)}")
     print(f"Saved: {out_dir / 'best_film_only.pt'}, {out_dir / 'reward_curve.png'}")
-    if use_rsp:
-        print(f"RSP outputs: {out_dir / 'rsp_projection.npy'}, {out_dir / 'best_rsp_z.npy'}")
 
     if interrupted_exc is not None:
         if isinstance(interrupted_exc, KeyboardInterrupt):

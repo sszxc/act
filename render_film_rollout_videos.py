@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Read run_meta.json and best_film_only.pt from a FiLM search dir and record two rollout videos:
-  - Optimized FiLM (best_film_only.pt)
-  - Architectural default FiLM (gamma=1, beta=0)
+Read run_meta.json and best_film_only.pt from a PCA-bottleneck FiLM search dir (produced by
+optimize_film_params.py --film_pca_path/--film_bottleneck_dim) and record two rollout videos:
+  - Optimized FiLM (best_film_only.pt's best_theta)
+  - Identity PCA-bottleneck FiLM (gamma=1, beta=0 in the k-dim subspace) as baseline — note this
+    is still lossy reconstruction through the bottleneck, not a true no-FiLM pass-through.
 
 Writes output under run_dir subdirectory (default rollout_videos/).
 
@@ -37,22 +39,38 @@ from optimize_film_params import (
 from sim_env import make_sim_env
 
 
-def _load_best_film_theta(pt_path: Path) -> np.ndarray:
+def _load_best_film_pca(pt_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """Returns (W, mu, best_theta, k) from a PCA-bottleneck best_film_only.pt, as written by
+    optimize_film_params.py (film_ckpt dict: film_pca_W/mu/gamma/beta, best_theta,
+    film_bottleneck_dim). --film_pca_path/--film_bottleneck_dim are required there now, so every
+    run produces this format — no fallback to the older plain-FiLM (visual_film_gamma/beta) shape.
+    """
     d = torch.load(pt_path, map_location="cpu")
-    if "best_theta" in d:
-        t = d["best_theta"]
-        if isinstance(t, torch.Tensor):
-            return t.detach().float().cpu().numpy().reshape(-1)
-        return np.asarray(t, dtype=np.float64).reshape(-1)
-    g = d["visual_film_gamma"].detach().float().cpu().numpy().reshape(-1)
-    b = d["visual_film_beta"].detach().float().cpu().numpy().reshape(-1)
-    return np.concatenate([g, b], axis=0)
+    required = {"film_pca_W", "film_pca_mu", "best_theta", "film_bottleneck_dim"}
+    missing = required - set(d.keys())
+    if missing:
+        raise ValueError(
+            f"{pt_path} missing {sorted(missing)}; expected a PCA-bottleneck best_film_only.pt "
+            "(from optimize_film_params.py, which requires --film_pca_path/--film_bottleneck_dim)"
+        )
+    W = d["film_pca_W"].detach().float().cpu().numpy()
+    mu = d["film_pca_mu"].detach().float().cpu().numpy()
+    best_theta = d["best_theta"]
+    if isinstance(best_theta, torch.Tensor):
+        best_theta = best_theta.detach().float().cpu().numpy()
+    best_theta = np.asarray(best_theta, dtype=np.float64).reshape(-1)
+    k = int(d["film_bottleneck_dim"])
+    if best_theta.size != 2 * k:
+        raise ValueError(f"best_theta dim {best_theta.size} != 2*film_bottleneck_dim={2 * k}")
+    return W, mu, best_theta, k
 
 
-def _identity_film_theta(hidden_dim: int) -> np.ndarray:
-    return np.concatenate(
-        [np.ones(hidden_dim, dtype=np.float64), np.zeros(hidden_dim, dtype=np.float64)]
-    )
+def _identity_film_pca_theta(k: int) -> np.ndarray:
+    """gamma=1, beta=0 in the k-dim bottleneck. NOTE: unlike the plain FiLM path this is NOT a
+    pass-through baseline — encode/decode through a k < hidden_dim PCA subspace is inherently
+    lossy even at the identity setting (see detr_vae.py's load_film_pca()). This isolates
+    "reconstruction-only" from "reconstruction + searched modulation", it isn't "no FiLM"."""
+    return np.concatenate([np.ones(k, dtype=np.float64), np.zeros(k, dtype=np.float64)])
 
 
 def _safe_rename(src: Path, dst: Path) -> None:
@@ -166,11 +184,13 @@ def main():
     )
 
     hidden_dim = int(policy.model.visual_film_gamma.numel())
-    best_theta = _load_best_film_theta(film_pt)
-    if best_theta.size != 2 * hidden_dim:
+    pca_W, pca_mu, best_theta, k = _load_best_film_pca(film_pt)
+    if pca_W.shape[0] != hidden_dim:
         raise ValueError(
-            f"best_film theta dim {best_theta.size} != 2*hidden_dim={2 * hidden_dim}"
+            f"best_film_only.pt film_pca_W hidden_dim={pca_W.shape[0]} != model hidden_dim={hidden_dim} "
+            "(built from --hidden_dim); was it fit/searched against a different architecture?"
         )
+    policy.model.load_film_pca(torch.from_numpy(pca_W), torch.from_numpy(pca_mu))
 
     latent_z = _parse_latent_z(args.latent_z_sample, args.latent_z_dim)
 
@@ -194,11 +214,11 @@ def main():
     out_dir = run_dir / args.videos_subdir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    identity_theta = _identity_film_theta(hidden_dim)
+    identity_theta = _identity_film_pca_theta(k)
 
     results: list[dict] = []
 
-    def do_rollout(label: str, film_theta: np.ndarray | None, rollout_id: int) -> tuple[float, float]:
+    def do_rollout(label: str, film_pca_theta: np.ndarray | None, rollout_id: int) -> tuple[float, float]:
         set_seed(args.seed)
         env = make_sim_env(task_name, time_limit=max_timesteps * DT)
         try:
@@ -211,7 +231,7 @@ def main():
                 pca=None,
                 use_pca_action=False,
                 rollout_latent_z=latent_z,
-                film_theta=film_theta,
+                film_pca_theta=film_pca_theta,
                 fixed_object_pose=fixed_object_pose,
                 fixed_init_qpos=fixed_init_qpos,
                 init_qpos_from_dataset=args.init_qpos_from_dataset,
@@ -256,7 +276,12 @@ def main():
         "task_name": task_name,
         "seed": args.seed,
         "fixed_object_pose": fixed_object_pose.tolist(),
-        "baseline_description": "identity FiLM: gamma=1, beta=0 (DETRVAE buffer default)",
+        "baseline_description": (
+            "identity PCA-bottleneck FiLM: gamma=1, beta=0 in the k-dim subspace. NOT a "
+            "pass-through — hard-bottleneck encode/decode is lossy even at identity; this "
+            "isolates reconstruction-only from reconstruction + searched modulation."
+        ),
+        "film_bottleneck_dim": k,
         "policy_overrides_note": (
             "chunk_size, hidden_dim, temporal_agg, latent_z, etc. must match search/train; "
             "this summary records CLI values used in this run."
