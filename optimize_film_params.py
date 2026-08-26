@@ -380,6 +380,7 @@ def run_ars(
     rng = np.random.default_rng(seed)
     theta = theta0.astype(np.float64).copy()
     dim = theta.size
+    out_dir = log_path.parent
     history_best = []
     history_iter_max = []
     best_so_far = -np.inf
@@ -425,6 +426,7 @@ def run_ars(
                 best_theta = snap.copy()
             history_best.append(best_so_far)
             history_iter_max.append(float(iter_best))
+            elapsed_now = time.perf_counter() - t_start
             with open(log_path, "a", encoding="utf-8") as flog:
                 flog.write(
                     json.dumps(
@@ -432,11 +434,21 @@ def run_ars(
                             "iter": it,
                             "best_so_far": best_so_far,
                             "iter_best": iter_best,
-                            "elapsed_sec": round(time.perf_counter() - t_start, 3),
+                            "elapsed_sec": round(elapsed_now, 3),
                         }
                     )
                     + "\n"
                 )
+            _save_progress_checkpoint(
+                out_dir,
+                "ars_curves.npz",
+                {"best_so_far": np.array(history_best), "iter_max": np.array(history_iter_max)},
+                np.array(history_best),
+                "best_so_far",
+                np.array(history_iter_max),
+                "iter_max",
+                elapsed_now,
+            )
             dt = time.perf_counter() - t0
             print(f"[ARS] iter {it}: iter_best={iter_best:.4f} best_so_far={best_so_far:.4f} wall={dt:.2f}s")
     except (KeyboardInterrupt, Exception) as e:
@@ -466,6 +478,7 @@ def run_ars_batched(
     rng = np.random.default_rng(seed)
     theta = theta0.astype(np.float64).copy()
     dim = theta.size
+    out_dir = log_path.parent
     best_so_far = -np.inf
     best_theta = theta.copy()
     history_best = []
@@ -520,6 +533,7 @@ def run_ars_batched(
 
             history_best.append(best_so_far)
             history_iter_best.append(iter_best)
+            elapsed_now = time.perf_counter() - t_start
             with open(log_path, "a", encoding="utf-8") as flog:
                 flog.write(
                     json.dumps(
@@ -527,11 +541,21 @@ def run_ars_batched(
                             "iter": it,
                             "best_so_far": best_so_far,
                             "iter_best": iter_best,
-                            "elapsed_sec": round(time.perf_counter() - t_start, 3),
+                            "elapsed_sec": round(elapsed_now, 3),
                         }
                     )
                     + "\n"
                 )
+            _save_progress_checkpoint(
+                out_dir,
+                "ars_curves.npz",
+                {"best_so_far": np.array(history_best), "iter_max": np.array(history_iter_best)},
+                np.array(history_best),
+                "best_so_far",
+                np.array(history_iter_best),
+                "iter_max",
+                elapsed_now,
+            )
             dt = time.perf_counter() - t0
             r_mean = float(np.mean(rewards)) if rewards.size else float("nan")
             r_std = float(np.std(rewards)) if rewards.size else float("nan")
@@ -568,6 +592,7 @@ def run_cma(
     if popsize is not None:
         opts["popsize"] = popsize
     es = cma.CMAEvolutionStrategy(x0, sigma0, opts)
+    out_dir = log_path.parent
     history_best = []
     history_gen_max = []
     best_so_far = -np.inf
@@ -598,6 +623,7 @@ def run_cma(
                 best_x = np.asarray(xs[ib], dtype=np.float64).copy()
             history_best.append(best_so_far)
             history_gen_max.append(gen_max)
+            elapsed_now = time.perf_counter() - t_start
             with open(log_path, "a", encoding="utf-8") as flog:
                 flog.write(
                     json.dumps(
@@ -606,11 +632,21 @@ def run_cma(
                             "params": np.asarray(xs[ib], dtype=np.float64).tolist(),
                             "gen_max": gen_max,
                             "best_so_far": best_so_far,
-                            "elapsed_sec": round(time.perf_counter() - t_start, 3),
+                            "elapsed_sec": round(elapsed_now, 3),
                         }
                     )
                     + "\n"
                 )
+            _save_progress_checkpoint(
+                out_dir,
+                "cma_curves.npz",
+                {"best_so_far": np.array(history_best), "gen_max": np.array(history_gen_max)},
+                np.array(history_best),
+                "best_so_far",
+                np.array(history_gen_max),
+                "gen_max",
+                elapsed_now,
+            )
             dt = time.perf_counter() - t0
             r_mean = float(np.mean(r_arr)) if r_arr.size else float("nan")
             r_std = float(np.std(r_arr)) if r_arr.size else float("nan")
@@ -644,6 +680,7 @@ def run_cma_batched(
     if popsize is not None:
         opts["popsize"] = popsize
     es = cma.CMAEvolutionStrategy(x0, sigma0, opts)
+    out_dir = log_path.parent
     best_so_far = -np.inf
     best_x = x0.copy()
     history_best = []
@@ -678,6 +715,7 @@ def run_cma_batched(
                 best_x = np.asarray(xs[ib], dtype=np.float64).copy()
             history_best.append(best_so_far)
             history_gen_max.append(gen_max)
+            elapsed_now = time.perf_counter() - t_start
             with open(log_path, "a", encoding="utf-8") as flog:
                 flog.write(
                     json.dumps(
@@ -686,11 +724,21 @@ def run_cma_batched(
                             "params": np.asarray(xs[ib], dtype=np.float64).tolist(),
                             "gen_max": gen_max,
                             "best_so_far": best_so_far,
-                            "elapsed_sec": round(time.perf_counter() - t_start, 3),
+                            "elapsed_sec": round(elapsed_now, 3),
                         }
                     )
                     + "\n"
                 )
+            _save_progress_checkpoint(
+                out_dir,
+                "cma_curves.npz",
+                {"best_so_far": np.array(history_best), "gen_max": np.array(history_gen_max)},
+                np.array(history_best),
+                "best_so_far",
+                np.array(history_gen_max),
+                "gen_max",
+                elapsed_now,
+            )
             dt = time.perf_counter() - t0
             r_mean = float(np.mean(rewards)) if rewards.size else float("nan")
             r_std = float(np.std(rewards)) if rewards.size else float("nan")
@@ -756,6 +804,24 @@ def _save_curve_png(
     fig.tight_layout()
     fig.savefig(path, dpi=120)
     plt.close(fig)
+
+
+def _save_progress_checkpoint(
+    out_dir: Path,
+    npz_name: str,
+    npz_arrays: dict,
+    y1: np.ndarray,
+    y1_label: str,
+    y2: np.ndarray | None,
+    y2_label: str | None,
+    elapsed_sec: float,
+) -> None:
+    """Persist the optimizer's progress so far (curves .npz + reward_curve.png), overwriting the
+    previous snapshot in place. Called after every completed iteration/generation (not just at the
+    end or on interrupt) so a run killed mid-flight still leaves usable, up-to-date results on
+    disk, and so the plot is viewable while the run is still going."""
+    np.savez(out_dir / npz_name, **npz_arrays)
+    _save_curve_png(out_dir / "reward_curve.png", y1, y1_label, y2, y2_label, elapsed_sec=elapsed_sec)
 
 
 def _load_num_optim_prompt_template(path: Path) -> str:
@@ -993,6 +1059,7 @@ def run_llm(
     last-round-only).
     """
     rank = int(np.asarray(x0).size)
+    out_dir = log_path.parent
     rng = np.random.default_rng(seed)
     _maybe_load_dotenv()
     base_url = _get_env("OPENAI_BASE_URL") or "https://openai.rc.asu.edu/v1"
@@ -1153,6 +1220,17 @@ def run_llm(
 
             with open(log_path, "a", encoding="utf-8") as flog:
                 flog.write(json.dumps(history[-1], ensure_ascii=False) + "\n")
+            elapsed_now = time.perf_counter() - t_start
+            _save_progress_checkpoint(
+                out_dir,
+                "llm_curves.npz",
+                {"best_so_far": np.array(history_best), "iter_reward": np.array(history_iter_reward)},
+                np.array(history_best),
+                "best_so_far",
+                np.array(history_iter_reward),
+                "iter_reward",
+                elapsed_now,
+            )
             dt = time.perf_counter() - t0
             print(f"[LLM] iter {it}: reward={reward:.4f} best_so_far={best_so_far:.4f} source={source} wall={dt:.2f}s")
     except (KeyboardInterrupt, Exception) as e:
