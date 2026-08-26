@@ -21,6 +21,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import pickle
@@ -28,7 +29,7 @@ import re
 import shutil
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -185,13 +186,20 @@ def rollout_batch_episode_returns(
     rollout_desc: str = "rollout",
     video_dir: Path | None = None,
     round_label: str = "round",
-) -> np.ndarray:
+    capture_frames: bool = False,
+) -> np.ndarray | tuple[np.ndarray, list[list[dict]]]:
     """
     Step multiple envs in parallel (one theta each), batch observations per timestep on one GPU.
     Returns episode_return per trajectory (shape: (B,)).
 
     If video_dir is not None, records one video per env (all camera_names side by side) to
     video_dir / f"{round_label}_env{i}.mp4".
+
+    If capture_frames is True, also (or additionally, independent of video_dir) collects each
+    env's per-timestep observation images and returns them as a second value:
+    (rewards_sum, image_lists) where image_lists[i] is a list of {cam_name: HxWxC uint8} dicts,
+    one per timestep, for env i (same format save_videos expects). Used e.g. to build VLM visual
+    feedback without needing to encode/decode an mp4.
     """
     B = len(envs)
     if thetas.shape[0] != B:
@@ -236,7 +244,8 @@ def rollout_batch_episode_returns(
 
     rewards_sum = np.zeros(B, dtype=np.float64)
     record_video = video_dir is not None
-    image_lists: list[list[dict]] | None = [[] for _ in range(B)] if record_video else None
+    collect_images = record_video or capture_frames
+    image_lists: list[list[dict]] | None = [[] for _ in range(B)] if collect_images else None
 
     # Same as imitate_episodes eval: inference_mode so temporal_agg does not keep
     # autograd over the full episode when stitching multi-step policy outputs into all_time_actions
@@ -256,7 +265,7 @@ def rollout_batch_episode_returns(
                 qpos_np = np.asarray(obs["qpos"], dtype=np.float32)[:state_dim]
                 qpos_batch.append(pre_process(qpos_np))
 
-                if record_video:
+                if collect_images:
                     image_lists[i].append(obs["images"])
 
                 # images: (num_cam, C, H, W) normalized to 0..1
@@ -320,6 +329,9 @@ def rollout_batch_episode_returns(
         for i in range(B):
             save_videos(image_lists[i], DT, video_path=str(video_dir / f"{round_label}_env{i}.mp4"))
 
+    if capture_frames:
+        assert image_lists is not None
+        return rewards_sum, image_lists
     return rewards_sum
 
 
@@ -358,6 +370,16 @@ def _build_eval_config(
     }
 
 
+def _handle_optimizer_interrupt(tag: str, e: BaseException, it: int, n_completed: int) -> None:
+    """Print a clear message when a run_* optimizer loop is interrupted (Ctrl+C or an
+    unhandled exception mid-rollout). The caller still returns its partial history/best-so-far
+    normally; main() decides whether to exit cleanly (KeyboardInterrupt) or re-raise (a real
+    bug) after saving plots/checkpoints for whatever completed so far.
+    """
+    kind = "KeyboardInterrupt (Ctrl+C)" if isinstance(e, KeyboardInterrupt) else f"{type(e).__name__}: {e}"
+    print(f"[{tag}] interrupted at iter {it} ({kind}); saving partial results ({n_completed} rounds completed)")
+
+
 def run_ars(
     fitness_fn,
     theta0: np.ndarray,
@@ -377,45 +399,66 @@ def run_ars(
     best_so_far = -np.inf
     best_theta = theta.copy()
 
+    t_start = time.perf_counter()
     with open(log_path, "w", encoding="utf-8") as flog:
-        flog.write(f"# ARS dim={dim} sigma={sigma} alpha={alpha} n_pairs={n_pairs}\n")
+        flog.write(
+            f"# ARS dim={dim} sigma={sigma} alpha={alpha} n_pairs={n_pairs} "
+            f"start_time={datetime.now().isoformat()}\n"
+        )
 
-    for it in range(n_iters):
-        t0 = time.perf_counter()
-        print(f"[ARS] iter {it}/{n_iters-1} starting; will eval ≈ {2*n_pairs + 1} rollouts")
-        grad = np.zeros(dim, dtype=np.float64)
-        iter_best = -np.inf
-        snap = theta.copy()
-        for _ in range(n_pairs):
-            eps = rng.standard_normal(dim)
-            t_p = theta + sigma * eps
-            t_m = theta - sigma * eps
-            r_plus = fitness_fn(t_p)
-            r_minus = fitness_fn(t_m)
-            if r_plus > iter_best:
-                iter_best = r_plus
-                snap = t_p.copy()
-            if r_minus > iter_best:
-                iter_best = r_minus
-                snap = t_m.copy()
-            grad += (r_plus - r_minus) / (2.0 * sigma) * eps
-        grad /= max(n_pairs, 1)
-        theta = theta + alpha * grad
-        r_end = fitness_fn(theta)
-        if r_end > iter_best:
-            iter_best = r_end
+    interrupted_exc: BaseException | None = None
+    it = -1
+    try:
+        for it in range(n_iters):
+            t0 = time.perf_counter()
+            print(f"[ARS] iter {it}/{n_iters-1} starting; will eval ≈ {2*n_pairs + 1} rollouts")
+            grad = np.zeros(dim, dtype=np.float64)
+            iter_best = -np.inf
             snap = theta.copy()
-        if iter_best > best_so_far:
-            best_so_far = float(iter_best)
-            best_theta = snap.copy()
-        history_best.append(best_so_far)
-        history_iter_max.append(float(iter_best))
-        with open(log_path, "a", encoding="utf-8") as flog:
-            flog.write(json.dumps({"iter": it, "best_so_far": best_so_far, "iter_best": iter_best}) + "\n")
-        dt = time.perf_counter() - t0
-        print(f"[ARS] iter {it}: iter_best={iter_best:.4f} best_so_far={best_so_far:.4f} wall={dt:.2f}s")
+            for _ in range(n_pairs):
+                eps = rng.standard_normal(dim)
+                t_p = theta + sigma * eps
+                t_m = theta - sigma * eps
+                r_plus = fitness_fn(t_p)
+                r_minus = fitness_fn(t_m)
+                if r_plus > iter_best:
+                    iter_best = r_plus
+                    snap = t_p.copy()
+                if r_minus > iter_best:
+                    iter_best = r_minus
+                    snap = t_m.copy()
+                grad += (r_plus - r_minus) / (2.0 * sigma) * eps
+            grad /= max(n_pairs, 1)
+            theta = theta + alpha * grad
+            r_end = fitness_fn(theta)
+            if r_end > iter_best:
+                iter_best = r_end
+                snap = theta.copy()
+            if iter_best > best_so_far:
+                best_so_far = float(iter_best)
+                best_theta = snap.copy()
+            history_best.append(best_so_far)
+            history_iter_max.append(float(iter_best))
+            with open(log_path, "a", encoding="utf-8") as flog:
+                flog.write(
+                    json.dumps(
+                        {
+                            "iter": it,
+                            "best_so_far": best_so_far,
+                            "iter_best": iter_best,
+                            "elapsed_sec": round(time.perf_counter() - t_start, 3),
+                        }
+                    )
+                    + "\n"
+                )
+            dt = time.perf_counter() - t0
+            print(f"[ARS] iter {it}: iter_best={iter_best:.4f} best_so_far={best_so_far:.4f} wall={dt:.2f}s")
+    except (KeyboardInterrupt, Exception) as e:
+        interrupted_exc = e
+        _handle_optimizer_interrupt("ARS", e, it, len(history_best))
 
-    return best_theta, np.array(history_best), np.array(history_iter_max)
+    elapsed_sec = time.perf_counter() - t_start
+    return best_theta, np.array(history_best), np.array(history_iter_max), interrupted_exc, elapsed_sec
 
 
 def run_ars_batched(
@@ -442,61 +485,80 @@ def run_ars_batched(
     history_best = []
     history_iter_best = []
 
+    t_start = time.perf_counter()
     with open(log_path, "w", encoding="utf-8") as flog:
         flog.write(
-            f"# ARS(batched) dim={dim} sigma={sigma} alpha={alpha} n_pairs={n_pairs} batch_size={batch_size}\n"
+            f"# ARS(batched) dim={dim} sigma={sigma} alpha={alpha} n_pairs={n_pairs} batch_size={batch_size} "
+            f"start_time={datetime.now().isoformat()}\n"
         )
 
-    for it in range(n_iters):
-        t0 = time.perf_counter()
-        eps_list = [rng.standard_normal(dim) for _ in range(n_pairs)]
-        cand = []
-        for eps in eps_list:
-            cand.append(theta + sigma * eps)
-            cand.append(theta - sigma * eps)
-        # evaluate all perturbations
-        print(f"[ARS(batched)] iter {it}/{n_iters-1} evaluating {len(cand)} candidates (batch_size={batch_size})")
-        rewards = []
-        for i in range(0, len(cand), batch_size):
-            tb = np.stack(cand[i : i + batch_size], axis=0)
-            rewards.extend(list(map(float, fitness_batch_fn(tb))))
-        rewards = np.asarray(rewards, dtype=np.float64)
+    interrupted_exc: BaseException | None = None
+    it = -1
+    try:
+        for it in range(n_iters):
+            t0 = time.perf_counter()
+            eps_list = [rng.standard_normal(dim) for _ in range(n_pairs)]
+            cand = []
+            for eps in eps_list:
+                cand.append(theta + sigma * eps)
+                cand.append(theta - sigma * eps)
+            # evaluate all perturbations
+            print(f"[ARS(batched)] iter {it}/{n_iters-1} evaluating {len(cand)} candidates (batch_size={batch_size})")
+            rewards = []
+            for i in range(0, len(cand), batch_size):
+                tb = np.stack(cand[i : i + batch_size], axis=0)
+                rewards.extend(list(map(float, fitness_batch_fn(tb))))
+            rewards = np.asarray(rewards, dtype=np.float64)
 
-        iter_best = float(np.max(rewards))
-        best_idx = int(np.argmax(rewards))
-        snap = cand[best_idx].copy()
+            iter_best = float(np.max(rewards))
+            best_idx = int(np.argmax(rewards))
+            snap = cand[best_idx].copy()
 
-        # grad estimate
-        grad = np.zeros(dim, dtype=np.float64)
-        for k, eps in enumerate(eps_list):
-            r_plus = rewards[2 * k]
-            r_minus = rewards[2 * k + 1]
-            grad += (r_plus - r_minus) / (2.0 * sigma) * eps
-        grad /= max(n_pairs, 1)
+            # grad estimate
+            grad = np.zeros(dim, dtype=np.float64)
+            for k, eps in enumerate(eps_list):
+                r_plus = rewards[2 * k]
+                r_minus = rewards[2 * k + 1]
+                grad += (r_plus - r_minus) / (2.0 * sigma) * eps
+            grad /= max(n_pairs, 1)
 
-        theta = theta + alpha * grad
-        r_end = float(fitness_batch_fn(theta.reshape(1, -1))[0])
-        if r_end > iter_best:
-            iter_best = r_end
-            snap = theta.copy()
+            theta = theta + alpha * grad
+            r_end = float(fitness_batch_fn(theta.reshape(1, -1))[0])
+            if r_end > iter_best:
+                iter_best = r_end
+                snap = theta.copy()
 
-        if iter_best > best_so_far:
-            best_so_far = iter_best
-            best_theta = snap.copy()
+            if iter_best > best_so_far:
+                best_so_far = iter_best
+                best_theta = snap.copy()
 
-        history_best.append(best_so_far)
-        history_iter_best.append(iter_best)
-        with open(log_path, "a", encoding="utf-8") as flog:
-            flog.write(json.dumps({"iter": it, "best_so_far": best_so_far, "iter_best": iter_best}) + "\n")
-        dt = time.perf_counter() - t0
-        r_mean = float(np.mean(rewards)) if rewards.size else float("nan")
-        r_std = float(np.std(rewards)) if rewards.size else float("nan")
-        print(
-            f"[ARS(batched)] iter {it}: iter_best={iter_best:.4f} best_so_far={best_so_far:.4f} "
-            f"mean±std={r_mean:.4f}±{r_std:.4f} wall={dt:.2f}s"
-        )
+            history_best.append(best_so_far)
+            history_iter_best.append(iter_best)
+            with open(log_path, "a", encoding="utf-8") as flog:
+                flog.write(
+                    json.dumps(
+                        {
+                            "iter": it,
+                            "best_so_far": best_so_far,
+                            "iter_best": iter_best,
+                            "elapsed_sec": round(time.perf_counter() - t_start, 3),
+                        }
+                    )
+                    + "\n"
+                )
+            dt = time.perf_counter() - t0
+            r_mean = float(np.mean(rewards)) if rewards.size else float("nan")
+            r_std = float(np.std(rewards)) if rewards.size else float("nan")
+            print(
+                f"[ARS(batched)] iter {it}: iter_best={iter_best:.4f} best_so_far={best_so_far:.4f} "
+                f"mean±std={r_mean:.4f}±{r_std:.4f} wall={dt:.2f}s"
+            )
+    except (KeyboardInterrupt, Exception) as e:
+        interrupted_exc = e
+        _handle_optimizer_interrupt("ARS(batched)", e, it, len(history_best))
 
-    return best_theta, np.asarray(history_best), np.asarray(history_iter_best)
+    elapsed_sec = time.perf_counter() - t_start
+    return best_theta, np.asarray(history_best), np.asarray(history_iter_best), interrupted_exc, elapsed_sec
 
 
 def run_cma(
@@ -525,47 +587,57 @@ def run_cma(
     best_so_far = -np.inf
     best_x = x0.copy()
 
+    t_start = time.perf_counter()
     with open(log_path, "w", encoding="utf-8") as flog:
         flog.write(
-            f"# CMA-ES dim={x0.size} sigma0={sigma0} maxiter={maxiter} popsize={getattr(es, 'popsize', None)}\n"
+            f"# CMA-ES dim={x0.size} sigma0={sigma0} maxiter={maxiter} popsize={getattr(es, 'popsize', None)} "
+            f"start_time={datetime.now().isoformat()}\n"
         )
 
-    while not es.stop():
-        t0 = time.perf_counter()
-        xs = es.ask()
-        gen = int(es.countiter)
-        print(f"[CMA] gen {gen}/{maxiter-1} evaluating pop={len(xs)} (waiting for rollouts)")
-        rewards = [fitness_fn(np.asarray(x, dtype=np.float64)) for x in xs]
-        r_arr = np.asarray(list(map(float, rewards)), dtype=np.float64)
-        es.tell(xs, [-float(r) for r in rewards])
-        gen_max = float(np.max(r_arr)) if r_arr.size else float("nan")
-        ib = int(np.argmax(r_arr)) if r_arr.size else 0
-        if rewards[ib] > best_so_far:
-            best_so_far = float(rewards[ib])
-            best_x = np.asarray(xs[ib], dtype=np.float64).copy()
-        history_best.append(best_so_far)
-        history_gen_max.append(gen_max)
-        with open(log_path, "a", encoding="utf-8") as flog:
-            flog.write(
-                json.dumps(
-                    {
-                        "generation": gen,
-                        "params": np.asarray(xs[ib], dtype=np.float64).tolist(),
-                        "gen_max": gen_max,
-                        "best_so_far": best_so_far,
-                    }
+    interrupted_exc: BaseException | None = None
+    gen = -1
+    try:
+        while not es.stop():
+            t0 = time.perf_counter()
+            xs = es.ask()
+            gen = int(es.countiter)
+            print(f"[CMA] gen {gen}/{maxiter-1} evaluating pop={len(xs)} (waiting for rollouts)")
+            rewards = [fitness_fn(np.asarray(x, dtype=np.float64)) for x in xs]
+            r_arr = np.asarray(list(map(float, rewards)), dtype=np.float64)
+            es.tell(xs, [-float(r) for r in rewards])
+            gen_max = float(np.max(r_arr)) if r_arr.size else float("nan")
+            ib = int(np.argmax(r_arr)) if r_arr.size else 0
+            if rewards[ib] > best_so_far:
+                best_so_far = float(rewards[ib])
+                best_x = np.asarray(xs[ib], dtype=np.float64).copy()
+            history_best.append(best_so_far)
+            history_gen_max.append(gen_max)
+            with open(log_path, "a", encoding="utf-8") as flog:
+                flog.write(
+                    json.dumps(
+                        {
+                            "generation": gen,
+                            "params": np.asarray(xs[ib], dtype=np.float64).tolist(),
+                            "gen_max": gen_max,
+                            "best_so_far": best_so_far,
+                            "elapsed_sec": round(time.perf_counter() - t_start, 3),
+                        }
+                    )
+                    + "\n"
                 )
-                + "\n"
+            dt = time.perf_counter() - t0
+            r_mean = float(np.mean(r_arr)) if r_arr.size else float("nan")
+            r_std = float(np.std(r_arr)) if r_arr.size else float("nan")
+            print(
+                f"[CMA] gen {gen}: gen_max={gen_max:.4f} best_so_far={best_so_far:.4f} "
+                f"mean±std={r_mean:.4f}±{r_std:.4f} wall={dt:.2f}s"
             )
-        dt = time.perf_counter() - t0
-        r_mean = float(np.mean(r_arr)) if r_arr.size else float("nan")
-        r_std = float(np.std(r_arr)) if r_arr.size else float("nan")
-        print(
-            f"[CMA] gen {gen}: gen_max={gen_max:.4f} best_so_far={best_so_far:.4f} "
-            f"mean±std={r_mean:.4f}±{r_std:.4f} wall={dt:.2f}s"
-        )
+    except (KeyboardInterrupt, Exception) as e:
+        interrupted_exc = e
+        _handle_optimizer_interrupt("CMA", e, gen, len(history_best))
 
-    return best_x, np.array(history_best), np.array(history_gen_max)
+    elapsed_sec = time.perf_counter() - t_start
+    return best_x, np.array(history_best), np.array(history_gen_max), interrupted_exc, elapsed_sec
 
 
 def run_cma_batched(
@@ -591,54 +663,86 @@ def run_cma_batched(
     history_best = []
     history_gen_max = []
 
+    t_start = time.perf_counter()
     with open(log_path, "w", encoding="utf-8") as flog:
         flog.write(
-            f"# CMA-ES(batched) dim={x0.size} sigma0={sigma0} maxiter={maxiter} popsize={getattr(es,'popsize',None)} batch_size={batch_size}\n"
+            f"# CMA-ES(batched) dim={x0.size} sigma0={sigma0} maxiter={maxiter} popsize={getattr(es,'popsize',None)} "
+            f"batch_size={batch_size} start_time={datetime.now().isoformat()}\n"
         )
 
-    while not es.stop():
-        t0 = time.perf_counter()
-        xs = es.ask()
-        rewards = []
-        gen = int(es.countiter)
-        print(f"[CMA(batched)] gen {gen}/{maxiter-1} evaluating pop={len(xs)} (batch_size={batch_size})")
-        for i in range(0, len(xs), batch_size):
-            tb = np.stack([np.asarray(x, dtype=np.float64) for x in xs[i : i + batch_size]], axis=0)
-            rewards.extend(list(map(float, fitness_batch_fn(tb))))
-        rewards = np.asarray(rewards, dtype=np.float64)
-        es.tell(xs, list((-rewards).astype(float)))
+    interrupted_exc: BaseException | None = None
+    gen = -1
+    try:
+        while not es.stop():
+            t0 = time.perf_counter()
+            xs = es.ask()
+            rewards = []
+            gen = int(es.countiter)
+            print(f"[CMA(batched)] gen {gen}/{maxiter-1} evaluating pop={len(xs)} (batch_size={batch_size})")
+            for i in range(0, len(xs), batch_size):
+                tb = np.stack([np.asarray(x, dtype=np.float64) for x in xs[i : i + batch_size]], axis=0)
+                rewards.extend(list(map(float, fitness_batch_fn(tb))))
+            rewards = np.asarray(rewards, dtype=np.float64)
+            es.tell(xs, list((-rewards).astype(float)))
 
-        gen_max = float(np.max(rewards))
-        ib = int(np.argmax(rewards))
-        if rewards[ib] > best_so_far:
-            best_so_far = float(rewards[ib])
-            best_x = np.asarray(xs[ib], dtype=np.float64).copy()
-        history_best.append(best_so_far)
-        history_gen_max.append(gen_max)
-        with open(log_path, "a", encoding="utf-8") as flog:
-            flog.write(
-                json.dumps(
-                    {
-                        "generation": gen,
-                        "params": np.asarray(xs[ib], dtype=np.float64).tolist(),
-                        "gen_max": gen_max,
-                        "best_so_far": best_so_far,
-                    }
+            gen_max = float(np.max(rewards))
+            ib = int(np.argmax(rewards))
+            if rewards[ib] > best_so_far:
+                best_so_far = float(rewards[ib])
+                best_x = np.asarray(xs[ib], dtype=np.float64).copy()
+            history_best.append(best_so_far)
+            history_gen_max.append(gen_max)
+            with open(log_path, "a", encoding="utf-8") as flog:
+                flog.write(
+                    json.dumps(
+                        {
+                            "generation": gen,
+                            "params": np.asarray(xs[ib], dtype=np.float64).tolist(),
+                            "gen_max": gen_max,
+                            "best_so_far": best_so_far,
+                            "elapsed_sec": round(time.perf_counter() - t_start, 3),
+                        }
+                    )
+                    + "\n"
                 )
-                + "\n"
+            dt = time.perf_counter() - t0
+            r_mean = float(np.mean(rewards)) if rewards.size else float("nan")
+            r_std = float(np.std(rewards)) if rewards.size else float("nan")
+            print(
+                f"[CMA(batched)] gen {gen}: gen_max={gen_max:.4f} best_so_far={best_so_far:.4f} "
+                f"mean±std={r_mean:.4f}±{r_std:.4f} wall={dt:.2f}s"
             )
-        dt = time.perf_counter() - t0
-        r_mean = float(np.mean(rewards)) if rewards.size else float("nan")
-        r_std = float(np.std(rewards)) if rewards.size else float("nan")
-        print(
-            f"[CMA(batched)] gen {gen}: gen_max={gen_max:.4f} best_so_far={best_so_far:.4f} "
-            f"mean±std={r_mean:.4f}±{r_std:.4f} wall={dt:.2f}s"
-        )
+    except (KeyboardInterrupt, Exception) as e:
+        interrupted_exc = e
+        _handle_optimizer_interrupt("CMA(batched)", e, gen, len(history_best))
 
-    return best_x, np.asarray(history_best), np.asarray(history_gen_max)
+    elapsed_sec = time.perf_counter() - t_start
+    return best_x, np.asarray(history_best), np.asarray(history_gen_max), interrupted_exc, elapsed_sec
 
 
-def _save_curve_png(path: Path, y1: np.ndarray, y1_label: str, y2: np.ndarray | None, y2_label: str | None):
+def _format_duration(seconds: float) -> str:
+    total = int(round(max(0.0, seconds)))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m{s:02d}s"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def _save_curve_png(
+    path: Path,
+    y1: np.ndarray,
+    y1_label: str,
+    y2: np.ndarray | None,
+    y2_label: str | None,
+    elapsed_sec: float | None = None,
+):
+    if len(y1) == 0:
+        print(f"[plot] skipping {path.name}: no completed rounds to plot")
+        return
+
     import matplotlib
 
     matplotlib.use("Agg")
@@ -652,6 +756,17 @@ def _save_curve_png(path: Path, y1: np.ndarray, y1_label: str, y2: np.ndarray | 
     ax.set_ylabel("episode_return")
     ax.legend()
     ax.grid(True, alpha=0.3)
+    if elapsed_sec is not None:
+        ax.text(
+            0.99,
+            0.02,
+            f"total time: {_format_duration(elapsed_sec)}",
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=8,
+            alpha=0.7,
+        )
     fig.tight_layout()
     fig.savefig(path, dpi=120)
     plt.close(fig)
@@ -665,6 +780,17 @@ def _load_num_optim_prompt_template(path: Path) -> str:
         # This enables alternative prompt templates that are not wrapped in a python variable.
         return text.strip()
     return m.group(1).strip()
+
+
+def _prompt_template_is_vlm(path: Path) -> bool:
+    """True if the prompt template file declares `IS_VLM = True` (see
+    prompts/num_optim_Pratyush_vlm.py), i.e. it expects a visual-feedback image attached
+    to every LLM call from iteration 1 onward, in addition to the text history."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return bool(re.search(r"^\s*IS_VLM\s*=\s*True\s*$", text, flags=re.M))
 
 
 def _format_history_text_for_prompt(history: list[dict], rank: int) -> str:
@@ -771,14 +897,69 @@ def _get_env(name: str) -> str | None:
     return v if v else None
 
 
-def _call_llm_next_params(client, *, model: str, prompt: str, temperature: float) -> str:
+def _build_vlm_feedback_image(image_dicts: list[dict], num_frames: int = 5) -> np.ndarray:
+    """Sample `num_frames` evenly-spaced timesteps from one rollout's captured per-step camera
+    images (same list produced by rollout_batch_episode_returns(..., capture_frames=True)),
+    label each with its frame index, and stack them top-to-bottom into a single RGB uint8
+    composite image. Multiple cameras appear side-by-side within each row, matching
+    visualize_episodes.save_videos' frame layout.
+    """
+    import cv2  # local import: only needed for the VLM prompt path
+
+    total = len(image_dicts)
+    if total == 0:
+        raise ValueError("No frames captured for VLM feedback")
+    n = max(1, min(num_frames, total))
+    indices = [total - 1] if n == 1 else sorted({round(i * (total - 1) / (n - 1)) for i in range(n)})
+
+    cam_names = list(image_dicts[0].keys())
+    rows = []
+    for idx in indices:
+        cams = [np.asarray(image_dicts[idx][cam]) for cam in cam_names]
+        row = np.concatenate(cams, axis=1).copy()  # side-by-side cameras, HxWxC uint8 RGB
+        label = f"frame {idx}"
+        cv2.putText(row, label, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(row, label, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        rows.append(row)
+
+    max_w = max(r.shape[1] for r in rows)
+    if any(r.shape[1] != max_w for r in rows):
+        rows = [
+            r if r.shape[1] == max_w else np.pad(r, ((0, 0), (0, max_w - r.shape[1]), (0, 0)))
+            for r in rows
+        ]
+    return np.concatenate(rows, axis=0)
+
+
+def _encode_image_array_to_data_uri(img: np.ndarray, quality: int = 90) -> str:
+    """RGB uint8 HxWxC array -> `data:image/jpeg;base64,...` string usable as an image_url."""
+    import cv2  # local import: only needed for the VLM prompt path
+
+    bgr = np.ascontiguousarray(img[:, :, ::-1])  # RGB -> BGR for cv2.imencode
+    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    if not ok:
+        raise RuntimeError("Failed to JPEG-encode VLM feedback image")
+    b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+def _call_llm_next_params(
+    client, *, model: str, prompt: str, temperature: float, image_data_uri: str | None = None
+) -> str:
+    if image_data_uri:
+        content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": image_data_uri}},
+        ]
+    else:
+        content = prompt
     resp = client.chat.completions.create(
         model=model,
-        messages=[{"role": "user", "content": prompt}],
+        messages=[{"role": "user", "content": content}],
         temperature=float(temperature),
     )
-    content = resp.choices[0].message.content
-    return content if content is not None else ""
+    content_resp = resp.choices[0].message.content
+    return content_resp if content_resp is not None else ""
 
 
 def run_llm(
@@ -795,7 +976,19 @@ def run_llm(
     llm_step_size_hint: float,
     llm_optimum_hint: float,
     prompt_template_path: Path,
+    vlm_fitness_fn=None,
+    vlm_num_frames: int = 5,
 ):
+    """
+    vlm_fitness_fn: optional Callable[[np.ndarray], tuple[float, list[dict]]] — same role as
+    fitness_fn but also returns the evaluated candidate's per-timestep captured images (see
+    rollout_batch_episode_returns(..., capture_frames=True)). When given (i.e. the prompt
+    template sets IS_VLM = True, see prompts/num_optim_Pratyush_vlm.py), it replaces fitness_fn
+    for every evaluation, and a composite image built from vlm_num_frames evenly-spaced frames
+    of the most recently evaluated rollout is attached to every LLM call from iteration 1 onward
+    (the text history passed in the prompt still spans all iterations; only the image is
+    last-round-only).
+    """
     rank = int(np.asarray(x0).size)
     rng = np.random.default_rng(seed)
     _maybe_load_dotenv()
@@ -814,10 +1007,10 @@ def run_llm(
         api_key=api_key,
     )
     template = _load_num_optim_prompt_template(prompt_template_path)
-    prompt_backup_dir = log_path.parent / "llm_prompt_backups"
-    prompt_backup_dir.mkdir(parents=True, exist_ok=True)
+    prompt_log_dir = log_path.parent / "llm_prompt_logs"
+    prompt_log_dir.mkdir(parents=True, exist_ok=True)
     if prompt_template_path.is_file():
-        shutil.copy2(prompt_template_path, prompt_backup_dir / prompt_template_path.name)
+        shutil.copy2(prompt_template_path, prompt_log_dir / prompt_template_path.name)
 
     seen: set[tuple[float, ...]] = set()
     history: list[dict] = []
@@ -825,110 +1018,138 @@ def run_llm(
     history_iter_reward = []
     best_so_far = -np.inf
     best_x = _clip_quantize_params(x0)
+    use_vlm = vlm_fitness_fn is not None
+    last_vlm_image_uri: str | None = None  # visual feedback from the previous iteration's rollout only
 
+    t_start = time.perf_counter()
     with open(log_path, "w", encoding="utf-8") as flog:
         flog.write(
             f"# LLM dim={rank} maxiter={maxiter} model={llm_model} temp={llm_temperature} "
-            f"max_retries={llm_max_retries}\n"
+            f"max_retries={llm_max_retries} start_time={datetime.now().isoformat()}\n"
         )
 
-    for it in range(maxiter):
-        t0 = time.perf_counter()
-        raw_response = ""
-        source = "seed"
-        if it == 0:
-            cand = _clip_quantize_params(x0)
-        else:
-            prompt_hist = history[-llm_history_window:] if llm_history_window > 0 else history
-            history_text = _format_history_text_for_prompt(prompt_hist, rank)
-            prompt = _render_num_optim_prompt(
-                template,
-                rank=rank,
-                optimum_reward=float(llm_optimum_hint),
-                step_size=llm_step_size_hint,
-                episode_num=it + 1,
-                total_episodes=maxiter,
-                history_text=history_text,
-            )
-            (prompt_backup_dir / f"rendered_prompt_iter_{it:04d}.txt").write_text(prompt, encoding="utf-8")
-            cand = None
-            n_tries = max(1, int(llm_max_retries))
-            every_call_raised = True
-            saw_parseable_vector = False
-            attempt_responses: list[str] = []
-            for retry in range(n_tries):
-                try:
-                    print(
-                        f"[LLM] iter {it}/{maxiter-1} requesting next params from model={llm_model} "
-                        f"(retry {retry}/{n_tries - 1}) — waiting for optimizer response"
-                    )
-                    raw_response = _call_llm_next_params(
-                        client,
-                        model=llm_model,
-                        prompt=prompt,
-                        temperature=llm_temperature,
-                    )
-                    attempt_responses.append(f"--- retry {retry} ---\n{raw_response}")
-                    every_call_raised = False
-                    parsed = _parse_llm_params_response(raw_response, rank)
-                    if parsed is None:
-                        continue
-                    saw_parseable_vector = True
-                    parsed = _clip_quantize_params(parsed)
-                    key = tuple(float(v) for v in parsed.tolist())
-                    if key in seen:
-                        continue
-                    cand = parsed
-                    source = f"llm_success_after_retry_{retry}" if retry > 0 else "llm_success"
-                    break
-                except Exception as e:
-                    raw_response = f"__llm_error__: {e}"
-                    attempt_responses.append(f"--- retry {retry} ---\n{raw_response}")
-            (prompt_backup_dir / f"rendered_response_iter_{it:04d}.txt").write_text(
-                "\n\n".join(attempt_responses), encoding="utf-8"
-            )
-            if cand is None:
-                cand = _sample_unseen_params(rng, rank, seen)
-                # Distinguish why the LLM path failed (logged in source / optional fallback_reason).
-                if saw_parseable_vector:
-                    source = "duplicate_after_retries"
-                elif every_call_raised:
-                    source = "api_error"
-                else:
-                    source = "parse_failure"
+    interrupted_exc: BaseException | None = None
+    it = -1
+    try:
+        for it in range(maxiter):
+            t0 = time.perf_counter()
+            raw_response = ""
+            source = "seed"
+            if it == 0:
+                cand = _clip_quantize_params(x0)
+            else:
+                prompt_hist = history[-llm_history_window:] if llm_history_window > 0 else history
+                history_text = _format_history_text_for_prompt(prompt_hist, rank)
+                prompt = _render_num_optim_prompt(
+                    template,
+                    rank=rank,
+                    optimum_reward=float(llm_optimum_hint),
+                    step_size=llm_step_size_hint,
+                    episode_num=it + 1,
+                    total_episodes=maxiter,
+                    history_text=history_text,
+                )
+                (prompt_log_dir / f"rendered_prompt_iter_{it:04d}.txt").write_text(prompt, encoding="utf-8")
+                cand = None
+                n_tries = max(1, int(llm_max_retries))
+                every_call_raised = True
+                saw_parseable_vector = False
+                attempt_responses: list[str] = []
+                for retry in range(n_tries):
+                    try:
+                        print(
+                            f"[LLM] iter {it}/{maxiter-1} requesting next params from model={llm_model} "
+                            f"(retry {retry}/{n_tries - 1}) — waiting for optimizer response"
+                        )
+                        raw_response = _call_llm_next_params(
+                            client,
+                            model=llm_model,
+                            prompt=prompt,
+                            temperature=llm_temperature,
+                            image_data_uri=last_vlm_image_uri if use_vlm else None,
+                        )
+                        attempt_responses.append(f"--- retry {retry} ---\n{raw_response}")
+                        every_call_raised = False
+                        parsed = _parse_llm_params_response(raw_response, rank)
+                        if parsed is None:
+                            continue
+                        saw_parseable_vector = True
+                        parsed = _clip_quantize_params(parsed)
+                        key = tuple(float(v) for v in parsed.tolist())
+                        if key in seen:
+                            continue
+                        cand = parsed
+                        source = f"llm_success_after_retry_{retry}" if retry > 0 else "llm_success"
+                        break
+                    except Exception as e:
+                        raw_response = f"__llm_error__: {e}"
+                        attempt_responses.append(f"--- retry {retry} ---\n{raw_response}")
+                (prompt_log_dir / f"rendered_response_iter_{it:04d}.txt").write_text(
+                    "\n\n".join(attempt_responses), encoding="utf-8"
+                )
+                if cand is None:
+                    cand = _sample_unseen_params(rng, rank, seen)
+                    # Distinguish why the LLM path failed (logged in source / optional fallback_reason).
+                    if saw_parseable_vector:
+                        source = "duplicate_after_retries"
+                    elif every_call_raised:
+                        source = "api_error"
+                    else:
+                        source = "parse_failure"
 
-        cand = _clip_quantize_params(cand)
-        key = tuple(float(v) for v in cand.tolist())
-        if key in seen:
-            cand = _sample_unseen_params(rng, rank, seen)
+            cand = _clip_quantize_params(cand)
             key = tuple(float(v) for v in cand.tolist())
-            source = f"{source}_dedup"
-        reward = float(fitness_fn(cand))
-        seen.add(key)
+            if key in seen:
+                cand = _sample_unseen_params(rng, rank, seen)
+                key = tuple(float(v) for v in cand.tolist())
+                source = f"{source}_dedup"
 
-        if reward > best_so_far:
-            best_so_far = reward
-            best_x = cand.copy()
+            if use_vlm:
+                reward, frames = vlm_fitness_fn(cand)
+                reward = float(reward)
+                try:
+                    composite = _build_vlm_feedback_image(frames, num_frames=vlm_num_frames)
+                    last_vlm_image_uri = _encode_image_array_to_data_uri(composite)
+                    # Save every round's composite unconditionally (not just when it ends up
+                    # attached to a later prompt) so round 0 and the final round are covered too.
+                    (prompt_log_dir / f"vlm_feedback_round_{it:04d}.jpg").write_bytes(
+                        base64.b64decode(last_vlm_image_uri.split(",", 1)[1])
+                    )
+                except Exception as e:
+                    print(f"[LLM] iter {it}: warning: failed to build VLM feedback image: {e}")
+                    last_vlm_image_uri = None
+            else:
+                reward = float(fitness_fn(cand))
+            seen.add(key)
 
-        history.append(
-            {
-                "iter": it,
-                "params": [float(v) for v in cand.tolist()],
-                "reward": reward,
-                "best_so_far": float(best_so_far),
-                "source": source,
-                "raw_response": raw_response,
-            }
-        )
-        history_best.append(float(best_so_far))
-        history_iter_reward.append(float(reward))
+            if reward > best_so_far:
+                best_so_far = reward
+                best_x = cand.copy()
 
-        with open(log_path, "a", encoding="utf-8") as flog:
-            flog.write(json.dumps(history[-1], ensure_ascii=False) + "\n")
-        dt = time.perf_counter() - t0
-        print(f"[LLM] iter {it}: reward={reward:.4f} best_so_far={best_so_far:.4f} source={source} wall={dt:.2f}s")
+            history.append(
+                {
+                    "iter": it,
+                    "params": [float(v) for v in cand.tolist()],
+                    "reward": reward,
+                    "best_so_far": float(best_so_far),
+                    "source": source,
+                    "raw_response": raw_response,
+                    "elapsed_sec": round(time.perf_counter() - t_start, 3),
+                }
+            )
+            history_best.append(float(best_so_far))
+            history_iter_reward.append(float(reward))
 
-    return best_x, np.asarray(history_best), np.asarray(history_iter_reward)
+            with open(log_path, "a", encoding="utf-8") as flog:
+                flog.write(json.dumps(history[-1], ensure_ascii=False) + "\n")
+            dt = time.perf_counter() - t0
+            print(f"[LLM] iter {it}: reward={reward:.4f} best_so_far={best_so_far:.4f} source={source} wall={dt:.2f}s")
+    except (KeyboardInterrupt, Exception) as e:
+        interrupted_exc = e
+        _handle_optimizer_interrupt("LLM", e, it, len(history_best))
+
+    elapsed_sec = time.perf_counter() - t_start
+    return best_x, np.asarray(history_best), np.asarray(history_iter_reward), interrupted_exc, elapsed_sec
 
 
 def main():
@@ -1034,6 +1255,14 @@ def main():
         default=None,
         help="Prompt template python file (defaults to prompts/num_optim_Pratyush.py)",
     )
+    p.add_argument(
+        "--llm_vlm_num_frames",
+        type=int,
+        default=5,
+        help="Frames sampled from the previous round's rollout for VLM visual feedback, "
+        "stacked into one composite image (only used when the prompt template sets IS_VLM = True, "
+        "e.g. prompts/num_optim_Pratyush_vlm.py)",
+    )
 
     args = p.parse_args()
     if args.policy_class != "ACT":
@@ -1136,7 +1365,7 @@ def main():
         video_dir.mkdir(parents=True, exist_ok=True)
     _round_counter = {"n": 0}
 
-    def eval_theta_batch(theta_batch: np.ndarray) -> np.ndarray:
+    def eval_theta_batch(theta_batch: np.ndarray, capture_frames: bool = False):
         round_idx = _round_counter["n"]
         _round_counter["n"] += 1
         return rollout_batch_episode_returns(
@@ -1156,6 +1385,7 @@ def main():
             rollout_desc=f"sim rollout x{theta_batch.shape[0]}",
             video_dir=video_dir,
             round_label=f"round_{round_idx:04d}",
+            capture_frames=capture_frames,
         )
 
     theta_base = _film_theta_from_policy(policy).astype(np.float64, copy=False)
@@ -1174,6 +1404,11 @@ def main():
         def fitness(z: np.ndarray) -> float:
             return float(fitness_batch(np.asarray(z, dtype=np.float64).reshape(1, -1))[0])
 
+        def fitness_and_frames(z: np.ndarray) -> tuple[float, list[dict]]:
+            theta_batch = _rsp_decode_batch(theta_base, rsp_proj, np.asarray(z, dtype=np.float64).reshape(1, -1))
+            rewards, image_lists = eval_theta_batch(theta_batch, capture_frames=True)
+            return float(rewards[0]), image_lists[0]
+
         opt_x0 = z0
     else:
 
@@ -1182,6 +1417,11 @@ def main():
 
         def fitness(theta: np.ndarray) -> float:
             return float(fitness_batch(np.asarray(theta, dtype=np.float64).reshape(1, -1))[0])
+
+        def fitness_and_frames(theta: np.ndarray) -> tuple[float, list[dict]]:
+            theta_batch = np.asarray(theta, dtype=np.float64).reshape(1, -1)
+            rewards, image_lists = eval_theta_batch(theta_batch, capture_frames=True)
+            return float(rewards[0]), image_lists[0]
 
         opt_x0 = theta_base
 
@@ -1201,7 +1441,15 @@ def main():
         meta["rsp_seed"] = int(args.rsp_seed) if args.rsp_seed is not None else int(args.seed)
         meta["rsp_orthogonal"] = not args.rsp_raw_gaussian
         meta["theta_base"] = theta_base.tolist()
+    prompt_template_path: Path | None = None
+    use_vlm = False
     if args.method == "llm":
+        prompt_template_path = (
+            Path(args.llm_prompt_template).resolve()
+            if args.llm_prompt_template
+            else (Path(__file__).resolve().parent / "prompts" / "num_optim_Pratyush.py")
+        )
+        use_vlm = _prompt_template_is_vlm(prompt_template_path)
         meta["llm_model"] = args.llm_model
         meta["llm_maxiter"] = int(args.llm_maxiter)
         meta["llm_temperature"] = float(args.llm_temperature)
@@ -1213,16 +1461,27 @@ def main():
         )
         meta["llm_param_clip"] = [-6.0, 6.0]
         meta["llm_param_decimals"] = 1
-        meta["llm_prompt_backups_dir"] = "llm_prompt_backups"
+        meta["llm_prompt_logs_dir"] = "llm_prompt_logs"
+        meta["llm_prompt_template"] = str(prompt_template_path)
+        meta["llm_vlm"] = use_vlm
+        if use_vlm:
+            meta["llm_vlm_num_frames"] = int(args.llm_vlm_num_frames)
+            print(
+                f"[LLM] VLM prompt detected ({prompt_template_path.name}); attaching a "
+                f"{args.llm_vlm_num_frames}-frame visual feedback image (previous round only) "
+                "from iteration 1 onward. Make sure --llm_model points at a vision-capable model."
+            )
     with open(out_dir / "run_meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
     if use_rsp and rsp_proj is not None:
         np.save(out_dir / "rsp_projection.npy", rsp_proj)
 
+    interrupted_exc: BaseException | None = None
+    elapsed_sec: float = 0.0
     if args.method == "ars":
         log_path = out_dir / "ars_history.jsonl"
         if int(args.parallel) > 1:
-            best_x, h_best, h_iter = run_ars_batched(
+            best_x, h_best, h_iter, interrupted_exc, elapsed_sec = run_ars_batched(
                 fitness_batch,
                 opt_x0,
                 n_iters=args.ars_iters,
@@ -1234,7 +1493,7 @@ def main():
                 batch_size=int(args.parallel),
             )
         else:
-            best_x, h_best, h_iter = run_ars(
+            best_x, h_best, h_iter, interrupted_exc, elapsed_sec = run_ars(
                 fitness,
                 opt_x0,
                 n_iters=args.ars_iters,
@@ -1245,11 +1504,11 @@ def main():
                 log_path=log_path,
             )
         np.savez(out_dir / "ars_curves.npz", best_so_far=h_best, iter_max=h_iter)
-        _save_curve_png(out_dir / "reward_curve.png", h_best, "best_so_far", h_iter, "iter_max")
+        _save_curve_png(out_dir / "reward_curve.png", h_best, "best_so_far", h_iter, "iter_max", elapsed_sec=elapsed_sec)
     elif args.method == "cma":
         log_path = out_dir / "cma_history.jsonl"
         if int(args.parallel) > 1:
-            best_x, h_best, h_gen = run_cma_batched(
+            best_x, h_best, h_gen, interrupted_exc, elapsed_sec = run_cma_batched(
                 fitness_batch,
                 opt_x0,
                 sigma0=args.cma_sigma0,
@@ -1260,7 +1519,7 @@ def main():
                 batch_size=int(args.parallel),
             )
         else:
-            best_x, h_best, h_gen = run_cma(
+            best_x, h_best, h_gen, interrupted_exc, elapsed_sec = run_cma(
                 fitness,
                 opt_x0,
                 sigma0=args.cma_sigma0,
@@ -1270,17 +1529,13 @@ def main():
                 log_path=log_path,
             )
         np.savez(out_dir / "cma_curves.npz", best_so_far=h_best, gen_max=h_gen)
-        _save_curve_png(out_dir / "reward_curve.png", h_best, "best_so_far", h_gen, "gen_max")
+        _save_curve_png(out_dir / "reward_curve.png", h_best, "best_so_far", h_gen, "gen_max", elapsed_sec=elapsed_sec)
     else:
         if int(args.parallel) > 1:
             print("Warning: --method llm currently evaluates one candidate per iteration; extra parallel envs stay idle.")
-        prompt_template_path = (
-            Path(args.llm_prompt_template).resolve()
-            if args.llm_prompt_template
-            else (Path(__file__).resolve().parent / "prompts" / "num_optim_Pratyush.py")
-        )
+        assert prompt_template_path is not None
         optimum_hint = float(args.llm_optimum_hint) if args.llm_optimum_hint is not None else float(env_max_reward)
-        best_x, h_best, h_iter = run_llm(
+        best_x, h_best, h_iter, interrupted_exc, elapsed_sec = run_llm(
             fitness,
             opt_x0,
             maxiter=int(args.llm_maxiter),
@@ -1293,9 +1548,20 @@ def main():
             llm_step_size_hint=float(args.llm_step_size_hint),
             llm_optimum_hint=optimum_hint,
             prompt_template_path=prompt_template_path,
+            vlm_fitness_fn=fitness_and_frames if use_vlm else None,
+            vlm_num_frames=int(args.llm_vlm_num_frames),
         )
         np.savez(out_dir / "llm_curves.npz", best_so_far=h_best, iter_reward=h_iter)
-        _save_curve_png(out_dir / "reward_curve.png", h_best, "best_so_far", h_iter, "iter_reward")
+        _save_curve_png(out_dir / "reward_curve.png", h_best, "best_so_far", h_iter, "iter_reward", elapsed_sec=elapsed_sec)
+
+    run_finished_dt = datetime.now()
+    meta["elapsed_seconds"] = round(float(elapsed_sec), 3)
+    meta["elapsed_human"] = _format_duration(elapsed_sec)
+    meta["run_started_at"] = (run_finished_dt - timedelta(seconds=elapsed_sec)).isoformat()
+    meta["run_finished_at"] = run_finished_dt.isoformat()
+    meta["interrupted"] = interrupted_exc is not None
+    with open(out_dir / "run_meta.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
 
     if use_rsp and rsp_proj is not None:
         best_theta = _rsp_decode(theta_base, rsp_proj, best_x)
@@ -1314,10 +1580,19 @@ def main():
         film_ckpt["rsp_projection"] = torch.from_numpy(rsp_proj.astype(np.float32))
     torch.save(film_ckpt, out_dir / "best_film_only.pt")
     best_logged = float(np.max(h_best)) if len(h_best) else float("nan")
-    print(f"Done. Best episode_return in log ≈ {best_logged}")
+    print(f"Done. Best episode_return in log ≈ {best_logged}, total time {_format_duration(elapsed_sec)}")
     print(f"Saved: {out_dir / 'best_film_only.pt'}, {out_dir / 'reward_curve.png'}")
     if use_rsp:
         print(f"RSP outputs: {out_dir / 'rsp_projection.npy'}, {out_dir / 'best_rsp_z.npy'}")
+
+    if interrupted_exc is not None:
+        if isinstance(interrupted_exc, KeyboardInterrupt):
+            print("Interrupted by user (Ctrl+C); outputs above reflect the partial run.")
+            sys.exit(0)
+        else:
+            # Re-raise so the traceback and a non-zero exit code still surface (this was a real
+            # error, not a user-requested stop) — partial results/plots are already saved above.
+            raise interrupted_exc
 
 
 if __name__ == "__main__":
