@@ -123,8 +123,12 @@ def make_sim_env(task_name, time_limit=20):
         physics = mujoco.Physics.from_xml_path(xml_path)
         # Prefix match so eval-only scene variants (e.g. *_eval_cyl for shape
         # generalization tests) reuse the same task/reward logic as the base task.
+        # pick_place_v3 must be checked before pick: "sim_hmf_proto5_pick" is a prefix of
+        # "sim_hmf_proto5_pick_place_v3".
         if task_name.startswith("sim_hmf_proto5_pick_place_v3"):
             task = Proto5PickPlaceV3Task(random=False)
+        elif task_name.startswith("sim_hmf_proto5_pick"):
+            task = Proto5PickTask(random=False)
         elif task_name.startswith("sim_hmf_proto5_drawer"):
             task = Proto5DrawerTask(random=False)
         elif task_name.startswith("sim_hmf_proto5_basketball"):
@@ -132,7 +136,8 @@ def make_sim_env(task_name, time_limit=20):
         else:
             raise NotImplementedError(
                 f"Unknown HMF proto5 task_name '{task_name}'. "
-                "Expected sim_hmf_proto5_pick_place_v3, sim_hmf_proto5_drawer, or sim_hmf_proto5_basketball "
+                "Expected sim_hmf_proto5_pick_place_v3, sim_hmf_proto5_pick, "
+                "sim_hmf_proto5_drawer, or sim_hmf_proto5_basketball "
                 "(optionally with a suffix, e.g. an eval-only scene variant)."
             )
         env = control.Environment(physics, task, time_limit=time_limit, control_timestep=DT,
@@ -406,7 +411,7 @@ class Proto5HMFMocapTask(base.Task):
         - qpos: robot qpos (24,) = arm(6) + wrist(2) + fingers(16)
         - qvel: robot qvel (24,)
         - env_state: object free joint pose (7,) = xyz + quat(wxyz)
-        - images: topview, corner
+        - images: cameras listed in CAMERA_NAMES (default topview, corner)
     """
 
     MOCAP_BODY_NAME = 'mocap'
@@ -414,6 +419,7 @@ class Proto5HMFMocapTask(base.Task):
     OBJECT_QPOS_SIZE = 7
     CTRL_SIZE = HMF_PROTO5_CTRL_DIM
     KEYFRAME_NAME = 'home'
+    CAMERA_NAMES = ("topview", "corner")
 
     def __init__(self, random=None):
         super().__init__(random=random)
@@ -559,8 +565,8 @@ class Proto5HMFMocapTask(base.Task):
         obs['qvel'] = self.get_qvel(physics)
         obs['env_state'] = self.get_env_state(physics)
         obs['images'] = dict()
-        obs['images']['topview'] = physics.render(height=480, width=640, camera_id='topview')
-        obs['images']['corner'] = physics.render(height=480, width=640, camera_id='corner')
+        for cam_name in self.CAMERA_NAMES:
+            obs['images'][cam_name] = physics.render(height=480, width=640, camera_id=cam_name)
         return obs
 
     def get_reward(self, physics):
@@ -569,6 +575,39 @@ class Proto5HMFMocapTask(base.Task):
 
 # Success if min object–goal distance over the episode is within this (meters).
 PICK_PLACE_V3_SUCCESS_DIST_ATOL = 0.02
+# Pick: success if peak lift is within this of LIFT_TARGET (meters of remaining lift).
+PICK_SUCCESS_LIFT_ATOL = 0.01
+
+
+class Proto5PickTask(Proto5HMFMocapTask):
+    """Pick-only: no goal site. Per-step reward is negative remaining lift.
+
+    r_t = -max(0, LIFT_TARGET - (obj_z - rest_z)), so max_reward = 0 once the object
+    has been raised LIFT_TARGET meters above its reset height. Episode return is the
+    sum of per-step remaining lift (negative); highest_reward near 0 means a successful lift.
+    """
+
+    OBJECT_BODY_NAME = "obj"
+    CAMERA_NAMES = ("corner", "rhand_palm_right_cam")
+    LIFT_TARGET = 0.08  # meters above reset height
+
+    def __init__(self, random=None):
+        super().__init__(random=random)
+        self.max_reward = 0.0
+        self._rest_z = 0.65
+
+    def initialize_episode(self, physics):
+        super().initialize_episode(physics)
+        physics.forward()
+        obj_body = physics.model.name2id(self.OBJECT_BODY_NAME, "body")
+        self._rest_z = float(physics.data.xpos[obj_body][2])
+
+    def get_reward(self, physics):
+        physics.forward()
+        obj_body = physics.model.name2id(self.OBJECT_BODY_NAME, "body")
+        obj_z = float(np.asarray(physics.data.xpos[obj_body], dtype=np.float64)[2])
+        lift = obj_z - self._rest_z
+        return float(-max(0.0, self.LIFT_TARGET - lift))
 
 
 class Proto5PickPlaceV3Task(Proto5HMFMocapTask):
@@ -612,6 +651,9 @@ def episode_reward_meets_success(task_name, episode_highest_reward, env_max_rewa
     Whether a rollout counts as success vs env.task.max_reward.
     Pick-place v3: per-step reward is -distance; episode_highest_reward = max_t(-d_t) = -min_t(d_t).
     Success when min distance is within PICK_PLACE_V3_SUCCESS_DIST_ATOL of the goal.
+    Pick: per-step reward is -remaining_lift; success when peak lift is within
+    PICK_SUCCESS_LIFT_ATOL of LIFT_TARGET. pick_place_v3 must be checked first
+    (its name also starts with sim_hmf_proto5_pick).
     """
     if task_name.startswith("sim_hmf_proto5_pick_place_v3"):
         return bool(
@@ -620,6 +662,15 @@ def episode_reward_meets_success(task_name, episode_highest_reward, env_max_rewa
                 0.0,
                 rtol=0.0,
                 atol=PICK_PLACE_V3_SUCCESS_DIST_ATOL,
+            )
+        )
+    if task_name.startswith("sim_hmf_proto5_pick"):
+        return bool(
+            np.isclose(
+                episode_highest_reward,
+                0.0,
+                rtol=0.0,
+                atol=PICK_SUCCESS_LIFT_ATOL,
             )
         )
     return bool(episode_highest_reward == env_max_reward)
