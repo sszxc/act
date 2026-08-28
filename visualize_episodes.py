@@ -97,45 +97,55 @@ def _save_video(frames, output_path, fps=30, verbose=False):
     raise RuntimeError(f"All codecs failed; could not save video: {output_path}")
 
 
-def save_videos(video, dt, video_path=None, input_bgr=False):
+def _prep_cam_image(image, cam_name, input_bgr=False):
+    image = image.copy()
+    if image.shape[2] == 3 and input_bgr:
+        image = image[:, :, [2, 1, 0]]  # BGR -> RGB
+    return _draw_camera_name(image, cam_name)
+
+
+def _video_path_for_cam(video_path, cam_name):
+    root, ext = os.path.splitext(video_path)
+    if not ext:
+        ext = ".mp4"
+    return f"{root}_{cam_name}{ext}"
+
+
+def save_videos(video, dt, video_path=None, input_bgr=False, layout="combined"):
     """Build frame list from video (list or dict of multi-cam frames) and save via imageio.
     input_bgr: if True, HDF5 stores BGR → convert to RGB before writing; else assume RGB.
+    layout: "combined" writes one mp4 with cameras side-by-side (default);
+            "separate" writes one mp4 per camera (foo.mp4 -> foo_<cam>.mp4).
     """
+    if layout not in ("combined", "separate"):
+        raise ValueError(f"layout must be 'combined' or 'separate', got {layout!r}")
     if video_path is None:
         video_path = 'output.mp4'
     fps = int(1 / dt) if dt > 0 else 30
 
     if isinstance(video, list):
         cam_names = list(video[0].keys())
-        frames = []
+        per_cam = {cam: [] for cam in cam_names}
         for image_dict in tqdm(video, desc="Building frames", unit="frame"):
-            images = []
             for cam_name in cam_names:
-                image = image_dict[cam_name].copy()
-                if image.shape[2] == 3 and input_bgr:
-                    image = image[:, :, [2, 1, 0]]  # BGR -> RGB
-                image = _draw_camera_name(image, cam_name)
-                images.append(image)
-            frame = np.concatenate(images, axis=1)
-            frames.append(frame)
+                per_cam[cam_name].append(_prep_cam_image(image_dict[cam_name], cam_name, input_bgr))
     elif isinstance(video, dict):
         cam_names = list(video.keys())
         n_frames = video[cam_names[0]].shape[0]
-        frames = []
+        per_cam = {cam: [] for cam in cam_names}
         for t in tqdm(range(n_frames), desc="Building frames", unit="frame"):
-            images = []
             for cam_name in cam_names:
-                image = video[cam_name][t].copy()
-                if image.shape[2] == 3 and input_bgr:
-                    image = image[:, :, [2, 1, 0]]  # BGR -> RGB
-                image = _draw_camera_name(image, cam_name)
-                images.append(image)
-            frame = np.concatenate(images, axis=1)
-            frames.append(frame)
+                per_cam[cam_name].append(_prep_cam_image(video[cam_name][t], cam_name, input_bgr))
     else:
         raise TypeError("video must be list or dict")
 
-    _save_video(frames, video_path, fps=fps, verbose=False)
+    if layout == "combined":
+        n_frames = len(next(iter(per_cam.values())))
+        frames = [np.concatenate([per_cam[c][t] for c in cam_names], axis=1) for t in range(n_frames)]
+        _save_video(frames, video_path, fps=fps, verbose=False)
+    else:
+        for cam_name in cam_names:
+            _save_video(per_cam[cam_name], _video_path_for_cam(video_path, cam_name), fps=fps, verbose=False)
 
 
 def visualize_joints(qpos_list, command_list, plot_path=None, ylim=None, label_overwrite=None):

@@ -173,13 +173,15 @@ def rollout_batch_episode_returns(
     video_dir: Path | None = None,
     round_label: str = "round",
     capture_frames: bool = False,
+    video_layout: str = "combined",
 ) -> np.ndarray | tuple[np.ndarray, list[list[dict]]]:
     """
     Step multiple envs in parallel (one theta each), batch observations per timestep on one GPU.
     Returns episode_return per trajectory (shape: (B,)).
 
-    If video_dir is not None, records one video per env (all camera_names side by side) to
-    video_dir / f"{round_label}_env{i}.mp4".
+    If video_dir is not None, records video(s) per env to video_dir / f"{round_label}_env{i}.mp4".
+    video_layout="combined" (default) writes one side-by-side mp4; "separate" writes one mp4
+    per camera (e.g. round_0001_env0_default_cam.mp4).
 
     If capture_frames is True, also (or additionally, independent of video_dir) collects each
     env's per-timestep observation images and returns them as a second value:
@@ -313,7 +315,12 @@ def rollout_batch_episode_returns(
         assert video_dir is not None and image_lists is not None
         video_dir.mkdir(parents=True, exist_ok=True)
         for i in range(B):
-            save_videos(image_lists[i], DT, video_path=str(video_dir / f"{round_label}_env{i}.mp4"))
+            save_videos(
+                image_lists[i],
+                DT,
+                video_path=str(video_dir / f"{round_label}_env{i}.mp4"),
+                layout=video_layout,
+            )
 
     if capture_frames:
         assert image_lists is not None
@@ -1277,6 +1284,14 @@ def main():
         help="Render and save an mp4 per evaluated candidate per round to <output_dir>/videos/ "
         "(off by default: adds per-step frame capture + encoding overhead)",
     )
+    p.add_argument(
+        "--video_layout",
+        type=str,
+        choices=("combined", "separate"),
+        default="combined",
+        help="When --save_videos: 'combined' writes one side-by-side mp4 per env (default); "
+        "'separate' writes one mp4 per camera (e.g. round_0001_env0_default_cam.mp4)",
+    )
     p.add_argument("--temporal_agg", action="store_true")
     p.add_argument("--latent_z_sample", type=str, default=None)
     p.add_argument(
@@ -1509,6 +1524,7 @@ def main():
             video_dir=video_dir,
             round_label=f"round_{round_idx:04d}",
             capture_frames=capture_frames,
+            video_layout=args.video_layout,
         )
 
     theta_base = _film_theta_from_policy(policy).astype(np.float64, copy=False)
@@ -1540,6 +1556,7 @@ def main():
     }
     if args.save_videos:
         meta["videos_dir"] = "videos"
+        meta["video_layout"] = args.video_layout
     prompt_template_path: Path | None = None
     use_vlm = False
     if args.method == "llm":
