@@ -16,17 +16,27 @@ HMF_PROTO5_ACTION_DIM = 23  # mocap_pos(3) + mocap_quat(4, wxyz) + finger_ctrl(1
 HMF_PROTO5_CTRL_DIM = 16
 
 HMF_PROTO5_RANDOM_RESET_CONFIGS = {
-    # Pick-only: no goal. XY from teleop hdf5 extents (rounded); z = table 0.6 + geom half-extent
-    # of the placeholder mesh in the corresponding XML (box 0.05 / capsule 0.085).
+    # Pick-only: no goal. Matches dex-retargeting teleop yml simulation.random_object_shape
+    # (train_shapes = box/cylinder/sphere; z derived from table_z + geom half-extent).
     "pick": {
-        "random_obj_goal": [
-            {
-                "name": "obj",
-                "type": "body",
-                "position_ranges": [[-0.2, 0.2], [0.6, 0.9], [0.65, 0.65]],
-            },
-        ],
+        "random_object_shape": {
+            "enabled": True,
+            "body_name": "obj",
+            "geom_name": "objGeom",
+            "table_z": 0.6,
+            "position_ranges": [[-0.2, 0.2], [0.6, 0.9]],
+            "yaw_range": [-3.14159, 3.14159],
+            "density": 700,
+            "randomize_color": False,
+            "train_shapes": [
+                {"name": "box", "size_ranges": [[0.025, 0.04], [0.025, 0.04], [0.04, 0.07]]},
+                {"name": "cylinder", "size_ranges": [[0.025, 0.04], [0.04, 0.07]]},
+                {"name": "sphere", "size_ranges": [[0.035, 0.05]]},
+            ],
+        },
     },
+    # Held-out capsule: do not sample shape (ICL/CMA). XY random; z = table 0.6 + default
+    # eval-XML capsule half-extent 0.085. Pin with fixed_object_pose=[x,y,0.685].
     "pick_eval": {
         "random_obj_goal": [
             {
@@ -176,10 +186,10 @@ SIM_TASK_CONFIGS = {
         "random_reset": HMF_PROTO5_RANDOM_RESET_CONFIGS["pick_place_v3"],
     },
     # Pick-only (no goal site). Cameras match teleop hdf5: corner + palm wrist cam.
-    # r_t = -max(0, lift_target - (obj_z - rest_z)); max_reward = 0 (see Proto5PickTask).
+    # Reset samples box/cylinder/sphere (see random_object_shape). Reward: Proto5PickTask.
     "sim_hmf_proto5_pick": {
-        "dataset_dir": DATA_DIR + "/sim_hmf_proto5_teleop/pick/20260827_181026",
-        "num_episodes": 20,
+        "dataset_dir": DATA_DIR + "/sim_hmf_proto5_teleop/pick/good_58",
+        "num_episodes": 58,
         "episode_len": 400,
         "camera_names": ["corner", "rhand_palm_right_cam"],
         "state_dim": HMF_PROTO5_STATE_DIM,
@@ -188,11 +198,11 @@ SIM_TASK_CONFIGS = {
         "xml_path": "/home/lab/Documents/proto5_description/mjcf/hmf_hand_proto5_release_right_ur7e_scene_pick.xml",
         "random_reset": HMF_PROTO5_RANDOM_RESET_CONFIGS["pick"],
     },
-    # Eval-only held-out-shape variant: same dataset/checkpoint, placeholder geom is a capsule
-    # (train XML is a box). Pair with --task_name sim_hmf_proto5_pick_eval --ckpt_dir <pick ckpt>.
+    # Held-out capsule (no shape sampling). Same dataset/checkpoint as pick.
+    # Eval/ICL: --task_name sim_hmf_proto5_pick_eval --ckpt_dir <pick ckpt>.
     "sim_hmf_proto5_pick_eval": {
-        "dataset_dir": DATA_DIR + "/sim_hmf_proto5_teleop/pick/20260827_181026",
-        "num_episodes": 20,
+        "dataset_dir": DATA_DIR + "/sim_hmf_proto5_teleop/pick/good_58",
+        "num_episodes": 58,
         "episode_len": 400,
         "camera_names": ["corner", "rhand_palm_right_cam"],
         "state_dim": HMF_PROTO5_STATE_DIM,

@@ -26,6 +26,21 @@ HMF_PROTO5_RANDOM_RESET_STATE = [None]  # sampled body/site/joint reset, changed
 HMF_PROTO5_OBJ_GOAL_POSE = HMF_PROTO5_RANDOM_RESET_STATE  # backward-compatible alias
 
 
+# MuJoCo mjtGeom ids; keep in sync with dex-retargeting random_object_shape.
+_SHAPE_NAME_TO_MJTGEOM = {
+    "sphere": 2,
+    "capsule": 3,
+    "cylinder": 5,
+    "box": 6,
+}
+_SHAPE_SIZE_LEN = {
+    "box": 3,
+    "sphere": 1,
+    "cylinder": 2,
+    "capsule": 2,
+}
+
+
 def _sample_xyz(ranges):
     arr = np.asarray(ranges, dtype=np.float64)
     return np.array(
@@ -38,8 +53,88 @@ def _sample_xyz(ranges):
     )
 
 
+def _shape_z_half_extent(shape_name, size):
+    """How far the geom center must sit above the table so the bottom just touches it."""
+    if shape_name == "box":
+        return float(size[2])
+    if shape_name == "sphere":
+        return float(size[0])
+    if shape_name == "cylinder":
+        return float(size[1])
+    if shape_name == "capsule":
+        return float(size[1]) + float(size[0])
+    raise ValueError(f"Unsupported shape '{shape_name}'")
+
+
+def _shape_mass_and_diag_inertia(shape_name, size, density):
+    """Analytic mass + principal inertia for a uniform-density primitive (matches teleop)."""
+    if shape_name == "box":
+        sx, sy, sz = float(size[0]), float(size[1]), float(size[2])
+        a, b, c = 2 * sx, 2 * sy, 2 * sz
+        m = density * a * b * c
+        return m, np.array(
+            [m * (b**2 + c**2) / 12.0, m * (a**2 + c**2) / 12.0, m * (a**2 + b**2) / 12.0]
+        )
+    if shape_name == "sphere":
+        r = float(size[0])
+        m = density * (4.0 / 3.0) * np.pi * r**3
+        i = (2.0 / 5.0) * m * r**2
+        return m, np.array([i, i, i])
+    if shape_name == "cylinder":
+        r, h = float(size[0]), float(size[1])
+        m = density * np.pi * r**2 * (2 * h)
+        izz = 0.5 * m * r**2
+        ixx = m * (3 * r**2 + (2 * h) ** 2) / 12.0
+        return m, np.array([ixx, ixx, izz])
+    if shape_name == "capsule":
+        r, h = float(size[0]), float(size[1])
+        m_cyl = density * np.pi * r**2 * (2 * h)
+        m_hemi = density * (2.0 / 3.0) * np.pi * r**3
+        m = m_cyl + 2 * m_hemi
+        izz = 0.5 * m_cyl * r**2 + 2 * (2.0 / 5.0) * m_hemi * r**2
+        ixx_cyl = m_cyl * (3 * r**2 + (2 * h) ** 2) / 12.0
+        ixx_hemi_own = (83.0 / 320.0) * m_hemi * r**2
+        d = h + 3 * r / 8.0
+        ixx = ixx_cyl + 2 * (ixx_hemi_own + m_hemi * d**2)
+        return m, np.array([ixx, ixx, izz])
+    raise ValueError(f"Unsupported shape '{shape_name}'")
+
+
+def _sample_random_object_shape(cfg):
+    """Sample shape/size/yaw/xy; z = table_z + half-extent. Mirrors teleop yml sampling."""
+    shapes = cfg["train_shapes"]
+    spec = shapes[int(np.random.randint(len(shapes)))]
+    name = str(spec["name"])
+    expected_len = _SHAPE_SIZE_LEN[name]
+    size_ranges = np.asarray(spec["size_ranges"], dtype=np.float64)
+    if size_ranges.shape != (expected_len, 2):
+        raise ValueError(
+            f"random_object_shape size_ranges for '{name}' must be {(expected_len, 2)}, "
+            f"got {size_ranges.shape}"
+        )
+    size = np.array([np.random.uniform(lo, hi) for lo, hi in size_ranges], dtype=np.float64)
+    xy_ranges = np.asarray(cfg["position_ranges"], dtype=np.float64)
+    xy = np.array(
+        [np.random.uniform(*xy_ranges[0]), np.random.uniform(*xy_ranges[1])],
+        dtype=np.float64,
+    )
+    z = float(cfg["table_z"]) + _shape_z_half_extent(name, size)
+    yaw_range = np.asarray(cfg["yaw_range"], dtype=np.float64).reshape(-1)
+    yaw = float(np.random.uniform(yaw_range[0], yaw_range[1]))
+    return {
+        "body_name": cfg["body_name"],
+        "geom_name": cfg["geom_name"],
+        "density": float(cfg.get("density", 700.0)),
+        "randomize_color": bool(cfg.get("randomize_color", False)),
+        "shape": name,
+        "size": size,
+        "position": np.array([xy[0], xy[1], z], dtype=np.float64),
+        "yaw": yaw,
+    }
+
+
 def sample_hmf_proto5_random_reset(task_name):
-    """Sample task-specific random body/site reset targets for an HMF proto5 task."""
+    """Sample task-specific random body/site/shape reset targets for an HMF proto5 task."""
     random_reset = SIM_TASK_CONFIGS.get(task_name, {}).get("random_reset", {})
     state = {"random_obj_goal": []}
 
@@ -54,7 +149,15 @@ def sample_hmf_proto5_random_reset(task_name):
     if task_reset_joint and task_reset_joint.get("enabled", False):
         state["task_reset_joint"] = dict(task_reset_joint)
 
-    if not state["random_obj_goal"] and "task_reset_joint" not in state:
+    shape_cfg = random_reset.get("random_object_shape")
+    if shape_cfg and shape_cfg.get("enabled", False):
+        state["random_object_shape"] = _sample_random_object_shape(shape_cfg)
+
+    if (
+        not state["random_obj_goal"]
+        and "task_reset_joint" not in state
+        and "random_object_shape" not in state
+    ):
         return None
     return state
 
@@ -505,11 +608,57 @@ class Proto5HMFMocapTask(base.Task):
         physics.data.qpos[qadr:qadr + qwidth] = value
         physics.data.qvel[dadr:dadr + dwidth] = 0.0
 
+    @staticmethod
+    def _apply_random_object_shape(physics, sampled):
+        """Mutate already-compiled geom type/size/mass and free-joint pose (no XML recompile)."""
+        if not sampled:
+            return
+        body_name = str(sampled["body_name"])
+        geom_name = str(sampled["geom_name"])
+        shape_name = str(sampled["shape"])
+        size = np.asarray(sampled["size"], dtype=np.float64).reshape(-1)
+        pos = np.asarray(sampled["position"], dtype=np.float64).reshape(3)
+        yaw = float(sampled["yaw"])
+        density = float(sampled.get("density", 700.0))
+
+        body_id = physics.model.name2id(body_name, "body")
+        geom_id = physics.model.name2id(geom_name, "geom")
+        full_size = np.zeros(3, dtype=np.float64)
+        full_size[: size.shape[0]] = size
+
+        physics.model.geom_type[geom_id] = int(_SHAPE_NAME_TO_MJTGEOM[shape_name])
+        physics.model.geom_size[geom_id] = full_size
+        if sampled.get("randomize_color", False):
+            physics.model.geom_rgba[geom_id] = [
+                np.random.uniform(0.15, 0.95),
+                np.random.uniform(0.15, 0.95),
+                np.random.uniform(0.15, 0.95),
+                1.0,
+            ]
+
+        mass, diag_inertia = _shape_mass_and_diag_inertia(shape_name, size, density)
+        physics.model.body_mass[body_id] = mass
+        physics.model.body_inertia[body_id] = diag_inertia
+        physics.model.body_ipos[body_id] = [0.0, 0.0, 0.0]
+        physics.model.body_iquat[body_id] = [1.0, 0.0, 0.0, 0.0]
+
+        quat = np.array([np.cos(yaw / 2.0), 0.0, 0.0, np.sin(yaw / 2.0)], dtype=np.float64)
+        body_joint_num = int(physics.model.body_jntnum[body_id])
+        body_joint_adr = int(physics.model.body_jntadr[body_id])
+        if body_joint_num < 1 or int(physics.model.jnt_type[body_joint_adr]) != 0:
+            raise ValueError(f"random_object_shape: body '{body_name}' has no free joint")
+        qadr = int(physics.model.jnt_qposadr[body_joint_adr])
+        dadr = int(physics.model.jnt_dofadr[body_joint_adr])
+        physics.data.qpos[qadr:qadr + 3] = pos
+        physics.data.qpos[qadr + 3:qadr + 7] = quat
+        physics.data.qvel[dadr:dadr + 6] = 0.0
+
     @classmethod
     def _apply_random_reset(cls, physics, state):
         for target in state.get("random_obj_goal", []):
             cls._apply_random_target(physics, target)
         cls._apply_task_reset_joint(physics, state.get("task_reset_joint"))
+        cls._apply_random_object_shape(physics, state.get("random_object_shape"))
         physics.forward()
 
     def initialize_episode(self, physics):
