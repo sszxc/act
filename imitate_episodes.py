@@ -698,7 +698,13 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
     # for older checkpoints saved before this buffer existed to be missing them.
     allowed_missing = {
         "model.visual_film_gamma", "model.visual_film_beta",
+        # visual / memory (encoder-decoder boundary) / hs (pre-action_head) — see
+        # detr_vae.py's load_film_pca(..., target=...).
         "model.film_pca_W", "model.film_pca_mu", "model.film_pca_gamma", "model.film_pca_beta",
+        "model.film_pca_memory_W", "model.film_pca_memory_mu",
+        "model.film_pca_memory_gamma", "model.film_pca_memory_beta",
+        "model.film_pca_hs_W", "model.film_pca_hs_mu",
+        "model.film_pca_hs_gamma", "model.film_pca_hs_beta",
     }
     missing = set(getattr(loading_status, "missing_keys", []))
     unexpected = set(getattr(loading_status, "unexpected_keys", []))

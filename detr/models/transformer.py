@@ -46,7 +46,12 @@ class Transformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, src, mask, query_embed, pos_embed, latent_input=None, proprio_input=None, additional_pos_embed=None):
+    def forward(self, src, mask, query_embed, pos_embed, latent_input=None, proprio_input=None,
+                additional_pos_embed=None, memory_film_fn=None):
+        # memory_film_fn: optional Callable[[Tensor(S,B,C)], Tensor(S,B,C)], applied to the
+        # encoder output right before it is handed to the decoder as `memory` — i.e. the
+        # candidate-4 "encoder-FiLM-decoder" insertion point in detr_vae.py's PCA-bottleneck
+        # FiLM (see DETRVAE.load_film_pca(..., target="memory") / film_pca_memory_gamma/beta).
         # TODO flatten only when input has H and W
         if len(src.shape) == 4: # has H and W
             # flatten NxCxHxW to HWxNxC
@@ -71,6 +76,8 @@ class Transformer(nn.Module):
 
         tgt = torch.zeros_like(query_embed)
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
+        if memory_film_fn is not None:
+            memory = memory_film_fn(memory)
         hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
                           pos=pos_embed, query_pos=query_embed)
         hs = hs.transpose(1, 2)

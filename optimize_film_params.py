@@ -4,26 +4,37 @@ Search PCA-bottleneck FiLM parameters in ACT with CMA-ES, ARS, or an LLM optimiz
 object pose, to maximize episode_return.
 
 The search space is theta = [gamma, beta], each k-dim, where k = --film_bottleneck_dim. These are
-NOT raw per-channel FiLM values: they modulate a k-dim PCA subspace of the hidden_dim visual
-feature (see detr_vae.py's load_film_pca()/forward()), fit offline from recorded activations by
+NOT raw per-channel FiLM values: they modulate a k-dim PCA subspace of a hidden_dim-wide tensor
+(see detr_vae.py's load_film_pca()/forward()), fit offline from recorded activations by
 fit_film_pca.py. --film_pca_path points at that fit's .npz output; k is sliced from its stored
 basis (k <= max_k used when fitting).
+
+--film_target selects WHERE in the network that tensor is (must match --target used when fitting
+--film_pca_path):
+  - "visual" (default): before the Transformer encoder (the original mode).
+  - "memory": the encoder-decoder boundary (encoder's output, right before the decoder reads it).
+  - "hs": right after the decoder, before action_head/is_pad_head.
 
 Requires:
   - numpy, torch, matplotlib
   - CMA-ES: pip install cma (only for --method cma)
 
 Examples:
-  # 1) Fit the PCA basis once per ckpt/task (no sim rollout needed):
+  # 1) Fit the PCA basis once per ckpt/task/target (no sim rollout needed):
   python fit_film_pca.py --ckpt /path/to/policy_best.ckpt --task_name sim_transfer_cube_human \\
-    --max_k 64 --output tmp/film_pca/sim_transfer_cube_human.npz
+    --target visual --max_k 64 --output tmp/film_pca/sim_transfer_cube_human_visual.npz
 
-  # 2) Search theta (gamma, beta) in the resulting k-dim bottleneck:
+  # 2) Search theta (gamma, beta) in the resulting k-dim bottleneck (--film_target must match):
   python optimize_film_params.py --ckpt /path/to/policy_best.ckpt --task_name sim_transfer_cube_human \\
-    --film_pca_path tmp/film_pca/sim_transfer_cube_human.npz --film_bottleneck_dim 8 \\
+    --film_pca_path tmp/film_pca/sim_transfer_cube_human_visual.npz --film_bottleneck_dim 8 --film_target visual \\
     --fixed_object_pose "0.1,0.5,0.05,1,0,0,0" --method ars --ars_iters 3 --ars_pairs 2 --output_dir tmp/film_search
 
   python optimize_film_params.py --ckpt ... --film_pca_path ... --film_bottleneck_dim 8 --method cma --cma_maxiter 5 --cma_popsize 8 ...
+
+  # candidate 4 / 5 (fit + search must use the same --target / --film_target):
+  python fit_film_pca.py --ckpt ... --task_name ... --target memory --output tmp/film_pca/..._memory.npz
+  python optimize_film_params.py --ckpt ... --film_pca_path tmp/film_pca/..._memory.npz --film_target memory \\
+    --film_bottleneck_dim 8 --fixed_object_pose "..." --method ars --output_dir tmp/film_search_memory
 """
 from __future__ import annotations
 
@@ -81,6 +92,20 @@ def _parse_latent_z(s: str | None, latent_z_dim: int):
     return torch.tensor(arr, dtype=torch.float32).cuda()
 
 
+_FILM_TARGETS = ("visual", "memory", "hs")
+
+
+def _film_pca_attr(target: str, name: str) -> str:
+    """Maps a FiLM insertion target to its detr_vae.py buffer/policy-kwarg name: "visual" keeps
+    the original unprefixed film_pca_* names (backward compat); "memory"/"hs" (candidates 4/5 —
+    encoder-decoder boundary / pre-action_head) use film_pca_memory_*/film_pca_hs_*. These are
+    also exactly the ACTPolicy.__call__/DETRVAE.forward() kwarg names for "gamma"/"beta"."""
+    if target not in _FILM_TARGETS:
+        raise ValueError(f"Unknown --film_target {target!r}; expected one of {_FILM_TARGETS}")
+    prefix = "film_pca" if target == "visual" else f"film_pca_{target}"
+    return f"{prefix}_{name}"
+
+
 def _load_policy_and_stats(
     ckpt_path: Path,
     stats_path: Path | None,
@@ -100,10 +125,20 @@ def _load_policy_and_stats(
         "model.visual_film_beta",
         # PCA-bottleneck FiLM buffers: absent from any ckpt saved before this feature (and from
         # ckpts saved without --film_pca_path); load_film_pca() populates them post-hoc.
+        # visual / memory (candidate 4, encoder-decoder boundary) / hs (candidate 5,
+        # pre-action_head) — see detr_vae.py's load_film_pca(..., target=...).
         "model.film_pca_W",
         "model.film_pca_mu",
         "model.film_pca_gamma",
         "model.film_pca_beta",
+        "model.film_pca_memory_W",
+        "model.film_pca_memory_mu",
+        "model.film_pca_memory_gamma",
+        "model.film_pca_memory_beta",
+        "model.film_pca_hs_W",
+        "model.film_pca_hs_mu",
+        "model.film_pca_hs_gamma",
+        "model.film_pca_hs_beta",
     }
     missing = set(getattr(loading_status, "missing_keys", []))
     unexpected = set(getattr(loading_status, "unexpected_keys", []))
@@ -116,29 +151,32 @@ def _load_policy_and_stats(
     return policy, stats, str(ckpt_path)
 
 
-def _film_theta_from_policy(policy: ACTPolicy) -> np.ndarray:
-    """theta = [film_pca_gamma, film_pca_beta] (each k-dim) — the only free params under the
-    PCA-bottleneck FiLM mode (see detr_vae.py's load_film_pca()). Requires load_film_pca() to
-    have been called already (film_pca_k > 0)."""
-    if int(policy.model.film_pca_k) <= 0:
-        raise RuntimeError("policy.model has no PCA-bottleneck FiLM basis loaded; call load_film_pca() first")
-    g = policy.model.film_pca_gamma.detach().float().cpu().numpy()
-    b = policy.model.film_pca_beta.detach().float().cpu().numpy()
+def _film_theta_from_policy(policy: ACTPolicy, target: str = "visual") -> np.ndarray:
+    """theta = [gamma, beta] (each k-dim) — the only free params under the PCA-bottleneck FiLM
+    mode, for whichever insertion target (see detr_vae.py's load_film_pca(..., target=...)):
+    "visual" (default, before the Transformer encoder), "memory" (candidate 4, encoder-decoder
+    boundary), or "hs" (candidate 5, pre-action_head). Requires load_film_pca() to have been
+    called already for that target (film_pca_{target}_k > 0)."""
+    k_attr, g_attr, b_attr = (_film_pca_attr(target, n) for n in ("k", "gamma", "beta"))
+    if int(getattr(policy.model, k_attr)) <= 0:
+        raise RuntimeError(
+            f"policy.model has no PCA-bottleneck FiLM basis loaded for target={target!r}; "
+            f"call load_film_pca(..., target={target!r}) first"
+        )
+    g = getattr(policy.model, g_attr).detach().float().cpu().numpy()
+    b = getattr(policy.model, b_attr).detach().float().cpu().numpy()
     return np.concatenate([g, b], axis=0)
 
 
-def _apply_film_theta(policy: ACTPolicy, theta: np.ndarray, k: int):
-    g = torch.from_numpy(theta[:k]).to(
-        device=policy.model.film_pca_gamma.device,
-        dtype=policy.model.film_pca_gamma.dtype,
-    )
-    b = torch.from_numpy(theta[k : 2 * k]).to(
-        device=policy.model.film_pca_beta.device,
-        dtype=policy.model.film_pca_beta.dtype,
-    )
+def _apply_film_theta(policy: ACTPolicy, theta: np.ndarray, k: int, target: str = "visual"):
+    g_attr, b_attr = (_film_pca_attr(target, n) for n in ("gamma", "beta"))
+    g_buf = getattr(policy.model, g_attr)
+    b_buf = getattr(policy.model, b_attr)
+    g = torch.from_numpy(theta[:k]).to(device=g_buf.device, dtype=g_buf.dtype)
+    b = torch.from_numpy(theta[k : 2 * k]).to(device=b_buf.device, dtype=b_buf.dtype)
     with torch.no_grad():
-        policy.model.film_pca_gamma.copy_(g)
-        policy.model.film_pca_beta.copy_(b)
+        g_buf.copy_(g)
+        b_buf.copy_(b)
 
 
 def _split_film_theta_batch(theta_batch: np.ndarray, k: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -174,10 +212,16 @@ def rollout_batch_episode_returns(
     round_label: str = "round",
     capture_frames: bool = False,
     video_layout: str = "combined",
+    film_target: str = "visual",
 ) -> np.ndarray | tuple[np.ndarray, list[list[dict]]]:
     """
     Step multiple envs in parallel (one theta each), batch observations per timestep on one GPU.
     Returns episode_return per trajectory (shape: (B,)).
+
+    film_target: which PCA-bottleneck FiLM insertion point `thetas` searches — "visual"
+    (default), "memory" (candidate 4, encoder-decoder boundary), or "hs" (candidate 5,
+    pre-action_head). Must match whatever load_film_pca(..., target=film_target) installed on
+    `policy.model` beforehand; see _film_pca_attr().
 
     If video_dir is not None, records video(s) per env to video_dir / f"{round_label}_env{i}.mp4".
     video_layout="combined" (default) writes one side-by-side mp4; "separate" writes one mp4
@@ -193,8 +237,10 @@ def rollout_batch_episode_returns(
     if thetas.shape[0] != B:
         raise ValueError(f"thetas batch {thetas.shape[0]} != envs {B}")
 
-    k = int(policy.model.film_pca_k)
-    film_pca_gamma, film_pca_beta = _split_film_theta_batch(thetas, k)
+    k_attr, g_attr, b_attr = (_film_pca_attr(film_target, n) for n in ("k", "gamma", "beta"))
+    k = int(getattr(policy.model, k_attr))
+    film_gamma_t, film_beta_t = _split_film_theta_batch(thetas, k)
+    film_theta_kwargs = {g_attr: film_gamma_t, b_attr: film_beta_t}
 
     # reset all envs with fixed object pose
     from imitate_episodes import apply_object_pose_for_reset, overwrite_sim_qpos_from_dataset, sample_dataset_start_qpos
@@ -273,8 +319,7 @@ def rollout_batch_episode_returns(
                     qpos_t,
                     img_t,
                     latent_z_sample=latent_z,
-                    film_pca_gamma=film_pca_gamma,
-                    film_pca_beta=film_pca_beta,
+                    **film_theta_kwargs,
                 )
 
             if temporal_agg:
@@ -1343,7 +1388,8 @@ def main():
         "--film_pca_path",
         type=str,
         required=True,
-        help="Path to a fit_film_pca.py .npz output (W, mu, explained_variance_ratio, meta)",
+        help="Path to a fit_film_pca.py .npz output (W, mu, explained_variance_ratio, meta). "
+        "Must have been fit with --target matching --film_target below.",
     )
     p.add_argument(
         "--film_bottleneck_dim",
@@ -1351,6 +1397,16 @@ def main():
         required=True,
         help="k: PCA-bottleneck FiLM dim to search (theta = [gamma, beta], each k-dim). "
         "Must be <= max_k stored in --film_pca_path; W is sliced to W[:, :k]",
+    )
+    p.add_argument(
+        "--film_target",
+        type=str,
+        choices=_FILM_TARGETS,
+        default="visual",
+        help="Which encoder-FiLM-decoder insertion point to search: 'visual' (default, before "
+        "the Transformer encoder), 'memory' (candidate 4: encoder-decoder boundary), or 'hs' "
+        "(candidate 5: pre-action_head, after the decoder). See detr_vae.py's "
+        "load_film_pca(..., target=...).",
     )
     # LLM optimizer
     p.add_argument("--llm_model", type=str, default="llama4-scout-17b", help="LLM model name")
@@ -1462,9 +1518,13 @@ def main():
     policy.model.load_film_pca(
         torch.from_numpy(np.ascontiguousarray(pca_W_full[:, :k])).float(),
         torch.from_numpy(np.ascontiguousarray(pca_mu)).float(),
+        target=args.film_target,
     )
     film_dim = 2 * k
-    print(f"Loaded {ckpt_loaded}, PCA-bottleneck FiLM: k={k} (max_k={max_k} in {film_pca_path}), film_dim={film_dim}")
+    print(
+        f"Loaded {ckpt_loaded}, PCA-bottleneck FiLM target={args.film_target}: k={k} "
+        f"(max_k={max_k} in {film_pca_path}), film_dim={film_dim}"
+    )
 
     latent_z = _parse_latent_z(args.latent_z_sample, args.latent_z_dim)
 
@@ -1525,9 +1585,10 @@ def main():
             round_label=f"round_{round_idx:04d}",
             capture_frames=capture_frames,
             video_layout=args.video_layout,
+            film_target=args.film_target,
         )
 
-    theta_base = _film_theta_from_policy(policy).astype(np.float64, copy=False)
+    theta_base = _film_theta_from_policy(policy, target=args.film_target).astype(np.float64, copy=False)
 
     def fitness_batch(theta_batch: np.ndarray) -> np.ndarray:
         return eval_theta_batch(theta_batch)
@@ -1546,6 +1607,7 @@ def main():
         "ckpt": ckpt_loaded,
         "task_name": task_name,
         "method": args.method,
+        "film_target": args.film_target,
         "film_pca_path": str(film_pca_path),
         "film_bottleneck_dim": k,
         "film_pca_max_k": max_k,
@@ -1683,12 +1745,17 @@ def main():
 
     best_theta = np.asarray(best_x, dtype=np.float64)
 
-    _apply_film_theta(policy, best_theta, k)
+    _apply_film_theta(policy, best_theta, k, target=args.film_target)
+    W_attr, mu_attr, g_attr, b_attr = (_film_pca_attr(args.film_target, n) for n in ("W", "mu", "gamma", "beta"))
     film_ckpt = {
-        "film_pca_W": policy.model.film_pca_W.cpu(),
-        "film_pca_mu": policy.model.film_pca_mu.cpu(),
-        "film_pca_gamma": policy.model.film_pca_gamma.cpu(),
-        "film_pca_beta": policy.model.film_pca_beta.cpu(),
+        "film_target": args.film_target,
+        # Saved under fixed (unprefixed) keys regardless of film_target, for a stable
+        # best_film_only.pt schema across targets — "film_target" above says which
+        # detr_vae.py insertion point (load_film_pca(..., target=...)) these belong to.
+        "film_pca_W": getattr(policy.model, W_attr).cpu(),
+        "film_pca_mu": getattr(policy.model, mu_attr).cpu(),
+        "film_pca_gamma": getattr(policy.model, g_attr).cpu(),
+        "film_pca_beta": getattr(policy.model, b_attr).cpu(),
         "best_theta": torch.from_numpy(best_theta.astype(np.float32)),
         "film_bottleneck_dim": k,
     }

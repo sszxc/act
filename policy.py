@@ -26,6 +26,10 @@ class ACTPolicy(nn.Module):
         film_beta=None,
         film_pca_gamma=None,
         film_pca_beta=None,
+        film_pca_memory_gamma=None,
+        film_pca_memory_beta=None,
+        film_pca_hs_gamma=None,
+        film_pca_hs_beta=None,
     ):
         env_state = None
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -45,6 +49,10 @@ class ACTPolicy(nn.Module):
                 film_beta=film_beta,
                 film_pca_gamma=film_pca_gamma,
                 film_pca_beta=film_pca_beta,
+                film_pca_memory_gamma=film_pca_memory_gamma,
+                film_pca_memory_beta=film_pca_memory_beta,
+                film_pca_hs_gamma=film_pca_hs_gamma,
+                film_pca_hs_beta=film_pca_hs_beta,
             )
             total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
             loss_dict = dict()
@@ -64,6 +72,10 @@ class ACTPolicy(nn.Module):
                 film_beta=film_beta,
                 film_pca_gamma=film_pca_gamma,
                 film_pca_beta=film_pca_beta,
+                film_pca_memory_gamma=film_pca_memory_gamma,
+                film_pca_memory_beta=film_pca_memory_beta,
+                film_pca_hs_gamma=film_pca_hs_gamma,
+                film_pca_hs_beta=film_pca_hs_beta,
             ) # no action, sample from prior
             return a_hat
 

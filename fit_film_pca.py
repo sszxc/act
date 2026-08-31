@@ -1,26 +1,37 @@
 #!/usr/bin/env python3
 """
-Offline PCA fit for the PCA-bottleneck FiLM mode (see detr_vae.py's film_pca_* buffers and
-optimize_film_params.py --film_pca_path / --film_bottleneck_dim).
+Offline PCA fit for the PCA-bottleneck FiLM mode (see detr_vae.py's film_pca_*/film_pca_memory_*
+/film_pca_hs_* buffers and optimize_film_params.py --film_pca_path/--film_bottleneck_dim
+/--film_target).
 
-Hooks policy.model.input_proj to record the pre-FiLM visual feature map (backbone + input_proj
-output, before the elementwise gamma/beta applied at detr_vae.py's `src = src * gamma + beta`),
-sampled pixel-by-pixel (NOT spatially pooled — FiLM is applied at every spatial location, so the
-PCA basis should be fit on that same per-location distribution) from demonstration images (HDF5
-episodes already used for training), pooled across all cameras (FiLM is shared across cams in
-this architecture, so a single basis is fit over their union rather than one basis per camera).
+--target selects which encoder-FiLM-decoder insertion point to fit a basis for:
+  - "visual" (default): hooks policy.model.input_proj to record the pre-FiLM visual feature map
+    (backbone + input_proj output, before `src = src * gamma + beta`), sampled pixel-by-pixel
+    (NOT spatially pooled — FiLM is applied at every spatial location, so the PCA basis should be
+    fit on that same per-location distribution), pooled across all cameras (FiLM is shared across
+    cams, so a single basis is fit over their union rather than one basis per camera).
+  - "memory" (candidate 4): hooks the Transformer decoder's input to record its `memory` arg
+    (the encoder's output, right at the encoder-decoder boundary), sampled per sequence position.
+  - "hs" (candidate 5): hooks action_head's input to record the decoder's output (pre-readout),
+    sampled per query index.
+"memory"/"hs" need a full `policy(qpos, image)` forward pass (qpos, latent z, full Transformer),
+unlike "visual" which only needs the backbone+input_proj — still no sim rollout, just recorded
+demo qpos/images run through the model in inference mode.
 
 Fits PCA up to --max_k components and saves W (hidden_dim, max_k), mu (hidden_dim,), and metadata
-to a single .npz artifact. optimize_film_params.py --film_pca_path/--film_bottleneck_dim slices
-W[:, :k] from this file at search time — no need to re-run this script just to change k, only
-when the ckpt/task (i.e. the activation distribution) changes.
-
-No sim rollout needed — this only runs the vision backbone forward on recorded demo frames.
+to a single .npz artifact. optimize_film_params.py --film_pca_path/--film_bottleneck_dim/
+--film_target slices W[:, :k] from this file at search time (--film_target must match the
+--target this was fit with) — no need to re-run this script just to change k, only when the
+ckpt/task (i.e. the activation distribution) or --target changes.
 
 Example:
   python fit_film_pca.py --ckpt results/sim_transfer_cube_scripted/policy_best.ckpt \\
     --task_name sim_transfer_cube_scripted --num_episodes 20 --frames_per_episode 30 \\
     --points_per_frame 16 --max_k 64 --output tmp/film_pca/sim_transfer_cube_scripted.npz
+
+  # candidate 4 (memory) / candidate 5 (hs):
+  python fit_film_pca.py --ckpt ... --task_name ... --target memory --output tmp/film_pca/..._memory.npz
+  python fit_film_pca.py --ckpt ... --task_name ... --target hs --output tmp/film_pca/..._hs.npz
 """
 from __future__ import annotations
 
@@ -38,7 +49,7 @@ import torchvision.transforms as transforms
 from sklearn.decomposition import PCA
 
 from constants import SIM_TASK_CONFIGS, DEFAULT_STATE_DIM
-from optimize_film_params import _load_policy_and_stats
+from optimize_film_params import _load_policy_and_stats, _FILM_TARGETS
 
 
 def _collect_activations(
@@ -105,12 +116,108 @@ def _collect_activations(
     return np.concatenate(chunks, axis=0)
 
 
+def _collect_activations_transformer(
+    policy,
+    dataset_dir: str,
+    camera_names: list[str],
+    state_dim: int,
+    qpos_mean: np.ndarray,
+    qpos_std: np.ndarray,
+    episode_ids: list[int],
+    frames_per_episode: int,
+    points_per_frame: int,
+    rng: np.random.Generator,
+    target: str,
+    *,
+    show_progress: bool = False,
+) -> np.ndarray:
+    """Per-token samples of the "memory" (Transformer encoder output, between encoder and
+    decoder — candidate 4) or "hs" (Transformer decoder output, pre-action_head — candidate 5)
+    activation, pooled across episodes/timesteps into one (N, hidden_dim) array.
+
+    Unlike the "visual" target (which only needs backbone+input_proj, see
+    _collect_activations()), memory/hs depend on the full forward pass (qpos, latent z,
+    Transformer encoder+decoder), so a full `policy(qpos, image)` inference call is hooked
+    instead — still no sim rollout needed, just recorded demo qpos/images run through the model.
+    latent_z_sample is left at its default (None -> zeros), matching optimize_film_params.py's
+    default rollout behavior. Points are sampled across the token axis (sequence position for
+    "memory", query index for "hs") the same way _collect_activations() samples pixel locations.
+    """
+    assert target in ("memory", "hs")
+    captured: dict[str, torch.Tensor] = {}
+
+    if target == "memory":
+        def _hook(module, inp, out):
+            captured["feat"] = inp[1].detach()  # decoder.forward(tgt, memory, ...) -> (S,B,C)
+
+        handle = policy.model.transformer.decoder.register_forward_hook(_hook)
+    else:
+        def _hook(module, inp, out):
+            captured["feat"] = inp[0].detach()  # action_head(hs) -> (B,Q,C)
+
+        handle = policy.model.action_head.register_forward_hook(_hook)
+
+    chunks: list[np.ndarray] = []
+    try:
+        with torch.inference_mode():
+            it = episode_ids
+            if show_progress:
+                try:
+                    from tqdm import tqdm  # type: ignore
+
+                    it = tqdm(episode_ids, desc="episodes")
+                except Exception:
+                    pass
+            for ep_id in it:
+                path = Path(dataset_dir) / f"episode_{ep_id}.hdf5"
+                with h5py.File(path, "r") as root:
+                    episode_len = int(root["/action"].shape[0])
+                    n_frames = min(frames_per_episode, episode_len)
+                    ts_choices = rng.choice(episode_len, size=n_frames, replace=False)
+                    for t in ts_choices:
+                        cams = []
+                        for cam in camera_names:
+                            im = root[f"/observations/images/{cam}"][int(t)]  # H,W,C uint8
+                            im = np.transpose(im, (2, 0, 1)).astype(np.float32) / 255.0
+                            cams.append(im)
+                        # (1, num_cam, 3, H, W), 0..1 — ACTPolicy.__call__ applies ImageNet
+                        # normalization internally, so unlike _collect_activations() above
+                        # (which calls the backbone directly, bypassing ACTPolicy) do NOT
+                        # normalize here too.
+                        img = torch.from_numpy(np.stack(cams, axis=0)).float().cuda().unsqueeze(0)
+
+                        qpos_np = np.asarray(root["/observations/qpos"][int(t)], dtype=np.float32)[:state_dim]
+                        qpos_np = (qpos_np - qpos_mean) / qpos_std  # same preprocessing as rollouts
+                        qpos = torch.from_numpy(qpos_np.astype(np.float32)).float().cuda().unsqueeze(0)
+
+                        policy(qpos, img)  # populates captured["feat"] via the hook
+                        feat = captured["feat"][:, 0] if target == "memory" else captured["feat"][0]
+                        # memory: (S,B,C) -> (S,C) @ batch 0; hs: (B,Q,C) -> (Q,C) @ batch 0
+                        N, C = feat.shape
+                        n_pts = min(points_per_frame, N)
+                        idx = rng.choice(N, size=n_pts, replace=False)
+                        chunks.append(feat[idx].float().cpu().numpy())
+    finally:
+        handle.remove()
+    return np.concatenate(chunks, axis=0)
+
+
 def main():
     p = argparse.ArgumentParser(description="Offline PCA fit for the PCA-bottleneck FiLM mode")
     p.add_argument("--ckpt", type=str, required=True, help="path to policy .ckpt")
     p.add_argument("--stats_path", type=str, default=None, help="dataset_stats.pkl; defaults next to ckpt")
     p.add_argument("--task_name", type=str, required=True, help="task name in SIM_TASK_CONFIGS")
     p.add_argument("--output", type=str, required=True, help="output .npz path")
+    p.add_argument(
+        "--target",
+        type=str,
+        choices=_FILM_TARGETS,
+        default="visual",
+        help="Which encoder-FiLM-decoder insertion point to fit PCA for: 'visual' (default, "
+        "pre-Transformer-encoder), 'memory' (candidate 4: encoder-decoder boundary), or 'hs' "
+        "(candidate 5: pre-action_head). Must match --film_target when this .npz is later used "
+        "with optimize_film_params.py.",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--num_episodes", type=int, default=20, help="how many demo episodes to sample from")
     p.add_argument("--frames_per_episode", type=int, default=30, help="random timesteps sampled per episode")
@@ -166,7 +273,7 @@ def main():
         "state_dim": task_cfg.get("state_dim", DEFAULT_STATE_DIM),
         "action_dim": task_cfg.get("action_dim", task_cfg.get("state_dim", DEFAULT_STATE_DIM)),
     }
-    policy, _stats, ckpt_loaded = _load_policy_and_stats(
+    policy, stats, ckpt_loaded = _load_policy_and_stats(
         Path(args.ckpt),
         Path(args.stats_path) if args.stats_path else None,
         args.policy_class,
@@ -174,6 +281,7 @@ def main():
     )
 
     hidden_dim = int(policy.model.visual_film_gamma.numel())
+    state_dim = policy_config["state_dim"]
 
     n_available = task_cfg.get("num_episodes")
     if n_available is None:
@@ -184,19 +292,36 @@ def main():
 
     print(
         f"Sampling {n_episodes}/{n_available} episodes x up to {args.frames_per_episode} frames x "
-        f"{args.points_per_frame} points x {len(camera_names)} camera(s) from {dataset_dir}"
+        f"{args.points_per_frame} points x {len(camera_names)} camera(s) from {dataset_dir} "
+        f"(target={args.target})"
     )
     t0 = time.perf_counter()
-    X = _collect_activations(
-        policy,
-        dataset_dir,
-        camera_names,
-        episode_ids,
-        args.frames_per_episode,
-        args.points_per_frame,
-        rng,
-        show_progress=args.show_progress,
-    )
+    if args.target == "visual":
+        X = _collect_activations(
+            policy,
+            dataset_dir,
+            camera_names,
+            episode_ids,
+            args.frames_per_episode,
+            args.points_per_frame,
+            rng,
+            show_progress=args.show_progress,
+        )
+    else:
+        X = _collect_activations_transformer(
+            policy,
+            dataset_dir,
+            camera_names,
+            state_dim,
+            np.asarray(stats["qpos_mean"], dtype=np.float32),
+            np.asarray(stats["qpos_std"], dtype=np.float32),
+            episode_ids,
+            args.frames_per_episode,
+            args.points_per_frame,
+            rng,
+            args.target,
+            show_progress=args.show_progress,
+        )
     dt = time.perf_counter() - t0
     print(f"Collected {X.shape[0]} samples of dim {X.shape[1]} in {dt:.1f}s")
     if not np.all(np.isfinite(X)):
@@ -228,6 +353,7 @@ def main():
 
     meta = {
         "ckpt": ckpt_loaded,
+        "target": args.target,
         "task_name": task_name,
         "dataset_dir": dataset_dir,
         "camera_names": camera_names,
