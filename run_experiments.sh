@@ -26,7 +26,8 @@ PY=/home/lab/miniforge3/envs/aloha/bin/python
 # 格式："名字|重复次数|完整命令"
 EXPERIMENTS=(
   # qwen-vl vlm 优化，重复 5 次
-  "qwen3-vl-32b-thinking|5|$PY optimize_film_params.py --ckpt results/sim_hmf_proto5_pick_allgood/policy_best.ckpt --task_name sim_hmf_proto5_pick_eval --film_pca_path tmp/film_pca/sim_hmf_proto5_pick_allgood_hs.npz --film_target hs --film_bottleneck_dim 8 --fixed_object_pose 0.1,0.65,0.685 --temporal_agg --method llm --llm_prompt_template prompts/num_optim_Pratyush_vlm.py --llm_maxiter 50 --save_videos --llm_model qwen3-vl-32b-thinking"
+  # "qwen3-vl-32b-thinking|5|$PY optimize_film_params.py --ckpt results/sim_hmf_proto5_pick_allgood/policy_best.ckpt --task_name sim_hmf_proto5_pick_eval --film_pca_path tmp/film_pca/sim_hmf_proto5_pick_allgood.npz --film_bottleneck_dim 8 --fixed_object_pose 0.1,0.65,0.685 --temporal_agg --method llm --llm_prompt_template prompts/num_optim_Pratyush_vlm.py --llm_maxiter 50 --save_videos --llm_model qwen3-vl-32b-thinking"
+  # "qwen3-vl-32b-thinking|5|$PY optimize_film_params.py --ckpt results/sim_hmf_proto5_pick_allgood/policy_best.ckpt --task_name sim_hmf_proto5_pick_eval --film_pca_path tmp/film_pca/sim_hmf_proto5_pick_allgood_hs.npz --film_target hs --film_bottleneck_dim 8 --fixed_object_pose 0.1,0.65,0.685 --temporal_agg --method llm --llm_prompt_template prompts/num_optim_Pratyush_vlm.py --llm_maxiter 50 --save_videos --llm_model qwen3-vl-32b-thinking"
   
   # --film_target memory / hs
 
@@ -34,6 +35,7 @@ EXPERIMENTS=(
   # "qwen36-27b|5|$PY optimize_film_params.py   --ckpt results/sim_hmf_proto5_pick_allgood/policy_best.ckpt   --task_name sim_hmf_proto5_pick_eval   --film_pca_path tmp/film_pca/sim_hmf_proto5_pick_allgood.npz --film_bottleneck_dim 8   --fixed_object_pose "0.1,0.65,0.66,0.1,0.65,0.8"  --temporal_agg  --method llm --llm_model qwen36-27b --llm_maxiter  50 --save_videos"
   
   # CMA-ES 优化，重复 5 次
+  "cma-sigma1.0|5|$PY optimize_film_params.py --ckpt results/sim_hmf_proto5_pick_allgood/policy_best.ckpt --task_name sim_hmf_proto5_pick_eval --film_pca_path tmp/film_pca/sim_hmf_proto5_pick_allgood.npz --film_bottleneck_dim 8 --fixed_object_pose 0.1,0.65,0.685 --temporal_agg --method cma --cma_sigma0 1.0 --cma_maxiter 50 --save_videos"
   # "cma-sigma1.0|5|$PY optimize_film_params.py --ckpt results/sim_hmf_proto5_pick_allgood/policy_best.ckpt --task_name sim_hmf_proto5_pick_eval --film_pca_path tmp/film_pca/sim_hmf_proto5_pick_allgood_hs.npz --film_target hs --film_bottleneck_dim 8 --fixed_object_pose 0.1,0.65,0.685 --temporal_agg --method cma --cma_sigma0 1.0 --cma_maxiter 50 --save_videos"
 )
 
