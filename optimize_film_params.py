@@ -980,9 +980,15 @@ def _sample_unseen_params(rng: np.random.Generator, rank: int, seen: set[tuple[f
 def _init_openai_compatible_client(base_url: str, api_key: str):
     try:
         from openai import OpenAI
+        import httpx
     except Exception as e:  # pragma: no cover
         raise RuntimeError("Please install openai package for --method llm: `pip install openai`") from e
-    return OpenAI(base_url=base_url, api_key=api_key)
+    # Library default read timeout is 600s; a stuck-but-connected SOL request can silently
+    # block that long per attempt. 300s still gives "thinking" models room to generate while
+    # failing a truly hung request in reasonable time. connect stays short (5s) so a fully-down
+    # endpoint fails fast.
+    timeout = httpx.Timeout(300.0, connect=5.0)
+    return OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
 
 
 def _maybe_load_dotenv():
@@ -1190,6 +1196,15 @@ def run_llm(
                 saw_parseable_vector = False
                 attempt_responses: list[str] = []
                 for retry in range(n_tries):
+                    if retry > 0:
+                        # Backoff before re-hitting SOL after any failed attempt (error, parse
+                        # failure, or duplicate) — the openai SDK already backs off *within* one
+                        # call's internal retries, but nothing previously paced *these* app-level
+                        # retries, so a down/rate-limited endpoint got hit back-to-back.
+                        # 10s, 20s, 40s, 80s, 160s, then plateaus (cap = 5th doubling).
+                        backoff_s = min(10.0 * 2.0 ** (retry - 1), 160.0)
+                        print(f"[LLM] iter {it}: previous attempt failed, backing off {backoff_s:.0f}s before retry {retry}")
+                        time.sleep(backoff_s)
                     # Retries reuse the exact same prompt, so at low temperature the model tends
                     # to just repeat its previous (already-seen) answer, or the same truncated-
                     # empty response, verbatim — bumping temperature per retry gives it a real
