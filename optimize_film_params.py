@@ -44,6 +44,7 @@ import json
 import os
 import pickle
 import re
+import shlex
 import shutil
 import sys
 import time
@@ -1558,6 +1559,8 @@ def main():
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "command.txt", "w", encoding="utf-8") as f:
+        f.write("python " + " ".join(shlex.quote(a) for a in sys.argv) + "\n")
     video_dir = out_dir / "videos" if args.save_videos else None
     if video_dir is not None:
         video_dir.mkdir(parents=True, exist_ok=True)
