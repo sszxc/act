@@ -62,7 +62,7 @@ from constants import DT, SIM_TASK_CONFIGS, DEFAULT_STATE_DIM
 from policy import ACTPolicy
 from imitate_episodes import make_policy, set_seed
 from sim_env import make_sim_env
-from visualize_episodes import save_videos
+from visualize_episodes import save_videos, _video_path_for_cam
 
 
 def _progress(seq, *, enabled: bool, desc: str, total: int | None = None):
@@ -1073,27 +1073,35 @@ def _encode_image_array_to_data_uri(img: np.ndarray, quality: int = 90) -> str:
 
 
 def _score_video_with_reward_predictor(
-    video_path: str,
+    video_paths: list[str],
     *,
     instruction: str,
-    camera_label: str,
+    camera_labels: list[str],
     socket_path: str,
     timeout: float,
     output_dir: Path,
 ) -> dict:
-    """Score one rollout video via the local reward_predictor's IPC bridge: whole-video
-    scoring (runner="main_single", not the process-reward-curve runner), subgoals
-    auto-generated from `instruction` on every call (no `subgoals=` passed). Requires
-    the reward_predictor repo to already be on sys.path (see main()) and its
-    `python -m ipc.server` running with OPENAI_API_KEY sourced (for subgoal
+    """Score one rollout's synchronized per-camera videos via the local reward_predictor's
+    IPC bridge: whole-video scoring (runner="main_single", not the process-reward-curve
+    runner), subgoals auto-generated from `instruction` on every call (no `subgoals=`
+    passed). Requires the reward_predictor repo to already be on sys.path (see main())
+    and its `python -m ipc.server` running with OPENAI_API_KEY sourced (for subgoal
     generation). Returns {"progress_reward", "success_score", "components"}."""
     from ipc.client import score_trajectory  # local import: only needed for this path
 
+    if len(video_paths) != len(camera_labels):
+        raise ValueError(
+            f"got {len(video_paths)} videos but {len(camera_labels)} camera_labels"
+        )
+    if not 1 <= len(video_paths) <= 5:
+        raise ValueError(f"reward_predictor supports 1-5 synchronized videos, got {len(video_paths)}")
+    video_kwargs = {f"video{i}": p for i, p in enumerate(video_paths, start=1)}
+
     return score_trajectory(
         instruction,
-        video_path,
+        **video_kwargs,
         runner="main_single",
-        camera_labels=[camera_label],
+        camera_labels=camera_labels,
         socket_path=socket_path,
         timeout=timeout,
         output_dir=str(output_dir),
@@ -1173,7 +1181,7 @@ def run_llm(
     vlm_num_frames: int = 5,
     rp_fitness_fn=None,
     rp_instruction: str | None = None,
-    rp_camera_label: str = "combined camera view",
+    rp_camera_labels: list[str] | None = None,
     rp_socket_path: str = "/tmp/reward_predictor_ipc.sock",
     rp_timeout: float = 3600.0,
     rp_output_dir: Path | None = None,
@@ -1188,15 +1196,16 @@ def run_llm(
     (the text history passed in the prompt still spans all iterations; only the image is
     last-round-only).
 
-    rp_fitness_fn: optional Callable[[np.ndarray], tuple[float, str]] — mutually exclusive with
-    vlm_fitness_fn. When given (i.e. the prompt template sets IS_REWARD_PREDICTOR = True, see
+    rp_fitness_fn: optional Callable[[np.ndarray], tuple[float, list[str]]] — mutually exclusive
+    with vlm_fitness_fn. When given (i.e. the prompt template sets IS_REWARD_PREDICTOR = True, see
     prompts/num_optim_Pratyush_reward_predictor.py), it replaces fitness_fn for every rollout, but
     NOT the reward: its own return value (episode_return) is only kept as diagnostic history
     metadata, never used as R(params). Instead, the local reward_predictor (over its IPC bridge,
-    rp_socket_path) scores the returned video against auto-generated subgoals for rp_instruction,
-    and R(params) becomes that call's progress_reward. A text breakdown of the score (success_score
-    + per-subgoal probabilities) is attached to every LLM call from iteration 1 onward
-    (last-round-only, same cadence as vlm_fitness_fn's image).
+    rp_socket_path) scores the returned per-camera videos (one per rp_camera_labels entry, kept
+    separate — never merged into one side-by-side frame) against auto-generated subgoals for
+    rp_instruction, and R(params) becomes that call's progress_reward. A text breakdown of the
+    score (success_score + per-subgoal probabilities) is attached to every LLM call from
+    iteration 1 onward (last-round-only, same cadence as vlm_fitness_fn's image).
     """
     rank = int(np.asarray(x0).size)
     out_dir = log_path.parent
@@ -1362,11 +1371,11 @@ def run_llm(
                 # scoring failure here is fatal to this round (there is no fallback reward to fall
                 # back on) and is intentionally left to propagate to the run's outer except-block,
                 # same as any other fitness-evaluation failure.
-                rollout_return, video_path = rp_fitness_fn(cand)
+                rollout_return, video_paths = rp_fitness_fn(cand)
                 rp_result = _score_video_with_reward_predictor(
-                    video_path,
+                    video_paths,
                     instruction=rp_instruction,
-                    camera_label=rp_camera_label,
+                    camera_labels=rp_camera_labels,
                     socket_path=rp_socket_path,
                     timeout=rp_timeout,
                     output_dir=rp_output_dir / f"round_{it:04d}",
@@ -1577,11 +1586,13 @@ def main():
         "e.g. prompts/num_optim_Pratyush_reward_predictor.py)",
     )
     p.add_argument(
-        "--llm_rp_camera_label",
+        "--llm_rp_camera_labels",
         type=str,
-        default="combined camera view",
-        help="Camera label describing the recorded rollout video, passed as reward_predictor's "
-        "camera_labels (one video, since --video_layout combined is required in this mode)",
+        default=None,
+        help="Comma-separated camera labels, one per task camera name (same order as the task's "
+        "camera_names), describing each recorded rollout video for reward_predictor's "
+        "camera_labels. Reward-predictor mode renders/scores one video per camera (never merged "
+        "side-by-side). Default: the task's own camera_names.",
     )
     p.add_argument(
         "--llm_rp_repo_path",
@@ -1755,11 +1766,15 @@ def main():
 
     rp_video_dir = out_dir / "rp_videos"
 
-    def fitness_and_video(theta: np.ndarray) -> tuple[float, str]:
+    def fitness_and_video(theta: np.ndarray) -> tuple[float, list[str]]:
+        # video_layout is forced to "separate" for reward-predictor mode (see main()), so this
+        # rollout writes one mp4 per camera_names entry; return those paths in that same order.
         theta_batch = np.asarray(theta, dtype=np.float64).reshape(1, -1)
         round_idx = _round_counter["n"]
         rewards = eval_theta_batch(theta_batch, video_dir_override=rp_video_dir)
-        return float(rewards[0]), str(rp_video_dir / f"round_{round_idx:04d}_env0.mp4")
+        base_path = str(rp_video_dir / f"round_{round_idx:04d}_env0.mp4")
+        video_paths = [_video_path_for_cam(base_path, cam) for cam in task_cfg["camera_names"]]
+        return float(rewards[0]), video_paths
 
     opt_x0 = theta_base
 
@@ -1782,6 +1797,7 @@ def main():
     prompt_template_path: Path | None = None
     use_vlm = False
     use_reward_predictor = False
+    rp_camera_labels: list[str] | None = None
     if args.method == "llm":
         prompt_template_path = (
             Path(args.llm_prompt_template).resolve()
@@ -1805,13 +1821,26 @@ def main():
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            if args.video_layout != "combined":
+            if args.video_layout != "separate":
                 print(
-                    "reward-predictor mode requires --video_layout combined "
-                    "(one video per env, matching --llm_rp_camera_label)",
-                    file=sys.stderr,
+                    f"[LLM] reward-predictor mode scores one video per camera (never merged "
+                    f"side-by-side); forcing --video_layout separate (was {args.video_layout!r})"
                 )
-                sys.exit(1)
+                args.video_layout = "separate"
+                if args.save_videos:
+                    meta["video_layout"] = args.video_layout
+            if args.llm_rp_camera_labels:
+                rp_camera_labels = [s.strip() for s in args.llm_rp_camera_labels.split(",")]
+                if len(rp_camera_labels) != len(task_cfg["camera_names"]):
+                    print(
+                        f"--llm_rp_camera_labels must have exactly {len(task_cfg['camera_names'])} "
+                        f"comma-separated labels, one per camera {task_cfg['camera_names']}; "
+                        f"got {len(rp_camera_labels)}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+            else:
+                rp_camera_labels = list(task_cfg["camera_names"])
         meta["llm_model"] = args.llm_model
         meta["llm_maxiter"] = int(args.llm_maxiter)
         meta["llm_temperature"] = float(args.llm_temperature)
@@ -1841,7 +1870,7 @@ def main():
         meta["llm_reward_predictor"] = use_reward_predictor
         if use_reward_predictor:
             meta["llm_rp_instruction"] = args.llm_rp_instruction
-            meta["llm_rp_camera_label"] = args.llm_rp_camera_label
+            meta["llm_rp_camera_labels"] = rp_camera_labels
             meta["llm_rp_socket_path"] = args.llm_rp_socket_path
             sys.path.insert(0, str(Path(args.llm_rp_repo_path).resolve()))
             print(
@@ -1933,7 +1962,7 @@ def main():
             vlm_num_frames=int(args.llm_vlm_num_frames),
             rp_fitness_fn=fitness_and_video if use_reward_predictor else None,
             rp_instruction=args.llm_rp_instruction,
-            rp_camera_label=args.llm_rp_camera_label,
+            rp_camera_labels=rp_camera_labels,
             rp_socket_path=args.llm_rp_socket_path,
             rp_timeout=float(args.llm_rp_timeout),
             rp_output_dir=(out_dir / "rp_feedback") if use_reward_predictor else None,
