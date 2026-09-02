@@ -825,6 +825,7 @@ def _save_curve_png(
     y2: np.ndarray | None,
     y2_label: str | None,
     elapsed_sec: float | None = None,
+    ylabel: str = "episode_return",
 ):
     if len(y1) == 0:
         print(f"[plot] skipping {path.name}: no completed rounds to plot")
@@ -840,7 +841,7 @@ def _save_curve_png(
     if y2 is not None:
         ax.plot(np.arange(len(y2)), y2, alpha=0.6, label=y2_label or "iter/gen max")
     ax.set_xlabel("iteration / generation")
-    ax.set_ylabel("episode_return")
+    ax.set_ylabel(ylabel)
     ax.legend()
     ax.grid(True, alpha=0.3)
     if elapsed_sec is not None:
@@ -868,13 +869,14 @@ def _save_progress_checkpoint(
     y2: np.ndarray | None,
     y2_label: str | None,
     elapsed_sec: float,
+    ylabel: str = "episode_return",
 ) -> None:
     """Persist the optimizer's progress so far (curves .npz + reward_curve.png), overwriting the
     previous snapshot in place. Called after every completed iteration/generation (not just at the
     end or on interrupt) so a run killed mid-flight still leaves usable, up-to-date results on
     disk, and so the plot is viewable while the run is still going."""
     np.savez(out_dir / npz_name, **npz_arrays)
-    _save_curve_png(out_dir / "reward_curve.png", y1, y1_label, y2, y2_label, elapsed_sec=elapsed_sec)
+    _save_curve_png(out_dir / "reward_curve.png", y1, y1_label, y2, y2_label, elapsed_sec=elapsed_sec, ylabel=ylabel)
 
 
 def _load_num_optim_prompt_template(path: Path) -> str:
@@ -896,6 +898,18 @@ def _prompt_template_is_vlm(path: Path) -> bool:
     except OSError:
         return False
     return bool(re.search(r"^\s*IS_VLM\s*=\s*True\s*$", text, flags=re.M))
+
+
+def _prompt_template_uses_reward_predictor(path: Path) -> bool:
+    """True if the prompt template file declares `IS_REWARD_PREDICTOR = True` (see
+    prompts/num_optim_Pratyush_reward_predictor.py), i.e. it expects the local
+    reward_predictor's text feedback (over its IPC bridge) on every LLM call from
+    iteration 1 onward, in addition to the text history."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return bool(re.search(r"^\s*IS_REWARD_PREDICTOR\s*=\s*True\s*$", text, flags=re.M))
 
 
 def _format_history_text_for_prompt(history: list[dict], rank: int) -> str:
@@ -920,8 +934,11 @@ def _render_num_optim_prompt(
     episode_num: int,
     total_episodes: int,
     history_text: str,
+    reward_predictor_text: str = "",
 ) -> str:
-    """Fill placeholders for prompts/num_optim_Pratyush.py-style templates (no Jinja)."""
+    """Fill placeholders for prompts/num_optim_Pratyush.py-style templates (no Jinja).
+    `reward_predictor_text` fills {{ reward_predictor_text }}, used only by
+    prompts/num_optim_Pratyush_reward_predictor.py-style templates (no-op otherwise)."""
     rendered = template
     rendered = rendered.replace("{{ rank - 1 }}", str(rank - 1))
     rendered = rendered.replace("{{ rank }}", str(rank))
@@ -937,6 +954,7 @@ def _render_num_optim_prompt(
     rendered = re.sub(r"\{\{\s*episode_num\s*\}\}", str(int(episode_num)), rendered)
     rendered = re.sub(r"\{\{\s*total_episodes\s*\}\}", str(int(total_episodes)), rendered)
     rendered = re.sub(r"\{\{\s*history_text\s*\}\}", history_text, rendered)
+    rendered = re.sub(r"\{\{\s*reward_predictor_text\s*\}\}", reward_predictor_text, rendered)
 
     rendered = re.sub(r"<start_of_turn>.*$", "", rendered, flags=re.M).strip()
     return rendered
@@ -1054,6 +1072,43 @@ def _encode_image_array_to_data_uri(img: np.ndarray, quality: int = 90) -> str:
     return f"data:image/jpeg;base64,{b64}"
 
 
+def _score_video_with_reward_predictor(
+    video_path: str,
+    *,
+    instruction: str,
+    camera_label: str,
+    socket_path: str,
+    timeout: float,
+    output_dir: Path,
+) -> dict:
+    """Score one rollout video via the local reward_predictor's IPC bridge: whole-video
+    scoring (runner="main_single", not the process-reward-curve runner), subgoals
+    auto-generated from `instruction` on every call (no `subgoals=` passed). Requires
+    the reward_predictor repo to already be on sys.path (see main()) and its
+    `python -m ipc.server` running with OPENAI_API_KEY sourced (for subgoal
+    generation). Returns {"progress_reward", "success_score", "components"}."""
+    from ipc.client import score_trajectory  # local import: only needed for this path
+
+    return score_trajectory(
+        instruction,
+        video_path,
+        runner="main_single",
+        camera_labels=[camera_label],
+        socket_path=socket_path,
+        timeout=timeout,
+        output_dir=str(output_dir),
+    )
+
+
+def _format_reward_predictor_feedback_text(result: dict) -> str:
+    progress = float(result.get("progress_reward", float("nan")))
+    success = float(result.get("success_score", float("nan")))
+    lines = [f"progress_reward: {progress:.3f}, success_score: {success:.3f}"]
+    for name, prob in (result.get("components") or {}).items():
+        lines.append(f"  {name}: {float(prob):.3f}")
+    return "\n".join(lines)
+
+
 def _call_llm_next_params(
     client,
     *,
@@ -1116,6 +1171,12 @@ def run_llm(
     prompt_template_path: Path,
     vlm_fitness_fn=None,
     vlm_num_frames: int = 5,
+    rp_fitness_fn=None,
+    rp_instruction: str | None = None,
+    rp_camera_label: str = "combined camera view",
+    rp_socket_path: str = "/tmp/reward_predictor_ipc.sock",
+    rp_timeout: float = 3600.0,
+    rp_output_dir: Path | None = None,
 ):
     """
     vlm_fitness_fn: optional Callable[[np.ndarray], tuple[float, list[dict]]] — same role as
@@ -1126,6 +1187,16 @@ def run_llm(
     of the most recently evaluated rollout is attached to every LLM call from iteration 1 onward
     (the text history passed in the prompt still spans all iterations; only the image is
     last-round-only).
+
+    rp_fitness_fn: optional Callable[[np.ndarray], tuple[float, str]] — mutually exclusive with
+    vlm_fitness_fn. When given (i.e. the prompt template sets IS_REWARD_PREDICTOR = True, see
+    prompts/num_optim_Pratyush_reward_predictor.py), it replaces fitness_fn for every rollout, but
+    NOT the reward: its own return value (episode_return) is only kept as diagnostic history
+    metadata, never used as R(params). Instead, the local reward_predictor (over its IPC bridge,
+    rp_socket_path) scores the returned video against auto-generated subgoals for rp_instruction,
+    and R(params) becomes that call's progress_reward. A text breakdown of the score (success_score
+    + per-subgoal probabilities) is attached to every LLM call from iteration 1 onward
+    (last-round-only, same cadence as vlm_fitness_fn's image).
     """
     rank = int(np.asarray(x0).size)
     out_dir = log_path.parent
@@ -1159,6 +1230,8 @@ def run_llm(
     best_x = _clip_quantize_params(x0)
     use_vlm = vlm_fitness_fn is not None
     last_vlm_image_uri: str | None = None  # visual feedback from the previous iteration's rollout only
+    use_reward_predictor = rp_fitness_fn is not None
+    last_rp_feedback_text = "No reward-predictor feedback yet (first iteration)."
 
     t_start = time.perf_counter()
     with open(log_path, "w", encoding="utf-8") as flog:
@@ -1175,6 +1248,7 @@ def run_llm(
             t0 = time.perf_counter()
             raw_response = ""
             source = "seed"
+            extra_history_fields: dict = {}
             if it == 0:
                 cand = _clip_quantize_params(x0)
             else:
@@ -1188,6 +1262,7 @@ def run_llm(
                     episode_num=it + 1,
                     total_episodes=maxiter,
                     history_text=history_text,
+                    reward_predictor_text=last_rp_feedback_text,
                 )
                 (prompt_log_dir / f"rendered_prompt_iter_{it:04d}.txt").write_text(prompt, encoding="utf-8")
                 cand = None
@@ -1280,6 +1355,29 @@ def run_llm(
                 except Exception as e:
                     print(f"[LLM] iter {it}: warning: failed to build VLM feedback image: {e}")
                     last_vlm_image_uri = None
+            elif use_reward_predictor:
+                # R(params) is now the reward_predictor's progress_reward, not episode_return — a
+                # rollout still happens (to produce the video) but its own env reward is only kept
+                # as diagnostic history metadata below, never as the optimization objective. A
+                # scoring failure here is fatal to this round (there is no fallback reward to fall
+                # back on) and is intentionally left to propagate to the run's outer except-block,
+                # same as any other fitness-evaluation failure.
+                rollout_return, video_path = rp_fitness_fn(cand)
+                rp_result = _score_video_with_reward_predictor(
+                    video_path,
+                    instruction=rp_instruction,
+                    camera_label=rp_camera_label,
+                    socket_path=rp_socket_path,
+                    timeout=rp_timeout,
+                    output_dir=rp_output_dir / f"round_{it:04d}",
+                )
+                reward = float(rp_result["progress_reward"])
+                extra_history_fields["rollout_episode_return"] = float(rollout_return)
+                extra_history_fields["rp_success_score"] = float(rp_result.get("success_score", float("nan")))
+                last_rp_feedback_text = _format_reward_predictor_feedback_text(rp_result)
+                (prompt_log_dir / f"rp_feedback_round_{it:04d}.json").write_text(
+                    json.dumps(rp_result, indent=2), encoding="utf-8"
+                )
             else:
                 reward = float(fitness_fn(cand))
             seen.add(key)
@@ -1297,6 +1395,7 @@ def run_llm(
                     "source": source,
                     "raw_response": raw_response,
                     "elapsed_sec": round(time.perf_counter() - t_start, 3),
+                    **extra_history_fields,
                 }
             )
             history_best.append(float(best_so_far))
@@ -1314,9 +1413,11 @@ def run_llm(
                 np.array(history_iter_reward),
                 "iter_reward",
                 elapsed_now,
+                ylabel="progress_reward" if use_reward_predictor else "episode_return",
             )
             dt = time.perf_counter() - t0
-            print(f"[LLM] iter {it}: reward={reward:.4f} best_so_far={best_so_far:.4f} source={source} wall={dt:.2f}s")
+            reward_kind = "progress_reward" if use_reward_predictor else "reward"
+            print(f"[LLM] iter {it}: {reward_kind}={reward:.4f} best_so_far={best_so_far:.4f} source={source} wall={dt:.2f}s")
     except (KeyboardInterrupt, Exception) as e:
         interrupted_exc = e
         _handle_optimizer_interrupt("LLM", e, it, len(history_best))
@@ -1467,6 +1568,39 @@ def main():
         "stacked into one composite image (only used when the prompt template sets IS_VLM = True, "
         "e.g. prompts/num_optim_Pratyush_vlm.py)",
     )
+    p.add_argument(
+        "--llm_rp_instruction",
+        type=str,
+        default=None,
+        help="Natural-language task instruction passed to the local reward_predictor for "
+        "subgoal generation (required when the prompt template sets IS_REWARD_PREDICTOR = True, "
+        "e.g. prompts/num_optim_Pratyush_reward_predictor.py)",
+    )
+    p.add_argument(
+        "--llm_rp_camera_label",
+        type=str,
+        default="combined camera view",
+        help="Camera label describing the recorded rollout video, passed as reward_predictor's "
+        "camera_labels (one video, since --video_layout combined is required in this mode)",
+    )
+    p.add_argument(
+        "--llm_rp_repo_path",
+        type=str,
+        default="/home/lab/Documents/reward_predictor",
+        help="Path to the reward_predictor checkout; added to sys.path to import its ipc.client",
+    )
+    p.add_argument(
+        "--llm_rp_socket_path",
+        type=str,
+        default="/tmp/reward_predictor_ipc.sock",
+        help="Unix socket path of a running `python -m ipc.server` in the reward_predictor conda env",
+    )
+    p.add_argument(
+        "--llm_rp_timeout",
+        type=float,
+        default=3600.0,
+        help="Timeout (seconds) per reward_predictor IPC call; the first call also pays for model load",
+    )
 
     args = p.parse_args()
     if args.policy_class != "ACT":
@@ -1581,7 +1715,7 @@ def main():
         video_dir.mkdir(parents=True, exist_ok=True)
     _round_counter = {"n": 0}
 
-    def eval_theta_batch(theta_batch: np.ndarray, capture_frames: bool = False):
+    def eval_theta_batch(theta_batch: np.ndarray, capture_frames: bool = False, video_dir_override: Path | None = None):
         round_idx = _round_counter["n"]
         _round_counter["n"] += 1
         return rollout_batch_episode_returns(
@@ -1599,7 +1733,7 @@ def main():
             num_episodes=task_cfg.get("num_episodes"),
             show_rollout_progress=bool(args.show_rollout_progress),
             rollout_desc=f"sim rollout x{theta_batch.shape[0]}",
-            video_dir=video_dir,
+            video_dir=video_dir_override if video_dir_override is not None else video_dir,
             round_label=f"round_{round_idx:04d}",
             capture_frames=capture_frames,
             video_layout=args.video_layout,
@@ -1618,6 +1752,14 @@ def main():
         theta_batch = np.asarray(theta, dtype=np.float64).reshape(1, -1)
         rewards, image_lists = eval_theta_batch(theta_batch, capture_frames=True)
         return float(rewards[0]), image_lists[0]
+
+    rp_video_dir = out_dir / "rp_videos"
+
+    def fitness_and_video(theta: np.ndarray) -> tuple[float, str]:
+        theta_batch = np.asarray(theta, dtype=np.float64).reshape(1, -1)
+        round_idx = _round_counter["n"]
+        rewards = eval_theta_batch(theta_batch, video_dir_override=rp_video_dir)
+        return float(rewards[0]), str(rp_video_dir / f"round_{round_idx:04d}_env0.mp4")
 
     opt_x0 = theta_base
 
@@ -1639,6 +1781,7 @@ def main():
         meta["video_layout"] = args.video_layout
     prompt_template_path: Path | None = None
     use_vlm = False
+    use_reward_predictor = False
     if args.method == "llm":
         prompt_template_path = (
             Path(args.llm_prompt_template).resolve()
@@ -1646,6 +1789,29 @@ def main():
             else (Path(__file__).resolve().parent / "prompts" / "num_optim_Pratyush.py")
         )
         use_vlm = _prompt_template_is_vlm(prompt_template_path)
+        use_reward_predictor = _prompt_template_uses_reward_predictor(prompt_template_path)
+        if use_vlm and use_reward_predictor:
+            print(
+                f"{prompt_template_path} sets both IS_VLM and IS_REWARD_PREDICTOR; "
+                "these video-feedback modes are mutually exclusive",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if use_reward_predictor:
+            if not args.llm_rp_instruction:
+                print(
+                    "--llm_rp_instruction is required when the prompt template sets "
+                    "IS_REWARD_PREDICTOR = True",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if args.video_layout != "combined":
+                print(
+                    "reward-predictor mode requires --video_layout combined "
+                    "(one video per env, matching --llm_rp_camera_label)",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
         meta["llm_model"] = args.llm_model
         meta["llm_maxiter"] = int(args.llm_maxiter)
         meta["llm_temperature"] = float(args.llm_temperature)
@@ -1654,8 +1820,11 @@ def main():
         meta["llm_retry_temperature_bump"] = float(args.llm_retry_temperature_bump)
         meta["llm_history_window"] = int(args.llm_history_window)
         meta["llm_step_size_hint"] = float(args.llm_step_size_hint)
+        # Under reward-predictor mode R(params) is progress_reward in [0, 1] (env_max_reward is on
+        # the unrelated episode_return scale and would be a misleading default hint there).
+        default_llm_optimum_hint = 1.0 if use_reward_predictor else float(env_max_reward)
         meta["llm_optimum_hint"] = (
-            float(args.llm_optimum_hint) if args.llm_optimum_hint is not None else float(env_max_reward)
+            float(args.llm_optimum_hint) if args.llm_optimum_hint is not None else default_llm_optimum_hint
         )
         meta["llm_param_clip"] = [-6.0, 6.0]
         meta["llm_param_decimals"] = 1
@@ -1668,6 +1837,20 @@ def main():
                 f"[LLM] VLM prompt detected ({prompt_template_path.name}); attaching a "
                 f"{args.llm_vlm_num_frames}-frame visual feedback image (previous round only) "
                 "from iteration 1 onward. Make sure --llm_model points at a vision-capable model."
+            )
+        meta["llm_reward_predictor"] = use_reward_predictor
+        if use_reward_predictor:
+            meta["llm_rp_instruction"] = args.llm_rp_instruction
+            meta["llm_rp_camera_label"] = args.llm_rp_camera_label
+            meta["llm_rp_socket_path"] = args.llm_rp_socket_path
+            sys.path.insert(0, str(Path(args.llm_rp_repo_path).resolve()))
+            print(
+                f"[LLM] reward-predictor prompt detected ({prompt_template_path.name}); scoring each "
+                f"round's rollout video via the local reward_predictor IPC bridge "
+                f"({args.llm_rp_socket_path}) with auto-generated subgoals for "
+                f"instruction={args.llm_rp_instruction!r} from iteration 1 onward. Make sure "
+                "`python -m ipc.server` is running in the reward_predictor conda env (with "
+                "OPENAI_API_KEY sourced for subgoal generation)."
             )
     with open(out_dir / "run_meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -1730,7 +1913,7 @@ def main():
         if int(args.parallel) > 1:
             print("Warning: --method llm currently evaluates one candidate per iteration; extra parallel envs stay idle.")
         assert prompt_template_path is not None
-        optimum_hint = float(args.llm_optimum_hint) if args.llm_optimum_hint is not None else float(env_max_reward)
+        optimum_hint = float(args.llm_optimum_hint) if args.llm_optimum_hint is not None else default_llm_optimum_hint
         best_x, h_best, h_iter, interrupted_exc, elapsed_sec = run_llm(
             fitness,
             opt_x0,
@@ -1748,9 +1931,23 @@ def main():
             prompt_template_path=prompt_template_path,
             vlm_fitness_fn=fitness_and_frames if use_vlm else None,
             vlm_num_frames=int(args.llm_vlm_num_frames),
+            rp_fitness_fn=fitness_and_video if use_reward_predictor else None,
+            rp_instruction=args.llm_rp_instruction,
+            rp_camera_label=args.llm_rp_camera_label,
+            rp_socket_path=args.llm_rp_socket_path,
+            rp_timeout=float(args.llm_rp_timeout),
+            rp_output_dir=(out_dir / "rp_feedback") if use_reward_predictor else None,
         )
         np.savez(out_dir / "llm_curves.npz", best_so_far=h_best, iter_reward=h_iter)
-        _save_curve_png(out_dir / "reward_curve.png", h_best, "best_so_far", h_iter, "iter_reward", elapsed_sec=elapsed_sec)
+        _save_curve_png(
+            out_dir / "reward_curve.png",
+            h_best,
+            "best_so_far",
+            h_iter,
+            "iter_reward",
+            elapsed_sec=elapsed_sec,
+            ylabel="progress_reward" if use_reward_predictor else "episode_return",
+        )
 
     run_finished_dt = datetime.now()
     meta["elapsed_seconds"] = round(float(elapsed_sec), 3)
@@ -1779,7 +1976,8 @@ def main():
     }
     torch.save(film_ckpt, out_dir / "best_film_only.pt")
     best_logged = float(np.max(h_best)) if len(h_best) else float("nan")
-    print(f"Done. Best episode_return in log ≈ {best_logged}, total time {_format_duration(elapsed_sec)}")
+    best_logged_kind = "progress_reward" if use_reward_predictor else "episode_return"
+    print(f"Done. Best {best_logged_kind} in log ≈ {best_logged}, total time {_format_duration(elapsed_sec)}")
     print(f"Saved: {out_dir / 'best_film_only.pt'}, {out_dir / 'reward_curve.png'}")
 
     if interrupted_exc is not None:
