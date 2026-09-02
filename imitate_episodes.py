@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 from omegaconf import OmegaConf
 import hydra
 from hydra.core.hydra_config import HydraConfig
+from torch.utils.tensorboard import SummaryWriter
 from copy import deepcopy
 from tqdm import tqdm
 from einops import rearrange
@@ -844,10 +845,15 @@ def train_bc(train_dataloader, val_dataloader, config):
     policy.cuda()
     optimizer = make_optimizer(policy_class, policy)
 
+    # TensorBoard: `tensorboard --logdir <ckpt_dir>/tb` (or the parent results/ dir to
+    # compare runs side by side), then forward the port over SSH if training runs remotely.
+    tb_writer = SummaryWriter(log_dir=os.path.join(ckpt_dir, 'tb'))
+
     train_history = []
     validation_history = []
     min_val_loss = np.inf
     best_ckpt_info = None
+    global_step = 0  # cumulative optimizer.step() calls; standard TensorBoard x-axis
     for epoch in tqdm(range(num_epochs)):
         print(f'\nEpoch {epoch}')
         # validation
@@ -868,6 +874,7 @@ def train_bc(train_dataloader, val_dataloader, config):
         summary_string = ''
         for k, v in epoch_summary.items():
             summary_string += f'{k}: {v.item():.3f} '
+            tb_writer.add_scalar(f'val/{k}', v.item(), global_step)
         print(summary_string)
 
         # training
@@ -881,12 +888,14 @@ def train_bc(train_dataloader, val_dataloader, config):
             optimizer.step()
             optimizer.zero_grad()
             train_history.append(detach_dict(forward_dict))
+            global_step += 1
         epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*epoch:(batch_idx+1)*(epoch+1)])
         epoch_train_loss = epoch_summary['loss']
         print(f'Train loss: {epoch_train_loss:.5f}')
         summary_string = ''
         for k, v in epoch_summary.items():
             summary_string += f'{k}: {v.item():.3f} '
+            tb_writer.add_scalar(f'train/{k}', v.item(), global_step)
         print(summary_string)
 
         if epoch % 500 == 0:
@@ -901,6 +910,8 @@ def train_bc(train_dataloader, val_dataloader, config):
     ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt')
     torch.save(best_state_dict, ckpt_path)
     print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}')
+
+    tb_writer.close()
 
     # save training curves
     plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed)
