@@ -1621,7 +1621,10 @@ def main():
     # --output_dir is the *parent* folder for this run; the actual run always lands one level
     # down in icl_<timestamp>_<model_or_method>/, so a script sweeping multiple runs can pass the
     # same --output_dir repeatedly without them clobbering each other.
-    parent_dir = Path(args.output_dir) if args.output_dir is not None else Path(args.ckpt).resolve().parent
+    # Resolved to absolute here (not left relative to this process's cwd): reward-predictor mode
+    # sends rp_video_dir paths over IPC to a *separate* server process with its own cwd, which
+    # resolves relative paths against itself and silently looks in the wrong place.
+    parent_dir = Path(args.output_dir).resolve() if args.output_dir is not None else Path(args.ckpt).resolve().parent
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     model_name = args.llm_model if args.method == "llm" else args.method
     args.output_dir = str(parent_dir / f"icl_{timestamp}_{model_name}")
