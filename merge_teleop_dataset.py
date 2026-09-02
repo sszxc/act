@@ -67,8 +67,11 @@ def collect_episodes(src_dir):
     return episodes
 
 
-def merge_label(task_dir, label, overwrite, dry_run, move):
-    src_dirs = find_source_dirs(task_dir, label)
+def merge_label(task_dir, label, overwrite, dry_run, move, explicit_dirs=None):
+    if explicit_dirs:
+        src_dirs = [os.path.join(task_dir, d) for d in explicit_dirs]
+    else:
+        src_dirs = find_source_dirs(task_dir, label)
     if not src_dirs:
         print(f'[{label}] no source dirs found (looked for {label}\\d* under {task_dir}), skipping')
         return
@@ -143,10 +146,17 @@ def main():
     ap.add_argument('--move', action='store_true',
                      help='physically move files instead of symlinking, skip manifest.json, '
                           'and delete the source dirs once moved (destructive, no undo)')
+    ap.add_argument('--good_dirs', nargs='+',
+                     help='explicit list of source dir names (under task_dir) for the good label, '
+                          'overriding good\\d* auto-discovery; use when source dirs have custom names')
+    ap.add_argument('--bad_dirs', nargs='+',
+                     help='explicit list of source dir names (under task_dir) for the bad label, '
+                          'overriding bad\\d* auto-discovery')
     args = ap.parse_args()
 
+    explicit = {'good': args.good_dirs, 'bad': args.bad_dirs}
     for label in ('good', 'bad'):
-        merge_label(args.task_dir, label, args.overwrite, args.dry_run, args.move)
+        merge_label(args.task_dir, label, args.overwrite, args.dry_run, args.move, explicit[label])
 
 
 if __name__ == '__main__':
