@@ -1444,9 +1444,9 @@ def main():
         "--output_dir",
         type=str,
         default=None,
-        help="Where to write search outputs; defaults to a new "
-        "<ckpt_dir>/icl_<timestamp>_<model_or_method> folder next to the ckpt "
-        "(alongside eval_* folders)",
+        help="Parent folder for this run's outputs; a new "
+        "icl_<timestamp>_<model_or_method> subfolder is always created under it "
+        "(defaults to the ckpt's own directory, alongside eval_* folders)",
     )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
@@ -1618,11 +1618,13 @@ def main():
         print("FiLM exists only on ACT (DETRVAE); use --policy_class ACT", file=sys.stderr)
         sys.exit(1)
 
-    if args.output_dir is None:
-        ckpt_dir = Path(args.ckpt).resolve().parent
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        model_name = args.llm_model if args.method == "llm" else args.method
-        args.output_dir = str(ckpt_dir / f"icl_{timestamp}_{model_name}")
+    # --output_dir is the *parent* folder for this run; the actual run always lands one level
+    # down in icl_<timestamp>_<model_or_method>/, so a script sweeping multiple runs can pass the
+    # same --output_dir repeatedly without them clobbering each other.
+    parent_dir = Path(args.output_dir) if args.output_dir is not None else Path(args.ckpt).resolve().parent
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    model_name = args.llm_model if args.method == "llm" else args.method
+    args.output_dir = str(parent_dir / f"icl_{timestamp}_{model_name}")
 
     task_name = args.task_name
     if task_name not in SIM_TASK_CONFIGS:
