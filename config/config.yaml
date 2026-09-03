@@ -15,6 +15,11 @@ batch_size: 16
 num_epochs: 2000
 lr: 1.0e-5
 seed: 0
+# null = old behavior (one pass/epoch, batch_size effectively capped at num train episodes).
+# Set to an int to sample with replacement instead: samples_per_epoch = batch_size * batches_per_epoch,
+# so batch_size can exceed num train episodes (same episode can appear >1x per batch, each time
+# at an independently random timestep).
+batches_per_epoch: null
 
 # ACT policy
 kl_weight: 10

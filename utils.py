@@ -238,7 +238,8 @@ class EpisodicDatasetPCA(torch.utils.data.Dataset):
         return image_data, qpos_data, action_data, is_pad
 
 
-def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, num_queries, task_name=None):
+def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, num_queries,
+              task_name=None, batches_per_epoch=None):
     print(f'\nData from: {dataset_dir}\n')
     train_ratio = 0.8
     shuffled_indices = np.random.permutation(num_episodes)
@@ -262,7 +263,22 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
         train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, num_queries=num_queries)
         val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats, num_queries=num_queries)
 
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
+    if batches_per_epoch is None:
+        # Original behavior: one pass over train_dataset per epoch (each episode sampled once,
+        # at a random timestep). batch_size is effectively capped at num train episodes.
+        train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True,
+                                       pin_memory=True, num_workers=1, prefetch_factor=1)
+    else:
+        # Sample with replacement so batch_size can exceed num train episodes: the same episode
+        # can appear more than once per batch/epoch, each time at an independently random
+        # timestep (EpisodicDataset.__getitem__ redraws start_ts on every call regardless of
+        # index). samples_per_epoch is fixed so batches/epoch stays constant across training.
+        samples_per_epoch = batch_size_train * batches_per_epoch
+        train_sampler = torch.utils.data.RandomSampler(
+            train_dataset, replacement=True, num_samples=samples_per_epoch)
+        train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, sampler=train_sampler,
+                                       pin_memory=True, num_workers=1, prefetch_factor=1)
+    # Validation always does one plain pass per epoch (no replacement): no reason to inflate it.
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
 
     return train_dataloader, val_dataloader, stats, train_dataset.is_sim

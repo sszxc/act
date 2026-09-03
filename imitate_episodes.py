@@ -235,6 +235,7 @@ def train_or_eval(args, hydra_cfg=None):
         batch_size_val,
         num_queries=policy_config['num_queries'],
         task_name=task_name,
+        batches_per_epoch=args.get('batches_per_epoch', None),
     )
 
     # save dataset stats
