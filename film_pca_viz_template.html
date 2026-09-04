@@ -1,0 +1,361 @@
+<title>FiLM PCA Explorer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/4.0.0/plotly.min.js"></script>
+<style>
+  :root {
+    color-scheme: light;
+    --page:        #f9f9f7;
+    --surface:     #fcfcfb;
+    --text:        #0b0b0b;
+    --text-2:      #52514e;
+    --muted:       #898781;
+    --grid:        #e1e0d9;
+    --axis:        #c3c2b7;
+    --border:      rgba(11,11,11,0.10);
+    --accent:      #2a78d6;
+    --ink-line:    #0b0b0b;
+    --tab-bg:      #f0efec;
+    --good:        #2f9e58;
+    --bad:         #e34948;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page:        #0d0d0d;
+      --surface:     #1a1a19;
+      --text:        #ffffff;
+      --text-2:      #c3c2b7;
+      --muted:       #898781;
+      --grid:        #2c2c2a;
+      --axis:        #383835;
+      --border:      rgba(255,255,255,0.10);
+      --accent:      #3987e5;
+      --ink-line:    #ffffff;
+      --tab-bg:      #232322;
+      --good:        #49b876;
+      --bad:         #e66767;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page:        #0d0d0d;
+    --surface:     #1a1a19;
+    --text:        #ffffff;
+    --text-2:      #c3c2b7;
+    --muted:       #898781;
+    --grid:        #2c2c2a;
+    --axis:        #383835;
+    --border:      rgba(255,255,255,0.10);
+    --accent:      #3987e5;
+    --ink-line:    #ffffff;
+    --tab-bg:      #232322;
+    --good:        #49b876;
+    --bad:         #e66767;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--page);
+    color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 20px 24px 40px;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+
+  header { display: flex; flex-direction: column; gap: 6px; }
+  h1 { font-size: 1.375rem; font-weight: 700; margin: 0; letter-spacing: -0.01em; text-wrap: balance; }
+  .subtitle { color: var(--text-2); font-size: 0.9rem; max-width: 72ch; line-height: 1.5; }
+  .subtitle code, footer code, .meta code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85em;
+    background: var(--tab-bg); padding: 1px 5px; border-radius: 4px;
+  }
+  .badge {
+    align-self: flex-start;
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 0.75rem; color: var(--text-2);
+    border: 1px solid var(--border); border-radius: 999px;
+    padding: 4px 10px 4px 8px; margin-top: 2px;
+  }
+
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; border-bottom: 1px solid var(--grid); padding-bottom: 10px; }
+  .tab {
+    font: inherit; font-size: 0.95rem; font-weight: 600; color: var(--text-2);
+    background: var(--tab-bg); border: 1px solid transparent; border-radius: 8px;
+    padding: 7px 14px; cursor: pointer;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { background: var(--accent); color: #fff; }
+  .tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 1.15fr 0.85fr;
+    gap: 16px;
+    align-items: start;
+  }
+  @media (max-width: 860px) {
+    .grid { grid-template-columns: 1fr; }
+  }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 16px 8px;
+  }
+  .panel h2 {
+    font-size: 0.8rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+    color: var(--text-2); margin: 0 0 4px;
+  }
+  .panel .hint { font-size: 0.75rem; color: var(--muted); margin: 0 0 6px; }
+  .stack { display: flex; flex-direction: column; gap: 16px; }
+
+  table.meta { width: 100%; border-collapse: collapse; font-size: 0.8rem; margin-bottom: 8px; }
+  table.meta td { padding: 3px 0; vertical-align: top; }
+  table.meta td:first-child { color: var(--muted); width: 40%; white-space: nowrap; padding-right: 8px; }
+  table.meta td:last-child { text-align: right; word-break: break-all; font-variant-numeric: tabular-nums; }
+
+  table.loss { width: 100%; border-collapse: collapse; font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+  table.loss th, table.loss td { padding: 4px 6px; text-align: right; border-bottom: 1px solid var(--grid); }
+  table.loss th:first-child, table.loss td:first-child { text-align: left; }
+  table.loss th { color: var(--muted); font-weight: 600; }
+  .lost { color: var(--bad); }
+  .kept { color: var(--good); }
+
+  footer { font-size: 0.75rem; color: var(--muted); border-top: 1px solid var(--grid); padding-top: 12px; line-height: 1.6; }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>FiLM PCA Explorer</h1>
+    <p class="subtitle">
+      Per-component <code>explained_variance_ratio</code> from <code>fit_film_pca.py</code>.
+      Left: cumulative variance retained as more components are kept (all fits overlaid, active one
+      bold) — <code>1 − cumulative[k]</code> is what <code>--film_bottleneck_dim k</code> discards.
+      Right: each component's own share, and the same numbers as a table.
+    </p>
+    <span class="badge" id="badge"></span>
+  </header>
+
+  <nav class="tabs" id="tabs"></nav>
+
+  <div class="grid">
+    <section class="panel">
+      <h2>Cumulative variance retained</h2>
+      <p class="hint">Dashed lines mark 90% / 95% / 99% retained</p>
+      <div id="plotCumulative" style="width:100%; height:420px;"></div>
+    </section>
+
+    <div class="stack">
+      <section class="panel">
+        <h2>Per-component EVR (active fit)</h2>
+        <p class="hint" id="barsHint">Log scale — how much each individual dim carries</p>
+        <div id="plotBars" style="width:100%; height:230px;"></div>
+      </section>
+      <section class="panel">
+        <h2>Fit info</h2>
+        <table class="meta" id="metaTable"></table>
+        <table class="loss" id="lossTable"></table>
+      </section>
+    </div>
+  </div>
+
+  <footer id="footer">
+    Generated by <code>visualize_film_pca.py</code> from one or more <code>fit_film_pca.py</code> <code>.npz</code> outputs.
+  </footer>
+</div>
+
+<!--
+  Real data goes here: replace `null` below with a JSON object
+  { files: [{label, source_file, evr, cumulative, meta}, ...] }, meta being fit_film_pca.py's
+  saved metadata dict (task_name, target, ckpt, hidden_dim, max_k, n_samples, ...).
+  visualize_film_pca.py does this automatically.
+  Left as null, the page falls back to a small synthetic curve (layout preview only).
+-->
+<script type="application/json" id="pca-data">null</script>
+
+<script>
+(function () {
+  "use strict";
+
+  var injected = (function () {
+    try { return JSON.parse(document.getElementById("pca-data").textContent); }
+    catch (e) { return null; }
+  })();
+
+  // ---------- palette (read from CSS so it follows light/dark) ----------
+  var cs = getComputedStyle(document.body);
+  var COLOR = {
+    text: cs.getPropertyValue("--text").trim(),
+    text2: cs.getPropertyValue("--text-2").trim(),
+    muted: cs.getPropertyValue("--muted").trim(),
+    grid: cs.getPropertyValue("--grid").trim(),
+    axis: cs.getPropertyValue("--axis").trim(),
+    surface: cs.getPropertyValue("--surface").trim(),
+    accent: cs.getPropertyValue("--accent").trim(),
+    good: cs.getPropertyValue("--good").trim(),
+    bad: cs.getPropertyValue("--bad").trim(),
+  };
+  // qualitative palette for overlaid fits (falls back to accent if more fits than colors)
+  var QUAL = [COLOR.accent, COLOR.bad, COLOR.good, "#c98a2b", "#8e5fd6", "#2bb0a8"];
+  function colorFor(i) { return QUAL[i % QUAL.length]; }
+
+  // ---------- synthetic fallback (used only when no real data is injected) ----------
+  function buildMockFiles() {
+    var maxK = 32, evr = [];
+    for (var i = 0; i < maxK; i++) evr.push(0.35 * Math.exp(-i / 6) + 0.002);
+    var sum = evr.reduce(function (a, b) { return a + b; }, 0);
+    evr = evr.map(function (v) { return v / sum; });
+    var cumulative = [];
+    evr.reduce(function (acc, v) { var c = acc + v; cumulative.push(c); return c; }, 0);
+    return [{
+      label: "sample_task (visual)", source_file: "(no data injected)",
+      evr: evr, cumulative: cumulative,
+      meta: { task_name: "sample_task", target: "visual", ckpt: "-", hidden_dim: 512, max_k: maxK,
+              n_samples: 0, num_episodes_sampled: 0, frames_per_episode: 0, points_per_frame: 0,
+              seed: 0, fit_time: "-", dataset_dir: "-", sample: true },
+    }];
+  }
+
+  var FILES = (injected && injected.files && injected.files.length) ? injected.files : buildMockFiles();
+  var activeIdx = 0;
+
+  // ---------- header ----------
+  document.getElementById("badge").textContent = "📊 " + FILES.length + " fit" + (FILES.length === 1 ? "" : "s") +
+    (FILES[0].meta.sample ? " — sample data, run visualize_film_pca.py for the real thing" : "");
+
+  // ---------- tabs ----------
+  var tabsEl = document.getElementById("tabs");
+  FILES.forEach(function (f, i) {
+    var btn = document.createElement("button");
+    btn.className = "tab" + (i === 0 ? " active" : "");
+    btn.textContent = f.label;
+    btn.addEventListener("click", function () { setActive(i); });
+    tabsEl.appendChild(btn);
+  });
+
+  // ---------- cumulative chart (all fits overlaid) ----------
+  function cumulativeTraces() {
+    return FILES.map(function (f, i) {
+      var isActive = i === activeIdx;
+      return {
+        x: f.cumulative.map(function (_, k) { return k + 1; }),
+        y: f.cumulative,
+        name: f.label,
+        mode: "lines",
+        line: { color: colorFor(i), width: isActive ? 3 : 1.5 },
+        opacity: isActive ? 1 : 0.35,
+        hovertemplate: f.label + "<br>k=%{x}: %{y:.4f} retained<extra></extra>",
+      };
+    });
+  }
+
+  function refLine(y, dash) {
+    return { type: "line", xref: "paper", x0: 0, x1: 1, yref: "y", y0: y, y1: y,
+             line: { color: COLOR.axis, width: 1, dash: dash || "dot" } };
+  }
+
+  var axisCommon = {
+    gridcolor: COLOR.grid, zerolinecolor: COLOR.axis, linecolor: COLOR.axis,
+    tickfont: { color: COLOR.text2, size: 11 }, titlefont: { color: COLOR.text2, size: 12 },
+  };
+  var layoutCommon = {
+    paper_bgcolor: "transparent", plot_bgcolor: "transparent",
+    font: { color: COLOR.text, family: "system-ui, sans-serif" },
+    margin: { l: 48, r: 12, t: 8, b: 40 },
+    legend: { orientation: "h", y: -0.18, font: { color: COLOR.text2, size: 11 } },
+  };
+
+  Plotly.newPlot("plotCumulative", cumulativeTraces(), Object.assign({}, layoutCommon, {
+    xaxis: Object.assign({ title: "k (components kept)" }, axisCommon),
+    yaxis: Object.assign({ title: "cumulative EVR", range: [0, 1.02] }, axisCommon),
+    shapes: [refLine(0.90), refLine(0.95), refLine(0.99)],
+  }), { displayModeBar: false, responsive: true });
+
+  // ---------- per-fit bar chart ----------
+  function drawBars() {
+    var f = FILES[activeIdx];
+    var n = Math.min(f.evr.length, 32);
+    Plotly.newPlot("plotBars", [{
+      x: f.evr.slice(0, n).map(function (_, i) { return i + 1; }),
+      y: f.evr.slice(0, n),
+      type: "bar",
+      marker: { color: colorFor(activeIdx) },
+      hovertemplate: "dim %{x}: %{y:.5f}<extra></extra>",
+    }], Object.assign({}, layoutCommon, {
+      xaxis: Object.assign({ title: "component #", dtick: n > 16 ? 4 : 2 }, axisCommon),
+      yaxis: Object.assign({ title: "EVR", type: "log" }, axisCommon),
+      showlegend: false,
+      margin: { l: 48, r: 12, t: 8, b: 36 },
+    }), { displayModeBar: false, responsive: true });
+    document.getElementById("barsHint").textContent = n < f.evr.length
+      ? "Log scale — how much each individual dim carries (showing first " + n + " of " + f.evr.length + ")"
+      : "Log scale — how much each individual dim carries";
+  }
+
+  // ---------- meta + loss tables ----------
+  function short(s, keep) {
+    if (typeof s !== "string") return String(s);
+    var parts = s.split("/");
+    return parts.length > keep ? ".../" + parts.slice(-keep).join("/") : s;
+  }
+  function fmtDate(iso) {
+    if (!iso || iso === "-") return "-";
+    return String(iso).slice(0, 16).replace("T", " ");
+  }
+
+  function drawMetaTable() {
+    var m = FILES[activeIdx].meta;
+    var rows = [
+      ["source", FILES[activeIdx].source_file],
+      ["task_name", m.task_name],
+      ["target", m.target],
+      ["ckpt", short(m.ckpt, 2)],
+      ["dataset_dir", short(m.dataset_dir, 2)],
+      ["hidden_dim", m.hidden_dim],
+      ["max_k fit", m.max_k],
+      ["n_samples", m.n_samples],
+      ["episodes sampled", m.num_episodes_sampled + " / " + m.num_episodes_available],
+      ["frames/ep × pts/frame", m.frames_per_episode + " × " + m.points_per_frame],
+      ["seed", m.seed],
+      ["fit_time", fmtDate(m.fit_time)],
+    ];
+    document.getElementById("metaTable").innerHTML = rows.map(function (r) {
+      return "<tr><td>" + r[0] + "</td><td><code>" + r[1] + "</code></td></tr>";
+    }).join("");
+  }
+
+  function drawLossTable() {
+    var f = FILES[activeIdx];
+    var maxK = f.cumulative.length;
+    var checkpoints = [1, 2, 4, 8, 16, 24, 32, 48, 64].filter(function (k) { return k <= maxK; });
+    if (checkpoints[checkpoints.length - 1] !== maxK) checkpoints.push(maxK);
+    var head = "<tr><th>k</th><th>retained</th><th>lost</th></tr>";
+    var body = checkpoints.map(function (k) {
+      var kept = f.cumulative[k - 1];
+      var lost = 1 - kept;
+      return "<tr><td>" + k + "</td><td class=\"kept\">" + (kept * 100).toFixed(2) + "%</td>" +
+             "<td class=\"lost\">" + (lost * 100).toFixed(2) + "%</td></tr>";
+    }).join("");
+    document.getElementById("lossTable").innerHTML = head + body;
+  }
+
+  // ---------- wire it up ----------
+  function setActive(i) {
+    activeIdx = i;
+    Array.prototype.forEach.call(tabsEl.children, function (btn, idx) {
+      btn.classList.toggle("active", idx === i);
+    });
+    Plotly.restyle("plotCumulative",
+      { "line.width": FILES.map(function (_, idx) { return idx === i ? 3 : 1.5; }),
+        opacity: FILES.map(function (_, idx) { return idx === i ? 1 : 0.35; }) },
+      FILES.map(function (_, idx) { return idx; }));
+    drawBars();
+    drawMetaTable();
+    drawLossTable();
+  }
+
+  drawBars();
+  drawMetaTable();
+  drawLossTable();
+})();
+</script>
