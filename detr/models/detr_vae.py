@@ -85,19 +85,18 @@ class DETRVAE(nn.Module):
             self._film_viz_frame_idx = 0
 
             # --- PCA-bottleneck FiLM (opt-in, independent of the plain per-channel FiLM above) ---
-            # Hard bottleneck: src is encoded into a k-dim PCA subspace (W, mu fit offline from
-            # recorded activations by fit_film_pca.py), FiLM-modulated there (film_pca_gamma/beta,
-            # k-dim each, are the only free/searched params), then decoded straight back to
-            # hidden_dim and used as `src` outright — it REPLACES src, it does not compose with
+            # Residual bottleneck: src is encoded into a k-dim PCA subspace (W, mu fit offline
+            # from recorded activations by fit_film_pca.py), FiLM-modulated there (film_pca_gamma
+            # /beta, k-dim each, are the only free/searched params), then the *modulation* (not
+            # the reconstruction) is added back onto the original src — it does not compose with
             # visual_film_gamma/beta above. Disabled by default (film_pca_k == 0); see
             # load_film_pca() to install a basis, and forward()'s film_pca_gamma/film_pca_beta args
             # for per-sample batched search.
             #
-            # NOTE: because the k-dim subspace only spans part of hidden_dim's variance,
-            # x_hat = W @ (W^T (x - mu)) + mu != x in general, even at the identity setting
-            # gamma=1, beta=0 — reconstruction loss is inherent to this hard bottleneck, not a
-            # bug. A residual/soft variant that preserves the orthogonal complement (x_hat = x +
-            # W @ ((gamma-1) * z + beta)) is a possible future extension, not implemented here.
+            # x_hat = x + W @ ((gamma-1) * z + beta), z = W^T (x - mu): at the identity setting
+            # gamma=1, beta=0 this is exactly x (no reconstruction loss, for any k) — only the
+            # part of x that lies in the k-dim subspace is ever touched; the orthogonal
+            # complement passes through unchanged.
             self.film_pca_k = 0
             self.register_buffer("film_pca_W", torch.zeros(hidden_dim, 0))
             self.register_buffer("film_pca_mu", torch.zeros(hidden_dim))
@@ -110,7 +109,7 @@ class DETRVAE(nn.Module):
             self.backbones = None
 
         # --- PCA-bottleneck FiLM at other encoder/decoder-boundary insertion points ---
-        # Same encode->modulate->decode mechanism as film_pca_* above (see load_film_pca()),
+        # Same encode->modulate->residual-add mechanism as film_pca_* above (see load_film_pca()),
         # just applied to a different hidden_dim-wide tensor. Independent of film_pca_* and of
         # each other — each has its own basis/free-params and is a no-op until load_film_pca()
         # installs a basis for that target (film_pca_{target}_k == 0 by default). Registered
@@ -158,8 +157,8 @@ class DETRVAE(nn.Module):
             film_pca_memory_*; see transformer.py's memory_film_fn hook).
           - "hs": the Transformer decoder's output, before action_head/is_pad_head (buffers
             film_pca_hs_*).
-        All three share the same encode->modulate->decode math (_pca_bottleneck_core); they
-        only differ in which hidden_dim-wide tensor they're applied to.
+        All three share the same encode->modulate->residual-add math (_pca_bottleneck_core);
+        they only differ in which hidden_dim-wide tensor they're applied to.
 
         W: (hidden_dim, k) principal directions (columns), mu: (hidden_dim,) mean — both fit
         offline by fit_film_pca.py (--target matching this one) from recorded activations at
@@ -193,7 +192,7 @@ class DETRVAE(nn.Module):
         gamma: torch.Tensor,
         beta: torch.Tensor,
     ) -> torch.Tensor:
-        """Shared encode->modulate->decode math for the "memory"/"hs" PCA-bottleneck FiLM
+        """Shared encode->modulate->residual-add math for the "memory"/"hs" PCA-bottleneck FiLM
         targets (see load_film_pca()). Mirrors the inline visual-src math in forward() below,
         just generalized to a canonical (B, N, C) layout so it works for both memory's
         (S,B,C)-shaped tokens and hs's (B,Q,C)-shaped tokens without duplicating the einsum
@@ -204,12 +203,16 @@ class DETRVAE(nn.Module):
         gamma, beta: (k,) shared across the whole batch, or (B, k) per-sample (batched search,
         same convention as film_pca_gamma/beta). Broadcast across N either way (gamma/beta do
         not vary across tokens), matching the visual path's spatial broadcast over H,W.
+
+        Returns x_bnc + W @ ((gamma-1)*z + beta) — a residual correction confined to the k-dim
+        subspace, added onto the untouched input (not a low-rank reconstruction replacing it).
+        At gamma=1, beta=0 the correction is exactly zero, so this is the identity for any k.
         """
         z = torch.einsum("bnc,ck->bnk", x_bnc - mu.view(1, 1, -1), W)
         g = gamma.view(1, 1, -1) if gamma.dim() == 1 else gamma.view(gamma.shape[0], 1, -1)
         b = beta.view(1, 1, -1) if beta.dim() == 1 else beta.view(beta.shape[0], 1, -1)
-        z = z * g + b
-        return torch.einsum("bnk,ck->bnc", z, W) + mu.view(1, 1, -1)
+        delta = z * (g - 1.0) + b
+        return x_bnc + torch.einsum("bnk,ck->bnc", delta, W)
 
     def _resolve_film_pca_override(
         self, override, default_buffer: torch.Tensor, ref: torch.Tensor
@@ -353,9 +356,10 @@ class DETRVAE(nn.Module):
             pos = torch.cat(all_cam_pos, axis=3)
 
             if self.film_pca_k > 0:
-                # PCA-bottleneck FiLM (hard bottleneck): encode -> modulate -> decode, REPLACING
-                # src outright (does not compose with visual_film_gamma/beta below). See
-                # load_film_pca() / the film_pca_* buffer comments in __init__ for the math.
+                # PCA-bottleneck FiLM (residual bottleneck): encode -> modulate -> add back onto
+                # src as a residual correction (does not compose with visual_film_gamma/beta
+                # below). See load_film_pca() / the film_pca_* buffer comments in __init__ for
+                # the math.
                 if film_pca_gamma is None:
                     g_pca = self.film_pca_gamma.to(dtype=src.dtype, device=src.device)
                 else:
@@ -378,8 +382,8 @@ class DETRVAE(nn.Module):
                 W = self.film_pca_W.to(dtype=src.dtype, device=src.device)  # (hidden_dim, k)
                 mu = self.film_pca_mu.to(dtype=src.dtype, device=src.device)  # (hidden_dim,)
                 z = torch.einsum("bchw,ck->bkhw", src - mu.view(1, -1, 1, 1), W)  # encode
-                z = z * g_pca + b_pca  # modulate (the only free params: film_pca_gamma/beta)
-                src = torch.einsum("bkhw,ck->bchw", z, W) + mu.view(1, -1, 1, 1)  # decode, replaces src
+                delta = z * (g_pca - 1.0) + b_pca  # modulation only (free params: film_pca_gamma/beta)
+                src = src + torch.einsum("bkhw,ck->bchw", delta, W)  # residual add; identity at gamma=1,beta=0
             else:
                 # FiLM (feature-wise affine): src = gamma * src + beta
                 # Default: use internal buffers (shared across batch).
