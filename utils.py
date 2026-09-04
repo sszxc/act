@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import os
+import cv2
 import h5py
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.decomposition import PCA
@@ -10,14 +11,32 @@ from constants import ROOT_DIM, FINGER_DIM
 import IPython
 e = IPython.embed
 
+def load_cam_images(root, camera_names, start_ts, image_size=None):
+    """Read one frame per camera and stack to (k, h, w, 3). image_size=(H, W) resizes every
+    camera to a common size; required when cameras differ in native resolution."""
+    images = []
+    for cam_name in camera_names:
+        img = root[f'/observations/images/{cam_name}'][start_ts]
+        if image_size is not None:
+            img = cv2.resize(img, (int(image_size[1]), int(image_size[0])), interpolation=cv2.INTER_AREA)
+        images.append(img)
+    if len({im.shape for im in images}) > 1:
+        raise ValueError(
+            f'cameras have different resolutions: '
+            f'{dict(zip(camera_names, (im.shape for im in images)))}. '
+            f'Pass image_size=[H,W] to resize them to a common size.')
+    return np.stack(images, axis=0)
+
+
 class EpisodicDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, num_queries):
+    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, num_queries, image_size=None):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
         self.camera_names = camera_names
         self.norm_stats = norm_stats
         self.num_queries = int(num_queries)
+        self.image_size = image_size
         self.is_sim = None
         self.__getitem__(0) # initialize self.is_sim
 
@@ -41,9 +60,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
             # get observation at start_ts only
             qpos = root['/observations/qpos'][start_ts]
             qvel = root['/observations/qvel'][start_ts]
-            image_dict = dict()
-            for cam_name in self.camera_names:
-                image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start_ts]
+            all_cam_images = load_cam_images(root, self.camera_names, start_ts, self.image_size)
             # get a fixed-length action chunk starting near start_ts
             if is_sim:
                 action_start_ts = start_ts
@@ -58,12 +75,6 @@ class EpisodicDataset(torch.utils.data.Dataset):
         padded_action[:action_len] = action
         is_pad = np.zeros(self.num_queries, dtype=np.float32)
         is_pad[action_len:] = 1
-
-        # new axis for different cameras
-        all_cam_images = []
-        for cam_name in self.camera_names:
-            all_cam_images.append(image_dict[cam_name])
-        all_cam_images = np.stack(all_cam_images, axis=0)
 
         # construct observations
         image_data = torch.from_numpy(all_cam_images)
@@ -168,13 +179,15 @@ def get_norm_stats_with_pca(dataset_dir, num_episodes, pca_finger_dim):
 class EpisodicDatasetPCA(torch.utils.data.Dataset):
     """Like EpisodicDataset but transforms 22d action to root 6 + finger PCs via PCA."""
 
-    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, num_queries, pca, pca_finger_dim):
+    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, num_queries, pca, pca_finger_dim,
+                 image_size=None):
         super(EpisodicDatasetPCA).__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
         self.camera_names = camera_names
         self.norm_stats = norm_stats
         self.num_queries = int(num_queries)
+        self.image_size = image_size
         self.pca = pca
         self.pca_finger_dim = pca_finger_dim
         self.action_dim_out = ROOT_DIM + pca_finger_dim
@@ -198,9 +211,7 @@ class EpisodicDatasetPCA(torch.utils.data.Dataset):
                 start_ts = np.random.choice(episode_len)
             qpos = root['/observations/qpos'][start_ts]
             qvel = root['/observations/qvel'][start_ts]
-            image_dict = dict()
-            for cam_name in self.camera_names:
-                image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start_ts]
+            all_cam_images = load_cam_images(root, self.camera_names, start_ts, self.image_size)
             if is_sim:
                 action_start_ts = start_ts
             else:
@@ -218,11 +229,6 @@ class EpisodicDatasetPCA(torch.utils.data.Dataset):
         is_pad = np.zeros(self.num_queries, dtype=np.float32)
         is_pad[action_len:] = 1
 
-        all_cam_images = []
-        for cam_name in self.camera_names:
-            all_cam_images.append(image_dict[cam_name])
-        all_cam_images = np.stack(all_cam_images, axis=0)
-
         image_data = torch.from_numpy(all_cam_images)
         qpos_data = torch.from_numpy(qpos).float()
         action_data = torch.from_numpy(padded_action).float()
@@ -239,7 +245,7 @@ class EpisodicDatasetPCA(torch.utils.data.Dataset):
 
 
 def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, num_queries,
-              task_name=None, batches_per_epoch=None):
+              task_name=None, batches_per_epoch=None, image_size=None):
     print(f'\nData from: {dataset_dir}\n')
     train_ratio = 0.8
     shuffled_indices = np.random.permutation(num_episodes)
@@ -253,15 +259,17 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
         stats = {**norm_stats, 'pca': pca}
         train_dataset = EpisodicDatasetPCA(
             train_indices, dataset_dir, camera_names, norm_stats, num_queries=num_queries,
-            pca=pca, pca_finger_dim=pca_finger_dim)
+            pca=pca, pca_finger_dim=pca_finger_dim, image_size=image_size)
         val_dataset = EpisodicDatasetPCA(
             val_indices, dataset_dir, camera_names, norm_stats, num_queries=num_queries,
-            pca=pca, pca_finger_dim=pca_finger_dim)
+            pca=pca, pca_finger_dim=pca_finger_dim, image_size=image_size)
     else:
         norm_stats = get_norm_stats(dataset_dir, num_episodes)
         stats = norm_stats
-        train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, num_queries=num_queries)
-        val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats, num_queries=num_queries)
+        train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats,
+                                        num_queries=num_queries, image_size=image_size)
+        val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats,
+                                      num_queries=num_queries, image_size=image_size)
 
     if batches_per_epoch is None:
         # Original behavior: one pass over train_dataset per epoch (each episode sampled once,

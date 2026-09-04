@@ -10,6 +10,7 @@ import json
 from datetime import datetime
 import torch
 import numpy as np
+import cv2
 import pickle
 import argparse
 import matplotlib.pyplot as plt
@@ -85,10 +86,12 @@ def train_or_eval(args, hydra_cfg=None):
     else:
         from aloha_scripts.constants import TASK_CONFIGS
         task_config = TASK_CONFIGS[task_name]
-    dataset_dir = task_config['dataset_dir']
-    num_episodes = task_config['num_episodes']
+    # CLI (hydra) overrides; null falls back to the TASK_CONFIGS value
+    dataset_dir = args.get('dataset_dir') or task_config['dataset_dir']
+    num_episodes = args.get('num_episodes') or task_config['num_episodes']
     episode_len = task_config['episode_len']
-    camera_names = task_config['camera_names']
+    camera_names = list(args.get('camera_names') or task_config['camera_names'])
+    image_size = args.get('image_size') or None
     state_dim = task_config.get('state_dim', DEFAULT_STATE_DIM)
     action_dim = task_config.get('action_dim', state_dim)
     env_family = task_config.get('env_family', None)
@@ -135,6 +138,7 @@ def train_or_eval(args, hydra_cfg=None):
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
+        'image_size': image_size,
         'env_family': env_family,
         'real_robot': not is_sim,
         # eval-only: user-specified latent z (fixed within rollout)
@@ -236,6 +240,7 @@ def train_or_eval(args, hydra_cfg=None):
         num_queries=policy_config['num_queries'],
         task_name=task_name,
         batches_per_epoch=args.get('batches_per_epoch', None),
+        image_size=image_size,
     )
 
     # save dataset stats
@@ -277,11 +282,13 @@ def make_optimizer(policy_class, policy):
     return optimizer
 
 
-def get_image(ts, camera_names):
+def get_image(ts, camera_names, image_size=None):
     curr_images = []
     for cam_name in camera_names:
-        curr_image = rearrange(ts.observation['images'][cam_name], 'h w c -> c h w')
-        curr_images.append(curr_image)
+        img = ts.observation['images'][cam_name]
+        if image_size is not None:
+            img = cv2.resize(img, (int(image_size[1]), int(image_size[0])), interpolation=cv2.INTER_AREA)
+        curr_images.append(rearrange(img, 'h w c -> c h w'))
     curr_image = np.stack(curr_images, axis=0)
     curr_image = torch.from_numpy(curr_image / 255.0).float().cuda().unsqueeze(0)
     return curr_image
@@ -452,6 +459,7 @@ def rollout_single_episode_return(
     policy_class = config['policy_class']
     policy_config = config['policy_config']
     camera_names = config['camera_names']
+    image_size = config.get('image_size', None)
     state_dim = config['state_dim']
     action_dim = config.get('action_dim', state_dim)
     task_name = config['task_name']
@@ -545,7 +553,7 @@ def rollout_single_episode_return(
                 qpos = pre_process(qpos_numpy)
                 qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
                 qpos_history[:, t] = qpos
-                curr_image = get_image(ts, camera_names)
+                curr_image = get_image(ts, camera_names, image_size)
 
             if direct_replay:
                 target_qpos = np.asarray(replay_actions[t], dtype=np.float64)
@@ -643,6 +651,7 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
     onscreen_render = config['onscreen_render']
     policy_config = config['policy_config']
     camera_names = config['camera_names']
+    image_size = config.get('image_size', None)
     max_timesteps = config['episode_len']
     task_name = config['task_name']
     env_family = config.get('env_family', None)

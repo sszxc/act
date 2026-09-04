@@ -27,3 +27,14 @@ chunk_size: 100
 hidden_dim: 512
 dim_feedforward: 3200
 latent_z_dim: 32
+
+# Task-config overrides. null = use the value from TASK_CONFIGS (aloha_scripts/constants.py).
+# e.g. dataset_dir=data/real_pick_yellow_bottle/good_41_clean camera_names=[left,top,wrist]
+dataset_dir: null
+camera_names: null
+num_episodes: null
+
+# Resize every camera to [H, W] before stacking. Required when the selected cameras have
+# different native resolutions (e.g. left 480x640 + side 480x848 + thumb 400x400).
+# null = keep native size. Must match between train and eval.
+image_size: null
