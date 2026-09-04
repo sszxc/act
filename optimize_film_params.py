@@ -1650,6 +1650,21 @@ def main():
         "per point (see film_sweep_trajectories.npz).",
     )
     p.add_argument(
+        "--object_sweep_x_values",
+        type=str,
+        default="0",
+        help="--method sweep: comma/JSON list of x offsets (meters) from --fixed_object_pose's x, "
+        "crossed with the FiLM dim/value grid (for every offset, the whole one-at-a-time FiLM "
+        "sweep is re-run at that object position) -- rollouts multiply by len(x) * len(y). "
+        "Default '0' keeps the original single fixed-position behavior.",
+    )
+    p.add_argument(
+        "--object_sweep_y_values",
+        type=str,
+        default="0",
+        help="--method sweep: same as --object_sweep_x_values but for the object's y offset.",
+    )
+    p.add_argument(
         "--show_rollout_progress",
         action="store_true",
         help="Show tqdm-style progress bar for each simulation rollout (requires tqdm; otherwise no-op)",
@@ -1967,6 +1982,15 @@ def main():
         meta["sweep_values"] = sweep_values.tolist()
         meta["sweep_dim_names"] = sweep_dim_names
         meta["sweep_trajectories_file"] = "film_sweep_trajectories.npz"
+        # Object x/y grid crossed with the FiLM dim/value sweep (see run_sweep call below).
+        # Offsets are relative to fixed_object_pose; stored here as absolute positions since
+        # that's what the trajectories npz records per-point and what the viz plots directly.
+        object_x_offsets = _parse_float_list(args.object_sweep_x_values)
+        object_y_offsets = _parse_float_list(args.object_sweep_y_values)
+        object_x_values = (fixed_object_pose[0] + object_x_offsets).tolist()
+        object_y_values = (fixed_object_pose[1] + object_y_offsets).tolist()
+        meta["object_x_values"] = object_x_values
+        meta["object_y_values"] = object_y_values
     prompt_template_path: Path | None = None
     use_vlm = False
     use_reward_predictor = False
@@ -2114,51 +2138,95 @@ def main():
     elif args.method == "sweep":
         if int(args.parallel) > 1:
             print("Warning: --method sweep evaluates one grid point per rollout; extra parallel envs stay idle.")
-        log_path = out_dir / "sweep_history.jsonl"
         sweep_records: list[dict] = []
 
-        def eval_sweep_point(theta: np.ndarray, dim_name: str, value: float) -> float:
-            round_label = f"{dim_name}_val{value:g}"
-            reward_arr, mocap_pos_arr = rollout_batch_episode_returns(
-                policy,
-                envs[:1],
-                eval_cfg,
-                pre,
-                post,
-                theta.reshape(1, -1),
-                latent_z=latent_z,
-                fixed_object_pose=fixed_object_pose,
-                fixed_object_shape=fixed_object_shape,
-                fixed_object_size=fixed_object_size,
-                fixed_init_qpos=fixed_init_qpos,
-                init_qpos_from_dataset=args.init_qpos_from_dataset,
-                dataset_dir=task_cfg.get("dataset_dir"),
-                num_episodes=task_cfg.get("num_episodes"),
-                show_rollout_progress=bool(args.show_rollout_progress),
-                rollout_desc=f"sweep {round_label}",
-                video_dir=video_dir,
-                round_label=round_label,
-                capture_mocap_pos=True,
-                video_layout=args.video_layout,
-                film_target=args.film_target,
+        # Object (x, y) grid crossed with the FiLM dim/value grid: for every object position,
+        # the whole one-at-a-time FiLM sweep is re-run there. n_obj == 1 (both --object_sweep_*
+        # default to "0") reproduces the original single-fixed-position behavior exactly,
+        # including unchanged log/video filenames.
+        obj_grid = [(float(ox), float(oy)) for ox in object_x_offsets for oy in object_y_offsets]
+        n_obj = len(obj_grid)
+        n_total = n_obj * len(sweep_dim_names) * len(sweep_values)
+        if n_obj > 1:
+            print(
+                f"[sweep] object grid: {len(object_x_offsets)} x-offsets x {len(object_y_offsets)} "
+                f"y-offsets = {n_obj} positions, each with {len(sweep_dim_names)} FiLM dims x "
+                f"{len(sweep_values)} values -> {n_total} rollouts total"
             )
-            sweep_records.append(
-                {
-                    "dim_name": dim_name,
-                    "value": float(value),
-                    "episode_return": float(reward_arr[0]),
-                    "mocap_pos": mocap_pos_arr[0],  # (T, 3)
-                }
-            )
-            return float(reward_arr[0])
 
-        best_x, h_best, h_point, interrupted_exc, elapsed_sec = run_sweep(
-            eval_sweep_point,
-            opt_x0,
-            dim_names=sweep_dim_names,
-            sweep_values=sweep_values,
-            log_path=log_path,
-        )
+        sweep_t_start = time.perf_counter()
+        best_so_far_overall = -np.inf
+        best_x = opt_x0.copy()
+        all_point_rewards: list[float] = []
+        for obj_idx, (ox_off, oy_off) in enumerate(obj_grid):
+            fixed_object_pose_i = fixed_object_pose.copy()
+            fixed_object_pose_i[0] += ox_off
+            fixed_object_pose_i[1] += oy_off
+            obj_tag = f"objx{ox_off:+.3f}_objy{oy_off:+.3f}" if n_obj > 1 else None
+            if n_obj > 1:
+                print(
+                    f"[sweep] object position {obj_idx + 1}/{n_obj}: offset=({ox_off:+.3f},{oy_off:+.3f}) "
+                    f"pose_xy=({fixed_object_pose_i[0]:.3f},{fixed_object_pose_i[1]:.3f})"
+                )
+
+            def eval_sweep_point(
+                theta: np.ndarray, dim_name: str, value: float,
+                _pose=fixed_object_pose_i, _tag=obj_tag,
+            ) -> float:
+                round_label = f"{_tag}_{dim_name}_val{value:g}" if _tag else f"{dim_name}_val{value:g}"
+                reward_arr, mocap_pos_arr = rollout_batch_episode_returns(
+                    policy,
+                    envs[:1],
+                    eval_cfg,
+                    pre,
+                    post,
+                    theta.reshape(1, -1),
+                    latent_z=latent_z,
+                    fixed_object_pose=_pose,
+                    fixed_object_shape=fixed_object_shape,
+                    fixed_object_size=fixed_object_size,
+                    fixed_init_qpos=fixed_init_qpos,
+                    init_qpos_from_dataset=args.init_qpos_from_dataset,
+                    dataset_dir=task_cfg.get("dataset_dir"),
+                    num_episodes=task_cfg.get("num_episodes"),
+                    show_rollout_progress=bool(args.show_rollout_progress),
+                    rollout_desc=f"sweep {round_label}",
+                    video_dir=video_dir,
+                    round_label=round_label,
+                    capture_mocap_pos=True,
+                    video_layout=args.video_layout,
+                    film_target=args.film_target,
+                )
+                sweep_records.append(
+                    {
+                        "dim_name": dim_name,
+                        "value": float(value),
+                        "episode_return": float(reward_arr[0]),
+                        "mocap_pos": mocap_pos_arr[0],  # (T, 3)
+                        "object_x": float(_pose[0]),
+                        "object_y": float(_pose[1]),
+                    }
+                )
+                return float(reward_arr[0])
+
+            log_path = out_dir / (f"sweep_history_{obj_tag}.jsonl" if obj_tag else "sweep_history.jsonl")
+            best_x_i, h_best_i, h_point_i, interrupted_exc, _elapsed_i = run_sweep(
+                eval_sweep_point,
+                opt_x0,
+                dim_names=sweep_dim_names,
+                sweep_values=sweep_values,
+                log_path=log_path,
+            )
+            all_point_rewards.extend(h_point_i.tolist())
+            if len(h_best_i) and float(h_best_i[-1]) > best_so_far_overall:
+                best_so_far_overall = float(h_best_i[-1])
+                best_x = best_x_i.copy()
+            if interrupted_exc is not None:
+                break  # stop sweeping further object positions too
+
+        elapsed_sec = time.perf_counter() - sweep_t_start
+        h_point = np.array(all_point_rewards)
+        h_best = np.maximum.accumulate(h_point) if h_point.size else np.array([])
         np.savez(out_dir / "sweep_curves.npz", best_so_far=h_best, point_reward=h_point)
         _save_curve_png(out_dir / "reward_curve.png", h_best, "best_so_far", h_point, "point_reward", elapsed_sec=elapsed_sec)
         if sweep_records:
@@ -2168,8 +2236,12 @@ def main():
                 value=np.array([r["value"] for r in sweep_records], dtype=np.float64),
                 episode_return=np.array([r["episode_return"] for r in sweep_records], dtype=np.float64),
                 mocap_pos=np.stack([r["mocap_pos"] for r in sweep_records], axis=0),  # (n_points, T, 3)
+                object_x=np.array([r["object_x"] for r in sweep_records], dtype=np.float64),
+                object_y=np.array([r["object_y"] for r in sweep_records], dtype=np.float64),
                 dim_names=np.array(sweep_dim_names),
                 sweep_values=sweep_values,
+                object_x_values=np.array(object_x_values, dtype=np.float64),
+                object_y_values=np.array(object_y_values, dtype=np.float64),
                 theta_base=theta_base,
             )
             print(f"Saved {len(sweep_records)} trajectories to {out_dir / 'film_sweep_trajectories.npz'}")

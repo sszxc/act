@@ -115,6 +115,19 @@
   .legend-row { display: flex; align-items: center; gap: 10px; font-size: 0.72rem; color: var(--muted); margin-top: 4px; }
   .swatch-line { width: 22px; height: 0; border-top: 2px dashed var(--ink-line); display: inline-block; }
 
+  .plot3d-row { display: flex; align-items: stretch; gap: 4px; }
+  .plot3d-row #plot3d { flex: 1; min-width: 0; }
+  .vslider-wrap { width: 26px; position: relative; }
+  .vslider-wrap input[type="range"] {
+    position: absolute; top: 50%; left: 50%; width: 400px;
+    transform: translate(-50%, -50%) rotate(-90deg);
+  }
+  .hslider-wrap { padding: 2px 13px 0; }
+  .hslider-wrap input[type="range"], .vslider-wrap input[type="range"] {
+    accent-color: var(--accent);
+  }
+  #objPosLabel { text-align: center; }
+
   footer { font-size: 0.75rem; color: var(--muted); border-top: 1px solid var(--grid); padding-top: 12px; line-height: 1.6; }
 </style>
 
@@ -131,9 +144,18 @@
     <section class="panel">
       <h2>End-effector path</h2>
       <p class="hint">Drag to rotate · scroll to zoom · click a legend value to isolate it</p>
-      <div id="plot3d" style="width:100%; height:460px;"></div>
+      <p class="hint" id="objPosLabel" hidden></p>
+      <div class="plot3d-row">
+        <div id="plot3d" style="width:100%; height:460px;"></div>
+        <div class="vslider-wrap" id="objYSliderWrap" hidden>
+          <input type="range" id="objYSlider" min="0" max="0" step="1" value="0" />
+        </div>
+      </div>
+      <div class="hslider-wrap" id="objXSliderWrap" hidden>
+        <input type="range" id="objXSlider" min="0" max="0" step="1" value="0" style="width:100%;" />
+      </div>
       <div class="legend-row"><span class="swatch-line"></span> policy default (no FiLM change)</div>
-      <div class="legend-row">● start &nbsp;&nbsp; ■ end &nbsp;&nbsp; ◆ object (fixed pose)</div>
+      <div class="legend-row">● start &nbsp;&nbsp; ■ end &nbsp;&nbsp; ◆ object</div>
     </section>
 
     <div class="stack">
@@ -156,7 +178,11 @@
 <!--
   Real data goes here: replace `null` below with a JSON object
   { meta: {dim_names, sweep_values, theta_base, fixed_object_pose, task_name, film_target,
-           ckpt, source_file}, rows: [{dim_name, value, episode_return, mocap_pos}, ...] }.
+           ckpt, source_file, object_x_values, object_y_values},
+    rows: [{dim_name, value, episode_return, mocap_pos, object_x, object_y}, ...] }.
+  object_x_values/object_y_values (meta) and object_x/object_y (per row) are optional -- absent
+  when the object x/y grid wasn't swept (or from an older sweep), in which case the sliders stay
+  hidden and every row is treated as sitting at fixed_object_pose's x/y.
   visualize_film_sweep.py does this automatically from film_sweep_trajectories.npz.
   Left as null, the page falls back to a generated sample dataset (layout preview only).
 -->
@@ -200,6 +226,8 @@
   var DEFAULT_DIM_NAMES = ["gamma_0", "gamma_1", "gamma_2", "beta_0", "beta_1", "beta_2"];
   var DEFAULT_SWEEP_VALUES = [-100, -10, -5, -1, -0.5, 0, 0.5, 1, 5, 10, 100];
   var DEFAULT_OBJECT_POS = [0.10, 0.65, 0.685];
+  var DEFAULT_OBJECT_X_VALUES = [0.08, 0.10, 0.12];
+  var DEFAULT_OBJECT_Y_VALUES = [0.62, 0.65, 0.68];
 
   var META = (injected && injected.meta) || {
     task_name: "sim_hmf_proto5_pick_eval",
@@ -207,11 +235,23 @@
     dim_names: DEFAULT_DIM_NAMES,
     sweep_values: DEFAULT_SWEEP_VALUES,
     fixed_object_pose: DEFAULT_OBJECT_POS,
+    object_x_values: DEFAULT_OBJECT_X_VALUES,
+    object_y_values: DEFAULT_OBJECT_Y_VALUES,
     sample: true,
   };
   var DIM_NAMES = META.dim_names || DEFAULT_DIM_NAMES;
   var ALL_VALUES = META.sweep_values || DEFAULT_SWEEP_VALUES;
   var OBJECT_POS = (META.fixed_object_pose || DEFAULT_OBJECT_POS).slice(0, 3);
+  // Object x/y grid crossed with the FiLM dim/value sweep (optimize_film_params.py
+  // --object_sweep_x_values/--object_sweep_y_values). Falls back to the single fixed
+  // position for older sweep outputs / when the grid wasn't swept.
+  var OBJECT_X_VALUES = (META.object_x_values && META.object_x_values.length) ? META.object_x_values : [OBJECT_POS[0]];
+  var OBJECT_Y_VALUES = (META.object_y_values && META.object_y_values.length) ? META.object_y_values : [OBJECT_POS[1]];
+  var objXIdx = Math.floor((OBJECT_X_VALUES.length - 1) / 2);
+  var objYIdx = Math.floor((OBJECT_Y_VALUES.length - 1) / 2);
+  function selectedObjXY() { return [OBJECT_X_VALUES[objXIdx], OBJECT_Y_VALUES[objYIdx]]; }
+  function rowObjX(r) { return r.object_x !== undefined ? r.object_x : OBJECT_POS[0]; }
+  function rowObjY(r) { return r.object_y !== undefined ? r.object_y : OBJECT_POS[1]; }
 
   var MAXMAG = Math.log1p(Math.max.apply(null, ALL_VALUES.map(Math.abs).concat([1])));
   function colorForValue(v) {
@@ -259,42 +299,55 @@
     return WAYPOINTS[WAYPOINTS.length - 1].p;
   }
 
+  var CENTER_OBJ_X = OBJECT_X_VALUES[Math.floor((OBJECT_X_VALUES.length - 1) / 2)];
+  var CENTER_OBJ_Y = OBJECT_Y_VALUES[Math.floor((OBJECT_Y_VALUES.length - 1) / 2)];
+
   function buildMockDataset() {
     var T = 90;
     var rows = [];
-    DIM_NAMES.forEach(function (dim, dimIdx) {
-      var base = baselineOf(dim);
-      var rng = mulberry32(1000 + dimIdx * 97);
-      // a fixed per-dimension drift direction, so different FiLM directions push the
-      // arm off in visibly different ways
-      var driftAngle = dimIdx * 1.31;
-      var drift = [Math.cos(driftAngle), Math.sin(driftAngle), 0.4 * Math.sin(driftAngle * 0.7)];
+    OBJECT_X_VALUES.forEach(function (ox) {
+      OBJECT_Y_VALUES.forEach(function (oy) {
+        // the object moving on the grid drags the whole approach/grasp path with it
+        var objOffset = [ox - CENTER_OBJ_X, oy - CENTER_OBJ_Y];
 
-      ALL_VALUES.forEach(function (value) {
-        var delta = Math.abs(value - base);
-        var m = Math.min(1, Math.log1p(delta) / MAXMAG); // 0 at baseline -> ~1 at extreme
-        var liftFactor = 1 - 0.85 * Math.min(1, m * 1.25);
-        var jitterAmp = 0.012 * m;
-        var driftAmp = 0.05 * Math.pow(m, 1.3);
+        DIM_NAMES.forEach(function (dim, dimIdx) {
+          var base = baselineOf(dim);
+          var rng = mulberry32(1000 + dimIdx * 97 + Math.round(ox * 5000) + Math.round(oy * 7000));
+          // a fixed per-dimension drift direction, so different FiLM directions push the
+          // arm off in visibly different ways
+          var driftAngle = dimIdx * 1.31;
+          var drift = [Math.cos(driftAngle), Math.sin(driftAngle), 0.4 * Math.sin(driftAngle * 0.7)];
 
-        var pos = [];
-        for (var i = 0; i < T; i++) {
-          var u = i / (T - 1);
-          var p = basePoint(u).slice();
-          var liftRef = basePoint(0.45);
-          p[2] = liftRef[2] + (p[2] - liftRef[2]) * liftFactor;
-          var ramp = Math.min(1, u / 0.5);
-          p[0] += drift[0] * driftAmp * ramp;
-          p[1] += drift[1] * driftAmp * ramp;
-          p[2] += drift[2] * driftAmp * ramp * 0.5;
-          p[0] += jitterAmp * Math.sin(i * 1.7 + dimIdx) * (rng() * 0.6 + 0.7);
-          p[1] += jitterAmp * Math.cos(i * 1.3 + dimIdx) * (rng() * 0.6 + 0.7);
-          p[2] += jitterAmp * 0.5 * Math.sin(i * 2.1);
-          pos.push(p);
-        }
+          ALL_VALUES.forEach(function (value) {
+            var delta = Math.abs(value - base);
+            var m = Math.min(1, Math.log1p(delta) / MAXMAG); // 0 at baseline -> ~1 at extreme
+            var liftFactor = 1 - 0.85 * Math.min(1, m * 1.25);
+            var jitterAmp = 0.012 * m;
+            var driftAmp = 0.05 * Math.pow(m, 1.3);
 
-        var reward = -60 - 550 * Math.pow(m, 1.6) + (rng() - 0.5) * 14 - dimIdx * 2.5;
-        rows.push({ dim_name: dim, value: value, episode_return: reward, mocap_pos: pos });
+            var pos = [];
+            for (var i = 0; i < T; i++) {
+              var u = i / (T - 1);
+              var p = basePoint(u).slice();
+              var liftRef = basePoint(0.45);
+              p[2] = liftRef[2] + (p[2] - liftRef[2]) * liftFactor;
+              var ramp = Math.min(1, u / 0.5);
+              p[0] += drift[0] * driftAmp * ramp;
+              p[1] += drift[1] * driftAmp * ramp;
+              p[2] += drift[2] * driftAmp * ramp * 0.5;
+              p[0] += jitterAmp * Math.sin(i * 1.7 + dimIdx) * (rng() * 0.6 + 0.7);
+              p[1] += jitterAmp * Math.cos(i * 1.3 + dimIdx) * (rng() * 0.6 + 0.7);
+              p[2] += jitterAmp * 0.5 * Math.sin(i * 2.1);
+              p[0] += objOffset[0] * ramp;
+              p[1] += objOffset[1] * ramp;
+              pos.push(p);
+            }
+
+            var reward = -60 - 550 * Math.pow(m, 1.6) + (rng() - 0.5) * 14 - dimIdx * 2.5
+              - 40 * (Math.abs(objOffset[0]) + Math.abs(objOffset[1]));
+            rows.push({ dim_name: dim, value: value, episode_return: reward, mocap_pos: pos, object_x: ox, object_y: oy });
+          });
+        });
       });
     });
     return rows;
@@ -322,11 +375,16 @@
         "on a real <code>film_sweep_trajectories.npz</code> to replace it";
     }
 
+    var objGridNote = (OBJECT_X_VALUES.length > 1 || OBJECT_Y_VALUES.length > 1)
+      ? "Object x/y also swept on a " + OBJECT_X_VALUES.length + "×" + OBJECT_Y_VALUES.length +
+        " grid crossed with the FiLM sweep (drag the sliders beside/below the 3D plot) — z fixed at " +
+        OBJECT_POS[2].toFixed(3) + "."
+      : "Object pose fixed at (" + OBJECT_POS.map(function (v) { return v.toFixed(2); }).join(", ") + ") for every rollout.";
     document.getElementById("footer").innerHTML =
       "Rendered from <code>" + (META.source_file || "film_sweep_trajectories.npz") + "</code> " +
       "(produced by <code>optimize_film_params.py --method sweep</code>) — fields " +
       "<code>dim_name</code>, <code>value</code>, <code>episode_return</code>, <code>mocap_pos (T,3)</code>. " +
-      "Object pose fixed at (" + OBJECT_POS.map(function (v) { return v.toFixed(2); }).join(", ") + ") for every rollout.";
+      objGridNote;
   })();
 
   // ---------- per-tab render ----------
@@ -349,8 +407,12 @@
   function render(dim) {
     currentDim = dim;
     var base = baselineOf(dim);
-    var rows = DATA.filter(function (r) { return r.dim_name === dim; })
-      .sort(function (a, b) { return a.value - b.value; });
+    var oxy = selectedObjXY();
+    var rows = DATA.filter(function (r) {
+      return r.dim_name === dim &&
+        Math.abs(rowObjX(r) - oxy[0]) < 1e-4 &&
+        Math.abs(rowObjY(r) - oxy[1]) < 1e-4;
+    }).sort(function (a, b) { return a.value - b.value; });
     var baseIdx = rows.findIndex(function (r) { return r.value === base; });
     var label = labelFor(dim);
 
@@ -374,9 +436,9 @@
     });
     traces3d.push({
       type: "scatter3d", mode: "markers",
-      x: [OBJECT_POS[0]], y: [OBJECT_POS[1]], z: [OBJECT_POS[2]],
+      x: [oxy[0]], y: [oxy[1]], z: [OBJECT_POS[2]],
       marker: { size: 6, symbol: "diamond", color: COLOR.muted },
-      name: "object (fixed pose)",
+      name: "object",
       hovertemplate: "object<extra></extra>",
     });
 
@@ -453,6 +515,39 @@
 
     plotted = true;
   }
+
+  // ---------- object position sliders ----------
+  var objXSlider = document.getElementById("objXSlider");
+  var objYSlider = document.getElementById("objYSlider");
+  var objPosLabel = document.getElementById("objPosLabel");
+
+  function updateObjLabel() {
+    var oxy = selectedObjXY();
+    objPosLabel.hidden = false;
+    objPosLabel.textContent = "Object position: x=" + oxy[0].toFixed(3) + " m · y=" + oxy[1].toFixed(3) + " m";
+  }
+
+  if (OBJECT_X_VALUES.length > 1) {
+    document.getElementById("objXSliderWrap").hidden = false;
+    objXSlider.max = OBJECT_X_VALUES.length - 1;
+    objXSlider.value = objXIdx;
+    objXSlider.addEventListener("input", function () {
+      objXIdx = +objXSlider.value;
+      updateObjLabel();
+      render(currentDim);
+    });
+  }
+  if (OBJECT_Y_VALUES.length > 1) {
+    document.getElementById("objYSliderWrap").hidden = false;
+    objYSlider.max = OBJECT_Y_VALUES.length - 1;
+    objYSlider.value = objYIdx;
+    objYSlider.addEventListener("input", function () {
+      objYIdx = +objYSlider.value;
+      updateObjLabel();
+      render(currentDim);
+    });
+  }
+  if (OBJECT_X_VALUES.length > 1 || OBJECT_Y_VALUES.length > 1) updateObjLabel();
 
   // ---------- tabs ----------
   var tabsEl = document.getElementById("tabs");
