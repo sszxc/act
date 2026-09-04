@@ -1646,8 +1646,15 @@ def main():
         help="--method sweep: comma/JSON list of raw theta values. Swept one dim at a time "
         "(gamma_0..gamma_{k-1}, beta_0..beta_{k-1}) with every other dim held at theta_base "
         "(the policy's currently loaded FiLM identity: gamma=1, beta=0) — n_dims * n_values "
-        "rollouts total. Always records a video and the end-effector (mocap) xyz trajectory "
-        "per point (see film_sweep_trajectories.npz).",
+        "rollouts total. Always records the end-effector (mocap) xyz trajectory per point (see "
+        "film_sweep_trajectories.npz), plus a video unless --sweep_no_videos.",
+    )
+    p.add_argument(
+        "--sweep_no_videos",
+        action="store_true",
+        help="--method sweep: skip rendering/saving a video per point (mocap_pos + reward are "
+        "still recorded, which is all the viz needs). Saves roughly the video-encoding share of "
+        "each rollout's wall time (measured ~4-5s of a ~20-30s rollout, i.e. ~15-20%%).",
     )
     p.add_argument(
         "--object_sweep_x_values",
@@ -1862,8 +1869,9 @@ def main():
         f"(max_k={max_k} in {film_pca_path}), film_dim={film_dim}"
     )
     sweep_dim_names = [f"gamma_{i}" for i in range(k)] + [f"beta_{i}" for i in range(k)]
-    if args.method == "sweep" and not args.save_videos:
-        print("[sweep] forcing --save_videos on (each sweep point renders its own video)")
+    if args.method == "sweep" and not args.sweep_no_videos and not args.save_videos:
+        print("[sweep] forcing --save_videos on (each sweep point renders its own video); "
+              "pass --sweep_no_videos to skip and save time")
         args.save_videos = True
 
     latent_z = _parse_latent_z(args.latent_z_sample, args.latent_z_dim)
