@@ -214,9 +214,10 @@ def rollout_batch_episode_returns(
     video_dir: Path | None = None,
     round_label: str = "round",
     capture_frames: bool = False,
+    capture_mocap_pos: bool = False,
     video_layout: str = "combined",
     film_target: str = "visual",
-) -> np.ndarray | tuple[np.ndarray, list[list[dict]]]:
+):
     """
     Step multiple envs in parallel (one theta each), batch observations per timestep on one GPU.
     Returns episode_return per trajectory (shape: (B,)).
@@ -230,11 +231,20 @@ def rollout_batch_episode_returns(
     video_layout="combined" (default) writes one side-by-side mp4; "separate" writes one mp4
     per camera (e.g. round_0001_env0_default_cam.mp4).
 
-    If capture_frames is True, also (or additionally, independent of video_dir) collects each
-    env's per-timestep observation images and returns them as a second value:
-    (rewards_sum, image_lists) where image_lists[i] is a list of {cam_name: HxWxC uint8} dicts,
-    one per timestep, for env i (same format save_videos expects). Used e.g. to build VLM visual
-    feedback without needing to encode/decode an mp4.
+    If capture_frames is True, also collects each env's per-timestep observation images and
+    returns them: image_lists[i] is a list of {cam_name: HxWxC uint8} dicts, one per timestep,
+    for env i (same format save_videos expects). Used e.g. to build VLM visual feedback without
+    needing to encode/decode an mp4.
+
+    If capture_mocap_pos is True, also collects each env's commanded end-effector (mocap) xyz
+    position per timestep as an (B, T, 3) array. Only meaningful for HMF-proto5-style mocap
+    tasks, where action[:3] IS the mocap_pos written verbatim into physics.data.mocap_pos (see
+    sim_env.py's Proto5HMFMocapTask.before_step()) — for other task families action[:3] is not
+    an end-effector position.
+
+    capture_frames and capture_mocap_pos are independent; when either is set, the return value
+    is (rewards_sum, *extras) with extras in that order (image_lists, then mocap_pos), otherwise
+    just rewards_sum.
     """
     B = len(envs)
     if thetas.shape[0] != B:
@@ -286,6 +296,7 @@ def rollout_batch_episode_returns(
     record_video = video_dir is not None
     collect_images = record_video or capture_frames
     image_lists: list[list[dict]] | None = [[] for _ in range(B)] if collect_images else None
+    mocap_pos_lists: list[list[np.ndarray]] | None = [[] for _ in range(B)] if capture_mocap_pos else None
 
     # Same as imitate_episodes eval: inference_mode so temporal_agg does not keep
     # autograd over the full episode when stitching multi-step policy outputs into all_time_actions
@@ -352,6 +363,11 @@ def rollout_batch_episode_returns(
             raw_np = raw_action.detach().cpu().numpy()
             target_qpos_batch = post_process(raw_np)  # (B, action_dim)
 
+            if capture_mocap_pos:
+                assert mocap_pos_lists is not None
+                for i in range(B):
+                    mocap_pos_lists[i].append(np.asarray(target_qpos_batch[i, :3], dtype=np.float64))
+
             # step envs
             new_ts_list = []
             for i, env in enumerate(envs):
@@ -373,9 +389,15 @@ def rollout_batch_episode_returns(
                 layout=video_layout,
             )
 
+    extras = []
     if capture_frames:
         assert image_lists is not None
-        return rewards_sum, image_lists
+        extras.append(image_lists)
+    if capture_mocap_pos:
+        assert mocap_pos_lists is not None
+        extras.append(np.stack([np.stack(lst, axis=0) for lst in mocap_pos_lists], axis=0))
+    if extras:
+        return (rewards_sum, *extras)
     return rewards_sum
 
 
@@ -812,6 +834,89 @@ def run_cma_batched(
     return best_x, np.asarray(history_best), np.asarray(history_gen_max), interrupted_exc, elapsed_sec
 
 
+def run_sweep(
+    fitness_fn,
+    theta_base: np.ndarray,
+    *,
+    dim_names: list[str],
+    sweep_values: np.ndarray,
+    log_path: Path,
+):
+    """
+    One-at-a-time manual grid sweep (--method sweep): for each name in dim_names (in order),
+    set theta[dim] to each of sweep_values while every other dim stays at theta_base, and call
+    fitness_fn(theta, dim_name, value) -> reward. Not an optimizer — just drives the grid and
+    logs/checkpoints progress the same way run_ars/run_cma do, so it gets the same
+    reward_curve.png / interrupt handling for free. fitness_fn is responsible for its own side
+    effects (saving video/trajectory) per point.
+    """
+    out_dir = log_path.parent
+    history_best = []
+    history_point = []
+    best_so_far = -np.inf
+    best_theta = theta_base.copy()
+
+    grid = [(i, float(v)) for i in range(len(dim_names)) for v in sweep_values]
+    t_start = time.perf_counter()
+    with open(log_path, "w", encoding="utf-8") as flog:
+        flog.write(
+            f"# Sweep dim={theta_base.size} n_dims={len(dim_names)} n_values={len(sweep_values)} "
+            f"n_points={len(grid)} start_time={datetime.now().isoformat()}\n"
+        )
+
+    interrupted_exc: BaseException | None = None
+    it = -1
+    try:
+        for it, (dim_idx, value) in enumerate(grid):
+            t0 = time.perf_counter()
+            theta = theta_base.copy()
+            theta[dim_idx] = value
+            dim_name = dim_names[dim_idx]
+            print(f"[sweep] point {it}/{len(grid)-1}: {dim_name}={value:g} starting")
+            reward = float(fitness_fn(theta, dim_name, value))
+            if reward > best_so_far:
+                best_so_far = reward
+                best_theta = theta.copy()
+            history_best.append(best_so_far)
+            history_point.append(reward)
+            elapsed_now = time.perf_counter() - t_start
+            with open(log_path, "a", encoding="utf-8") as flog:
+                flog.write(
+                    json.dumps(
+                        {
+                            "point": it,
+                            "dim_name": dim_name,
+                            "value": value,
+                            "reward": reward,
+                            "best_so_far": best_so_far,
+                            "elapsed_sec": round(elapsed_now, 3),
+                        }
+                    )
+                    + "\n"
+                )
+            _save_progress_checkpoint(
+                out_dir,
+                "sweep_curves.npz",
+                {"best_so_far": np.array(history_best), "point_reward": np.array(history_point)},
+                np.array(history_best),
+                "best_so_far",
+                np.array(history_point),
+                "point_reward",
+                elapsed_now,
+            )
+            dt = time.perf_counter() - t0
+            print(
+                f"[sweep] point {it}: {dim_name}={value:g} reward={reward:.4f} "
+                f"best_so_far={best_so_far:.4f} wall={dt:.2f}s"
+            )
+    except (KeyboardInterrupt, Exception) as e:
+        interrupted_exc = e
+        _handle_optimizer_interrupt("sweep", e, it, len(history_best))
+
+    elapsed_sec = time.perf_counter() - t_start
+    return best_theta, np.array(history_best), np.array(history_point), interrupted_exc, elapsed_sec
+
+
 def _format_duration(seconds: float) -> str:
     total = int(round(max(0.0, seconds)))
     h, rem = divmod(total, 3600)
@@ -832,22 +937,34 @@ def _save_curve_png(
     elapsed_sec: float | None = None,
     ylabel: str = "episode_return",
 ):
-    if len(y1) == 0:
-        print(f"[plot] skipping {path.name}: no completed rounds to plot")
-        return
-
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(8, 4))
-    ax.plot(np.arange(len(y1)), y1, label=y1_label)
-    if y2 is not None:
-        ax.plot(np.arange(len(y2)), y2, alpha=0.6, label=y2_label or "iter/gen max")
+    if len(y1) == 0:
+        # Still write a PNG on failed / 0-round runs so every experiment dir has a
+        # reward_curve.png (empty axes + annotation), not a missing file.
+        ax.text(
+            0.5,
+            0.5,
+            "no completed rounds to plot",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=12,
+            alpha=0.7,
+        )
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+    else:
+        ax.plot(np.arange(len(y1)), y1, label=y1_label)
+        if y2 is not None:
+            ax.plot(np.arange(len(y2)), y2, alpha=0.6, label=y2_label or "iter/gen max")
+        ax.legend()
     ax.set_xlabel("iteration / generation")
     ax.set_ylabel(ylabel)
-    ax.legend()
     ax.grid(True, alpha=0.3)
     if elapsed_sec is not None:
         ax.text(
@@ -1504,7 +1621,7 @@ def main():
         action="store_true",
         help="Init qpos from a random trajectory start in the dataset (combines with fixed object)",
     )
-    p.add_argument("--method", type=str, choices=("cma", "ars", "llm"), required=True)
+    p.add_argument("--method", type=str, choices=("cma", "ars", "llm", "sweep"), required=True)
     # policy architecture (must match training)
     p.add_argument("--policy_class", type=str, default="ACT")
     p.add_argument("--chunk_size", type=int, default=100)
@@ -1521,6 +1638,17 @@ def main():
     p.add_argument("--cma_sigma0", type=float, default=0.3)
     p.add_argument("--cma_maxiter", type=int, default=50)
     p.add_argument("--cma_popsize", type=int, default=None)
+    # sweep (manual one-at-a-time grid search)
+    p.add_argument(
+        "--sweep_values",
+        type=str,
+        default="-10,-5,-3,-1,-0.5,0,0.5,1,3,5,10",
+        help="--method sweep: comma/JSON list of raw theta values. Swept one dim at a time "
+        "(gamma_0..gamma_{k-1}, beta_0..beta_{k-1}) with every other dim held at theta_base "
+        "(the policy's currently loaded FiLM identity: gamma=1, beta=0) — n_dims * n_values "
+        "rollouts total. Always records a video and the end-effector (mocap) xyz trajectory "
+        "per point (see film_sweep_trajectories.npz).",
+    )
     p.add_argument(
         "--show_rollout_progress",
         action="store_true",
@@ -1718,6 +1846,10 @@ def main():
         f"Loaded {ckpt_loaded}, PCA-bottleneck FiLM target={args.film_target}: k={k} "
         f"(max_k={max_k} in {film_pca_path}), film_dim={film_dim}"
     )
+    sweep_dim_names = [f"gamma_{i}" for i in range(k)] + [f"beta_{i}" for i in range(k)]
+    if args.method == "sweep" and not args.save_videos:
+        print("[sweep] forcing --save_videos on (each sweep point renders its own video)")
+        args.save_videos = True
 
     latent_z = _parse_latent_z(args.latent_z_sample, args.latent_z_dim)
 
@@ -1830,6 +1962,11 @@ def main():
     if args.save_videos:
         meta["videos_dir"] = "videos"
         meta["video_layout"] = args.video_layout
+    if args.method == "sweep":
+        sweep_values = _parse_float_list(args.sweep_values)
+        meta["sweep_values"] = sweep_values.tolist()
+        meta["sweep_dim_names"] = sweep_dim_names
+        meta["sweep_trajectories_file"] = "film_sweep_trajectories.npz"
     prompt_template_path: Path | None = None
     use_vlm = False
     use_reward_predictor = False
@@ -1974,7 +2111,70 @@ def main():
             )
         np.savez(out_dir / "cma_curves.npz", best_so_far=h_best, gen_max=h_gen)
         _save_curve_png(out_dir / "reward_curve.png", h_best, "best_so_far", h_gen, "gen_max", elapsed_sec=elapsed_sec)
-    else:
+    elif args.method == "sweep":
+        if int(args.parallel) > 1:
+            print("Warning: --method sweep evaluates one grid point per rollout; extra parallel envs stay idle.")
+        log_path = out_dir / "sweep_history.jsonl"
+        sweep_records: list[dict] = []
+
+        def eval_sweep_point(theta: np.ndarray, dim_name: str, value: float) -> float:
+            round_label = f"{dim_name}_val{value:g}"
+            reward_arr, mocap_pos_arr = rollout_batch_episode_returns(
+                policy,
+                envs[:1],
+                eval_cfg,
+                pre,
+                post,
+                theta.reshape(1, -1),
+                latent_z=latent_z,
+                fixed_object_pose=fixed_object_pose,
+                fixed_object_shape=fixed_object_shape,
+                fixed_object_size=fixed_object_size,
+                fixed_init_qpos=fixed_init_qpos,
+                init_qpos_from_dataset=args.init_qpos_from_dataset,
+                dataset_dir=task_cfg.get("dataset_dir"),
+                num_episodes=task_cfg.get("num_episodes"),
+                show_rollout_progress=bool(args.show_rollout_progress),
+                rollout_desc=f"sweep {round_label}",
+                video_dir=video_dir,
+                round_label=round_label,
+                capture_mocap_pos=True,
+                video_layout=args.video_layout,
+                film_target=args.film_target,
+            )
+            sweep_records.append(
+                {
+                    "dim_name": dim_name,
+                    "value": float(value),
+                    "episode_return": float(reward_arr[0]),
+                    "mocap_pos": mocap_pos_arr[0],  # (T, 3)
+                }
+            )
+            return float(reward_arr[0])
+
+        best_x, h_best, h_point, interrupted_exc, elapsed_sec = run_sweep(
+            eval_sweep_point,
+            opt_x0,
+            dim_names=sweep_dim_names,
+            sweep_values=sweep_values,
+            log_path=log_path,
+        )
+        np.savez(out_dir / "sweep_curves.npz", best_so_far=h_best, point_reward=h_point)
+        _save_curve_png(out_dir / "reward_curve.png", h_best, "best_so_far", h_point, "point_reward", elapsed_sec=elapsed_sec)
+        if sweep_records:
+            np.savez(
+                out_dir / "film_sweep_trajectories.npz",
+                dim_name=np.array([r["dim_name"] for r in sweep_records]),
+                value=np.array([r["value"] for r in sweep_records], dtype=np.float64),
+                episode_return=np.array([r["episode_return"] for r in sweep_records], dtype=np.float64),
+                mocap_pos=np.stack([r["mocap_pos"] for r in sweep_records], axis=0),  # (n_points, T, 3)
+                dim_names=np.array(sweep_dim_names),
+                sweep_values=sweep_values,
+                theta_base=theta_base,
+            )
+            print(f"Saved {len(sweep_records)} trajectories to {out_dir / 'film_sweep_trajectories.npz'}")
+            print(f"Visualize: python visualize_film_sweep.py --sweep_dir {out_dir}")
+    elif args.method == "llm":
         if int(args.parallel) > 1:
             print("Warning: --method llm currently evaluates one candidate per iteration; extra parallel envs stay idle.")
         assert prompt_template_path is not None

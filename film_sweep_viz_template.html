@@ -1,0 +1,477 @@
+<title>FiLM Sweep Explorer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/4.0.0/plotly.min.js"></script>
+<style>
+  :root {
+    color-scheme: light;
+    --page:        #f9f9f7;
+    --surface:     #fcfcfb;
+    --text:        #0b0b0b;
+    --text-2:      #52514e;
+    --muted:       #898781;
+    --grid:        #e1e0d9;
+    --axis:        #c3c2b7;
+    --border:      rgba(11,11,11,0.10);
+    --accent:      #2a78d6;
+    --div-neg:     #2a78d6;
+    --div-mid:     #f0efec;
+    --div-pos:     #e34948;
+    --ink-line:    #0b0b0b;
+    --tab-bg:      #f0efec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page:        #0d0d0d;
+      --surface:     #1a1a19;
+      --text:        #ffffff;
+      --text-2:      #c3c2b7;
+      --muted:       #898781;
+      --grid:        #2c2c2a;
+      --axis:        #383835;
+      --border:      rgba(255,255,255,0.10);
+      --accent:      #3987e5;
+      --div-neg:     #3987e5;
+      --div-mid:     #383835;
+      --div-pos:     #e66767;
+      --ink-line:    #ffffff;
+      --tab-bg:      #232322;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page:        #0d0d0d;
+    --surface:     #1a1a19;
+    --text:        #ffffff;
+    --text-2:      #c3c2b7;
+    --muted:       #898781;
+    --grid:        #2c2c2a;
+    --axis:        #383835;
+    --border:      rgba(255,255,255,0.10);
+    --accent:      #3987e5;
+    --div-neg:     #3987e5;
+    --div-mid:     #383835;
+    --div-pos:     #e66767;
+    --ink-line:    #ffffff;
+    --tab-bg:      #232322;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--page);
+    color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 20px 24px 40px;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+
+  header { display: flex; flex-direction: column; gap: 6px; }
+  h1 { font-size: 1.375rem; font-weight: 700; margin: 0; letter-spacing: -0.01em; text-wrap: balance; }
+  .subtitle { color: var(--text-2); font-size: 0.9rem; max-width: 68ch; line-height: 1.5; }
+  .subtitle code, footer code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85em;
+    background: var(--tab-bg); padding: 1px 5px; border-radius: 4px;
+  }
+  .badge {
+    align-self: flex-start;
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 0.75rem; color: var(--text-2);
+    border: 1px solid var(--border); border-radius: 999px;
+    padding: 4px 10px 4px 8px; margin-top: 2px;
+  }
+
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; border-bottom: 1px solid var(--grid); padding-bottom: 10px; }
+  .tab {
+    font: inherit; font-size: 0.95rem; font-weight: 600; color: var(--text-2);
+    background: var(--tab-bg); border: 1px solid transparent; border-radius: 8px;
+    padding: 7px 14px; cursor: pointer;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { background: var(--accent); color: #fff; }
+  .tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 1.15fr 0.85fr;
+    gap: 16px;
+    align-items: start;
+  }
+  @media (max-width: 860px) {
+    .grid { grid-template-columns: 1fr; }
+  }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 16px 8px;
+  }
+  .panel h2 {
+    font-size: 0.8rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+    color: var(--text-2); margin: 0 0 4px;
+  }
+  .panel .hint { font-size: 0.75rem; color: var(--muted); margin: 0 0 6px; }
+  .stack { display: flex; flex-direction: column; gap: 16px; }
+
+  .legend-row { display: flex; align-items: center; gap: 10px; font-size: 0.72rem; color: var(--muted); margin-top: 4px; }
+  .swatch-line { width: 22px; height: 0; border-top: 2px dashed var(--ink-line); display: inline-block; }
+
+  footer { font-size: 0.75rem; color: var(--muted); border-top: 1px solid var(--grid); padding-top: 12px; line-height: 1.6; }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>FiLM Sweep Explorer</h1>
+    <p class="subtitle" id="subtitle"></p>
+    <span class="badge" id="badge"></span>
+  </header>
+
+  <nav class="tabs" id="tabs"></nav>
+
+  <div class="grid">
+    <section class="panel">
+      <h2>End-effector path</h2>
+      <p class="hint">Drag to rotate · scroll to zoom · click a legend value to isolate it</p>
+      <div id="plot3d" style="width:100%; height:460px;"></div>
+      <div class="legend-row"><span class="swatch-line"></span> policy default (no FiLM change)</div>
+      <div class="legend-row">● start &nbsp;&nbsp; ■ end &nbsp;&nbsp; ◆ object (fixed pose)</div>
+    </section>
+
+    <div class="stack">
+      <section class="panel">
+        <h2>Height over time</h2>
+        <p class="hint">z position — did the lift actually happen?</p>
+        <div id="plotHeight" style="width:100%; height:210px;"></div>
+      </section>
+      <section class="panel">
+        <h2>Reward vs. value</h2>
+        <p class="hint">Hover a point to highlight its trajectory above</p>
+        <div id="plotReward" style="width:100%; height:210px;"></div>
+      </section>
+    </div>
+  </div>
+
+  <footer id="footer"></footer>
+</div>
+
+<!--
+  Real data goes here: replace `null` below with a JSON object
+  { meta: {dim_names, sweep_values, theta_base, fixed_object_pose, task_name, film_target,
+           ckpt, source_file}, rows: [{dim_name, value, episode_return, mocap_pos}, ...] }.
+  visualize_film_sweep.py does this automatically from film_sweep_trajectories.npz.
+  Left as null, the page falls back to a generated sample dataset (layout preview only).
+-->
+<script type="application/json" id="sweep-data">null</script>
+
+<script>
+(function () {
+  "use strict";
+
+  var injected = (function () {
+    try { return JSON.parse(document.getElementById("sweep-data").textContent); }
+    catch (e) { return null; }
+  })();
+
+  // ---------- palette (read from CSS so it follows light/dark) ----------
+  var cs = getComputedStyle(document.body);
+  var COLOR = {
+    text: cs.getPropertyValue("--text").trim(),
+    text2: cs.getPropertyValue("--text-2").trim(),
+    muted: cs.getPropertyValue("--muted").trim(),
+    grid: cs.getPropertyValue("--grid").trim(),
+    axis: cs.getPropertyValue("--axis").trim(),
+    surface: cs.getPropertyValue("--surface").trim(),
+    neg: cs.getPropertyValue("--div-neg").trim(),
+    mid: cs.getPropertyValue("--div-mid").trim(),
+    pos: cs.getPropertyValue("--div-pos").trim(),
+    ink: cs.getPropertyValue("--ink-line").trim(),
+  };
+
+  function hexToRgb(h) {
+    h = h.replace("#", "");
+    return [parseInt(h.slice(0,2),16), parseInt(h.slice(2,4),16), parseInt(h.slice(4,6),16)];
+  }
+  function rgbToStr(rgb) { return "rgb(" + rgb.map(function(v){return Math.round(v);}).join(",") + ")"; }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function lerpRgb(c1, c2, t) { return [lerp(c1[0],c2[0],t), lerp(c1[1],c2[1],t), lerp(c1[2],c2[2],t)]; }
+
+  var NEG = hexToRgb(COLOR.neg), MID = hexToRgb(COLOR.mid), POS = hexToRgb(COLOR.pos);
+
+  // ---------- defaults (used only when no real data is injected) ----------
+  var DEFAULT_DIM_NAMES = ["gamma_0", "gamma_1", "gamma_2", "beta_0", "beta_1", "beta_2"];
+  var DEFAULT_SWEEP_VALUES = [-100, -10, -5, -1, -0.5, 0, 0.5, 1, 5, 10, 100];
+  var DEFAULT_OBJECT_POS = [0.10, 0.65, 0.685];
+
+  var META = (injected && injected.meta) || {
+    task_name: "sim_hmf_proto5_pick_eval",
+    film_target: "hs",
+    dim_names: DEFAULT_DIM_NAMES,
+    sweep_values: DEFAULT_SWEEP_VALUES,
+    fixed_object_pose: DEFAULT_OBJECT_POS,
+    sample: true,
+  };
+  var DIM_NAMES = META.dim_names || DEFAULT_DIM_NAMES;
+  var ALL_VALUES = META.sweep_values || DEFAULT_SWEEP_VALUES;
+  var OBJECT_POS = (META.fixed_object_pose || DEFAULT_OBJECT_POS).slice(0, 3);
+
+  var MAXMAG = Math.log1p(Math.max.apply(null, ALL_VALUES.map(Math.abs).concat([1])));
+  function colorForValue(v) {
+    var u = Math.sign(v) * Math.log1p(Math.abs(v)) / MAXMAG; // [-1, 1]
+    return u <= 0 ? rgbToStr(lerpRgb(MID, NEG, -u)) : rgbToStr(lerpRgb(MID, POS, u));
+  }
+
+  var SUBSCRIPT = "₀₁₂₃₄₅₆₇₈₉";
+  function labelFor(dim) {
+    var m = /^(gamma|beta)_(\d+)$/.exec(dim);
+    if (!m) return dim;
+    var greek = m[1] === "gamma" ? "γ" : "β";
+    var sub = m[2].split("").map(function (d) { return SUBSCRIPT[+d]; }).join("");
+    return greek + sub;
+  }
+  function baselineOf(dim) { return dim.indexOf("gamma") === 0 ? 1 : 0; }
+
+  // ---------- mock dataset (matches film_sweep_trajectories.npz schema) ----------
+  function mulberry32(seed) {
+    return function () {
+      seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+      var t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var WAYPOINTS = [
+    { t: 0.00, p: [0.05, 0.55, 0.80] },  // start, hovering
+    { t: 0.25, p: [0.10, 0.65, 0.78] },  // approach above object
+    { t: 0.45, p: [0.10, 0.65, 0.70] },  // descend to grasp
+    { t: 0.75, p: [0.10, 0.64, 0.90] },  // lift
+    { t: 1.00, p: [0.11, 0.63, 0.92] },  // hold
+  ];
+  function basePoint(u) {
+    for (var i = 1; i < WAYPOINTS.length; i++) {
+      if (u <= WAYPOINTS[i].t) {
+        var a = WAYPOINTS[i - 1], b = WAYPOINTS[i];
+        var span = b.t - a.t;
+        var local = span > 0 ? (u - a.t) / span : 0;
+        var ease = local - Math.sin(2 * Math.PI * local) / (2 * Math.PI); // ease in/out
+        return [0, 1, 2].map(function (k) { return lerp(a.p[k], b.p[k], ease); });
+      }
+    }
+    return WAYPOINTS[WAYPOINTS.length - 1].p;
+  }
+
+  function buildMockDataset() {
+    var T = 90;
+    var rows = [];
+    DIM_NAMES.forEach(function (dim, dimIdx) {
+      var base = baselineOf(dim);
+      var rng = mulberry32(1000 + dimIdx * 97);
+      // a fixed per-dimension drift direction, so different FiLM directions push the
+      // arm off in visibly different ways
+      var driftAngle = dimIdx * 1.31;
+      var drift = [Math.cos(driftAngle), Math.sin(driftAngle), 0.4 * Math.sin(driftAngle * 0.7)];
+
+      ALL_VALUES.forEach(function (value) {
+        var delta = Math.abs(value - base);
+        var m = Math.min(1, Math.log1p(delta) / MAXMAG); // 0 at baseline -> ~1 at extreme
+        var liftFactor = 1 - 0.85 * Math.min(1, m * 1.25);
+        var jitterAmp = 0.012 * m;
+        var driftAmp = 0.05 * Math.pow(m, 1.3);
+
+        var pos = [];
+        for (var i = 0; i < T; i++) {
+          var u = i / (T - 1);
+          var p = basePoint(u).slice();
+          var liftRef = basePoint(0.45);
+          p[2] = liftRef[2] + (p[2] - liftRef[2]) * liftFactor;
+          var ramp = Math.min(1, u / 0.5);
+          p[0] += drift[0] * driftAmp * ramp;
+          p[1] += drift[1] * driftAmp * ramp;
+          p[2] += drift[2] * driftAmp * ramp * 0.5;
+          p[0] += jitterAmp * Math.sin(i * 1.7 + dimIdx) * (rng() * 0.6 + 0.7);
+          p[1] += jitterAmp * Math.cos(i * 1.3 + dimIdx) * (rng() * 0.6 + 0.7);
+          p[2] += jitterAmp * 0.5 * Math.sin(i * 2.1);
+          pos.push(p);
+        }
+
+        var reward = -60 - 550 * Math.pow(m, 1.6) + (rng() - 0.5) * 14 - dimIdx * 2.5;
+        rows.push({ dim_name: dim, value: value, episode_return: reward, mocap_pos: pos });
+      });
+    });
+    return rows;
+  }
+
+  var DATA = injected ? injected.rows : buildMockDataset();
+
+  // ---------- header / footer text ----------
+  (function fillText() {
+    var lo = Math.min.apply(null, ALL_VALUES), hi = Math.max.apply(null, ALL_VALUES);
+    document.getElementById("subtitle").innerHTML =
+      "One PCA-bottleneck FiLM parameter at a time, swept over <code>" + lo + " … " + hi + "</code> " +
+      "while the others stay at the policy's identity FiLM (γ=1, β=0), replayed on " +
+      "<code>" + (META.task_name || "?") + "</code>" +
+      (META.film_target ? " (target=<code>" + META.film_target + "</code>)" : "") +
+      ". Each line is the commanded end-effector (mocap) path for one value.";
+
+    var badge = document.getElementById("badge");
+    if (injected) {
+      badge.textContent = "📊 " + DATA.length + " rollouts" +
+        (META.source_file ? " — from " + META.source_file : "") +
+        (META.ckpt ? " · " + META.ckpt.split("/").slice(-2).join("/") : "");
+    } else {
+      badge.innerHTML = "🧪 Sample data — layout preview, run <code>visualize_film_sweep.py</code> " +
+        "on a real <code>film_sweep_trajectories.npz</code> to replace it";
+    }
+
+    document.getElementById("footer").innerHTML =
+      "Rendered from <code>" + (META.source_file || "film_sweep_trajectories.npz") + "</code> " +
+      "(produced by <code>optimize_film_params.py --method sweep</code>) — fields " +
+      "<code>dim_name</code>, <code>value</code>, <code>episode_return</code>, <code>mocap_pos (T,3)</code>. " +
+      "Object pose fixed at (" + OBJECT_POS.map(function (v) { return v.toFixed(2); }).join(", ") + ") for every rollout.";
+  })();
+
+  // ---------- per-tab render ----------
+  var el3d = document.getElementById("plot3d");
+  var elH = document.getElementById("plotHeight");
+  var elR = document.getElementById("plotReward");
+  var currentDim = DIM_NAMES[0];
+  var plotted = false;
+
+  function layoutCommon(extra) {
+    var base = {
+      paper_bgcolor: "transparent",
+      plot_bgcolor: "transparent",
+      font: { color: COLOR.text2, family: "system-ui, -apple-system, sans-serif", size: 11 },
+      margin: { l: 44, r: 12, t: 6, b: 36 },
+    };
+    return Object.assign(base, extra || {});
+  }
+
+  function render(dim) {
+    currentDim = dim;
+    var base = baselineOf(dim);
+    var rows = DATA.filter(function (r) { return r.dim_name === dim; })
+      .sort(function (a, b) { return a.value - b.value; });
+    var baseIdx = rows.findIndex(function (r) { return r.value === base; });
+    var label = labelFor(dim);
+
+    // ---- 3D path ----
+    var traces3d = rows.map(function (r, i) {
+      var isBase = i === baseIdx;
+      var n = r.mocap_pos.length;
+      var sizes = new Array(n).fill(0); sizes[0] = 7; sizes[n - 1] = 7;
+      var symbols = new Array(n).fill("circle"); symbols[n - 1] = "square";
+      return {
+        type: "scatter3d", mode: "lines+markers",
+        x: r.mocap_pos.map(function (p) { return p[0]; }),
+        y: r.mocap_pos.map(function (p) { return p[1]; }),
+        z: r.mocap_pos.map(function (p) { return p[2]; }),
+        line: { color: isBase ? COLOR.ink : colorForValue(r.value), width: isBase ? 6 : 3.5, dash: isBase ? "dash" : "solid" },
+        marker: { size: sizes, symbol: symbols, color: isBase ? COLOR.ink : colorForValue(r.value) },
+        name: (isBase ? "★ " : "") + "value=" + r.value,
+        legendgroup: String(r.value),
+        hovertemplate: label + "=" + r.value + "<br>return=" + r.episode_return.toFixed(1) + "<extra></extra>",
+      };
+    });
+    traces3d.push({
+      type: "scatter3d", mode: "markers",
+      x: [OBJECT_POS[0]], y: [OBJECT_POS[1]], z: [OBJECT_POS[2]],
+      marker: { size: 6, symbol: "diamond", color: COLOR.muted },
+      name: "object (fixed pose)",
+      hovertemplate: "object<extra></extra>",
+    });
+
+    var fn3d = plotted ? Plotly.react : Plotly.newPlot;
+    fn3d(el3d, traces3d, layoutCommon({
+      showlegend: false,
+      scene: {
+        aspectmode: "data",
+        xaxis: { title: "x (m)", color: COLOR.muted, gridcolor: COLOR.grid, backgroundcolor: "transparent" },
+        yaxis: { title: "y (m)", color: COLOR.muted, gridcolor: COLOR.grid, backgroundcolor: "transparent" },
+        zaxis: { title: "z (m)", color: COLOR.muted, gridcolor: COLOR.grid, backgroundcolor: "transparent" },
+        camera: { eye: { x: 1.5, y: -1.5, z: 0.9 } },
+      },
+    }), { displayModeBar: false, responsive: true });
+
+    // ---- height over time ----
+    var tracesH = rows.map(function (r, i) {
+      var isBase = i === baseIdx;
+      return {
+        type: "scatter", mode: "lines",
+        x: r.mocap_pos.map(function (_, t) { return t; }),
+        y: r.mocap_pos.map(function (p) { return p[2]; }),
+        line: { color: isBase ? COLOR.ink : colorForValue(r.value), width: isBase ? 3.5 : 2, dash: isBase ? "dash" : "solid" },
+        name: "value=" + r.value,
+        hovertemplate: label + "=" + r.value + "  z=%{y:.3f}<extra></extra>",
+      };
+    });
+    var fnH = plotted ? Plotly.react : Plotly.newPlot;
+    fnH(elH, tracesH, layoutCommon({
+      showlegend: false,
+      xaxis: { title: "timestep", color: COLOR.muted, gridcolor: COLOR.grid, zeroline: false },
+      yaxis: { title: "z (m)", color: COLOR.muted, gridcolor: COLOR.grid, zeroline: false },
+    }), { displayModeBar: false, responsive: true });
+
+    // ---- reward vs value ----
+    var cats = rows.map(function (r) { return String(r.value); });
+    var traceLine = {
+      type: "scatter", mode: "lines", x: cats, y: rows.map(function (r) { return r.episode_return; }),
+      line: { color: COLOR.grid, width: 1.5 }, hoverinfo: "skip", showlegend: false,
+    };
+    var traceMarkers = rows.map(function (r, i) {
+      var isBase = i === baseIdx;
+      return {
+        type: "scatter", mode: "markers", x: [cats[i]], y: [r.episode_return],
+        marker: { size: isBase ? 13 : 10, color: isBase ? COLOR.ink : colorForValue(r.value), symbol: isBase ? "diamond" : "circle",
+          line: { color: COLOR.surface, width: 1 } },
+        name: "value=" + r.value, showlegend: false,
+        hovertemplate: label + "=" + r.value + "<br>return=%{y:.1f}<extra></extra>",
+      };
+    });
+    var rewardTraces = [traceLine].concat(traceMarkers);
+    var fnR = plotted ? Plotly.react : Plotly.newPlot;
+    fnR(elR, rewardTraces, layoutCommon({
+      showlegend: false,
+      xaxis: { title: label + " value", type: "category", categoryarray: cats, color: COLOR.muted, gridcolor: COLOR.grid },
+      yaxis: { title: "episode_return", color: COLOR.muted, gridcolor: COLOR.grid, zeroline: false },
+    }), { displayModeBar: false, responsive: true });
+
+    // cross-highlight: hovering a reward marker dims the other trajectories
+    elR.removeAllListeners && elR.removeAllListeners("plotly_hover");
+    elR.removeAllListeners && elR.removeAllListeners("plotly_unhover");
+    elR.on("plotly_hover", function (ev) {
+      var idx = ev.points[0].curveNumber - 1; // trace 0 is the connecting line
+      if (idx < 0 || idx >= rows.length) return;
+      var op = rows.map(function (_, j) { return j === idx ? 1 : 0.12; });
+      Plotly.restyle(el3d, { opacity: op }, rows.map(function (_, j) { return j; }));
+      Plotly.restyle(elH, { opacity: op }, rows.map(function (_, j) { return j; }));
+    });
+    elR.on("plotly_unhover", function () {
+      var op = rows.map(function () { return 1; });
+      Plotly.restyle(el3d, { opacity: op }, rows.map(function (_, j) { return j; }));
+      Plotly.restyle(elH, { opacity: op }, rows.map(function (_, j) { return j; }));
+    });
+
+    plotted = true;
+  }
+
+  // ---------- tabs ----------
+  var tabsEl = document.getElementById("tabs");
+  DIM_NAMES.forEach(function (dim) {
+    var btn = document.createElement("button");
+    btn.className = "tab" + (dim === currentDim ? " active" : "");
+    btn.textContent = labelFor(dim);
+    btn.setAttribute("data-dim", dim);
+    btn.addEventListener("click", function () {
+      Array.prototype.forEach.call(tabsEl.children, function (c) { c.classList.remove("active"); });
+      btn.classList.add("active");
+      render(dim);
+    });
+    tabsEl.appendChild(btn);
+  });
+
+  render(currentDim);
+  window.addEventListener("resize", function () {
+    Plotly.Plots.resize(el3d); Plotly.Plots.resize(elH); Plotly.Plots.resize(elR);
+  });
+})();
+</script>

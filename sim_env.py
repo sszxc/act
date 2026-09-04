@@ -518,6 +518,7 @@ class Proto5HMFMocapTask(base.Task):
     """
 
     MOCAP_BODY_NAME = 'mocap'
+    WRIST_BODY_NAME = 'RHand_PALM_LINK'  # welded to MOCAP_BODY_NAME, see mjcf equality/weld
     ROBOT_QPOS_SIZE = HMF_PROTO5_STATE_DIM
     OBJECT_QPOS_SIZE = 7
     CTRL_SIZE = HMF_PROTO5_CTRL_DIM
@@ -535,6 +536,19 @@ class Proto5HMFMocapTask(base.Task):
         if mocap_id < 0:
             raise ValueError(f"Body '{Proto5HMFMocapTask.MOCAP_BODY_NAME}' is not a mocap body in this XML.")
         return mocap_id
+
+    @classmethod
+    def sync_mocap_to_wrist(cls, physics):
+        """
+        Snap the mocap target to the wrist's current pose (post physics.forward()).
+        The weld constraint enforces mocap_pos/quat == wrist body pose; if qpos is
+        overwritten externally (e.g. from a dataset start pose) without this, the stale
+        mocap target yanks the wrist toward it on the very first physics.step().
+        """
+        wrist_id = physics.model.name2id(cls.WRIST_BODY_NAME, 'body')
+        mocap_id = cls._get_mocap_id(physics)
+        physics.data.mocap_pos[mocap_id][:] = physics.data.xpos[wrist_id]
+        physics.data.mocap_quat[mocap_id][:] = physics.data.xquat[wrist_id]
 
     def before_step(self, action, physics):
         action = np.asarray(action, dtype=np.float64).reshape(-1)
