@@ -34,6 +34,7 @@ from visualize_episodes import save_videos, visualize_joints
 from sim_env import BOX_POSE, DEX_OBJECT_POSE, HMF_PROTO5_RANDOM_RESET_STATE
 from sim_env import sample_dex_object_pose, sample_hmf_proto5_random_reset
 from sim_env import episode_reward_meets_success
+from sim_env import _shape_z_half_extent
 
 import IPython
 e = IPython.embed
@@ -347,7 +348,16 @@ def sample_dataset_start_qpos(dataset_dir, num_episodes):
     return np.array(qpos0, dtype=np.float32)
 
 
-def build_fixed_hmf_proto5_random_reset(task_name, fixed_object_pose):
+def build_fixed_hmf_proto5_random_reset(task_name, fixed_object_pose, fixed_object_shape=None, fixed_object_size=None):
+    """
+    fixed_object_shape: optional shape name ('box'/'cylinder'/'sphere', per the task's
+    random_object_shape.train_shapes). Size defaults to the mid-point of that shape's
+    size_ranges; pass fixed_object_size (box: 3 half-extents, cylinder: [radius, half-height],
+    sphere: [radius]) to override it — not clamped to size_ranges, so you can go outside the
+    trained distribution on purpose. z is table_z + the shape's half-extent, which overrides
+    the z passed in fixed_object_pose for that target (a shape has a different resting z than
+    whatever was fixed for it).
+    """
     random_reset = SIM_TASK_CONFIGS.get(task_name, {}).get("random_reset", {})
     targets = random_reset.get("random_obj_goal", [])
     expected_dim = 3 * len(targets)
@@ -369,21 +379,74 @@ def build_fixed_hmf_proto5_random_reset(task_name, fixed_object_pose):
     task_reset_joint = random_reset.get("task_reset_joint")
     if task_reset_joint and task_reset_joint.get("enabled", False):
         state["task_reset_joint"] = dict(task_reset_joint)
+
+    if fixed_object_shape is not None:
+        shape_cfg = random_reset.get("random_object_shape")
+        if not shape_cfg:
+            raise NotImplementedError(f"{task_name} has no random_object_shape config; cannot fix shape")
+        specs = {s["name"]: s for s in shape_cfg["train_shapes"]}
+        if fixed_object_shape not in specs:
+            raise ValueError(
+                f"fixed_object_shape '{fixed_object_shape}' not in {task_name}'s "
+                f"train_shapes {list(specs)}"
+            )
+        spec = specs[fixed_object_shape]
+        size_ranges = np.asarray(spec["size_ranges"], dtype=np.float64)
+        if fixed_object_size is not None:
+            size = np.asarray(fixed_object_size, dtype=np.float64).reshape(-1)
+            if size.size != size_ranges.shape[0]:
+                raise ValueError(
+                    f"fixed_object_size for '{fixed_object_shape}' needs {size_ranges.shape[0]} "
+                    f"value(s), got {size.size}"
+                )
+            if np.any(size <= 0):
+                raise ValueError(f"fixed_object_size must be positive, got {size}")
+        else:
+            size = size_ranges.mean(axis=1)
+        z = float(shape_cfg["table_z"]) + _shape_z_half_extent(fixed_object_shape, size)
+
+        body_name = shape_cfg["body_name"]
+        goal_target = next((t for t in state["random_obj_goal"] if t["name"] == body_name), None)
+        xy = goal_target["position"][:2] if goal_target is not None else arr[:2]
+        pos = np.array([xy[0], xy[1], z], dtype=np.float64)
+        if goal_target is not None:
+            print(f"[fixed_object_shape] '{fixed_object_shape}': overriding '{body_name}' z to {z:.4f} "
+                  f"(table_z {shape_cfg['table_z']} + half-extent); fixed_object_pose z is ignored for it.")
+            goal_target["position"] = pos
+
+        state["random_object_shape"] = {
+            "body_name": body_name,
+            "geom_name": shape_cfg["geom_name"],
+            "density": float(shape_cfg.get("density", 700.0)),
+            "randomize_color": bool(shape_cfg.get("randomize_color", False)),
+            "shape": fixed_object_shape,
+            "size": size,
+            "position": pos,
+            "yaw": 0.0,
+        }
+
     return state
 
 
-def apply_object_pose_for_reset(task_name, fixed_object_pose, env_family=None):
+def apply_object_pose_for_reset(task_name, fixed_object_pose, env_family=None, fixed_object_shape=None, fixed_object_size=None):
     """
     Set task-specific object/goal pose before env.reset().
     fixed_object_pose None: task-specific random sample; else fixed vector.
+    fixed_object_shape/fixed_object_size: HMF proto5 only; see build_fixed_hmf_proto5_random_reset().
     """
     if env_family is None:
         env_family = SIM_TASK_CONFIGS.get(task_name, {}).get("env_family")
+    if fixed_object_shape is not None and env_family != ENV_FAMILY_HMF_PROTO5_HAND:
+        raise NotImplementedError(f"fixed_object_shape not supported for {task_name} (env_family={env_family})")
+    if fixed_object_size is not None and fixed_object_shape is None:
+        raise ValueError("fixed_object_size requires fixed_object_shape")
 
     if fixed_object_pose is not None:
         arr = np.asarray(fixed_object_pose, dtype=np.float64).reshape(-1)
         if env_family == ENV_FAMILY_HMF_PROTO5_HAND:
-            HMF_PROTO5_RANDOM_RESET_STATE[0] = build_fixed_hmf_proto5_random_reset(task_name, arr)
+            HMF_PROTO5_RANDOM_RESET_STATE[0] = build_fixed_hmf_proto5_random_reset(
+                task_name, arr, fixed_object_shape=fixed_object_shape, fixed_object_size=fixed_object_size
+            )
         elif 'sim_transfer_cube' in task_name:
             if arr.size != 7:
                 raise ValueError(f"sim_transfer_cube needs 7-dim object pose, got {arr.size}")

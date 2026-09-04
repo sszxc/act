@@ -45,6 +45,22 @@ HMF_PROTO5_RANDOM_RESET_CONFIGS = {
                 "position_ranges": [[-0.2, 0.2], [0.6, 0.9], [0.685, 0.685]],
             },
         ],
+        # enabled=False: random reset still defaults to the XML-baked capsule.
+        # train_shapes here only back --fixed_object_shape (box/cylinder/sphere) overrides
+        # in imitate_episodes.build_fixed_hmf_proto5_random_reset.
+        "random_object_shape": {
+            "enabled": False,
+            "body_name": "obj",
+            "geom_name": "objGeom",
+            "table_z": 0.6,
+            "density": 700,
+            "randomize_color": False,
+            "train_shapes": [
+                {"name": "box", "size_ranges": [[0.025, 0.04], [0.025, 0.04], [0.04, 0.07]]},
+                {"name": "cylinder", "size_ranges": [[0.025, 0.04], [0.04, 0.07]]},
+                {"name": "sphere", "size_ranges": [[0.035, 0.05]]},
+            ],
+        },
     },
     "pick_place_v3": {
         "random_obj_goal": [

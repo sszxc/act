@@ -203,6 +203,8 @@ def rollout_batch_episode_returns(
     *,
     latent_z,
     fixed_object_pose: np.ndarray,
+    fixed_object_shape: str | None = None,
+    fixed_object_size: np.ndarray | None = None,
     fixed_init_qpos: np.ndarray | None,
     init_qpos_from_dataset: bool,
     dataset_dir: str | None,
@@ -248,7 +250,10 @@ def rollout_batch_episode_returns(
 
     ts_list = []
     for i, env in enumerate(envs):
-        apply_object_pose_for_reset(eval_cfg["task_name"], fixed_object_pose)
+        apply_object_pose_for_reset(
+            eval_cfg["task_name"], fixed_object_pose,
+            fixed_object_shape=fixed_object_shape, fixed_object_size=fixed_object_size,
+        )
         ts = env.reset()
         if fixed_init_qpos is not None:
             overwrite_sim_qpos_from_dataset(env, eval_cfg["task_name"], fixed_init_qpos)
@@ -1472,6 +1477,23 @@ def main():
         help="Fixed object pose: comma or JSON list (transfer 7 / insertion 14 / dex 7)",
     )
     p.add_argument(
+        "--fixed_object_shape",
+        type=str,
+        default=None,
+        choices=("box", "cylinder", "sphere"),
+        help="HMF proto5 only: pin the target object's shape (size = mid-point of the task's "
+        "train_shapes size_ranges; z auto-derived from table_z + half-extent, overriding the z "
+        "in --fixed_object_pose). Omit to keep the task's default shape.",
+    )
+    p.add_argument(
+        "--fixed_object_size",
+        type=str,
+        default=None,
+        help="Requires --fixed_object_shape. Comma or JSON list overriding the default "
+        "mid-range size (box: half-extents x,y,z / cylinder: radius,half-height / sphere: "
+        "radius). Not clamped to the task's train_shapes size_ranges.",
+    )
+    p.add_argument(
         "--fixed_init_qpos",
         type=str,
         default=None,
@@ -1637,6 +1659,11 @@ def main():
 
     set_seed(args.seed)
     fixed_object_pose = _parse_float_list(args.fixed_object_pose)
+    fixed_object_shape = args.fixed_object_shape
+    fixed_object_size = _parse_float_list(args.fixed_object_size) if args.fixed_object_size else None
+    if fixed_object_size is not None and fixed_object_shape is None:
+        print("--fixed_object_size requires --fixed_object_shape", file=sys.stderr)
+        sys.exit(1)
     fixed_init_qpos = _parse_float_list(args.fixed_init_qpos) if args.fixed_init_qpos else None
 
     policy_config = {
@@ -1743,6 +1770,8 @@ def main():
             theta_batch,
             latent_z=latent_z,
             fixed_object_pose=fixed_object_pose,
+            fixed_object_shape=fixed_object_shape,
+            fixed_object_size=fixed_object_size,
             fixed_init_qpos=fixed_init_qpos,
             init_qpos_from_dataset=args.init_qpos_from_dataset,
             dataset_dir=task_cfg.get("dataset_dir"),
@@ -1794,6 +1823,8 @@ def main():
         "film_dim": film_dim,
         "theta_base": theta_base.tolist(),
         "fixed_object_pose": fixed_object_pose.tolist(),
+        "fixed_object_shape": fixed_object_shape,
+        "fixed_object_size": fixed_object_size.tolist() if fixed_object_size is not None else None,
         "env_max_reward": env_max_reward,
     }
     if args.save_videos:
