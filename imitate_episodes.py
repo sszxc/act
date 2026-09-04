@@ -33,6 +33,7 @@ from visualize_episodes import save_videos, visualize_joints
 
 from sim_env import BOX_POSE, DEX_OBJECT_POSE, HMF_PROTO5_RANDOM_RESET_STATE
 from sim_env import sample_dex_object_pose, sample_hmf_proto5_random_reset
+from sim_env import Proto5HMFMocapTask
 from sim_env import episode_reward_meets_success
 from sim_env import _shape_z_half_extent
 
@@ -291,6 +292,8 @@ def overwrite_sim_qpos_from_dataset(env, task_name, dataset_qpos, env_family=Non
     Override sim initial joint positions with dataset trajectory start qpos.
     Sim only; no-op for real_robot.
     """
+    if env_family is None:
+        env_family = SIM_TASK_CONFIGS.get(task_name, {}).get("env_family")
     physics = env._physics
 
     # Bi-manual 14-dim tasks (transfer_cube / insertion)
@@ -338,6 +341,10 @@ def overwrite_sim_qpos_from_dataset(env, task_name, dataset_qpos, env_family=Non
             if physics.model.nu != HMF_PROTO5_CTRL_DIM:
                 raise ValueError(f"hmf_proto5_hand expects nu={HMF_PROTO5_CTRL_DIM}, got {physics.model.nu}.")
             physics.data.ctrl[:] = finger_qpos
+        # reset_context() already ran physics.forward() on exit; re-point the mocap
+        # weld target at the wrist's new pose so step 1 doesn't yank the arm toward
+        # wherever the "home" keyframe left mocap_pos/quat.
+        Proto5HMFMocapTask.sync_mocap_to_wrist(physics)
 
 
 def sample_dataset_start_qpos(dataset_dir, num_episodes):
@@ -346,6 +353,17 @@ def sample_dataset_start_qpos(dataset_dir, num_episodes):
     with h5py.File(dataset_path, 'r') as root:
         qpos0 = root['/observations/qpos'][0]
     return np.array(qpos0, dtype=np.float32)
+
+
+def _parse_float_list_str(s):
+    """Parse a CLI string ('v1,v2,...' or JSON list) into a 1-D float64 ndarray; None passes through."""
+    if s is None:
+        return None
+    s = str(s).strip()
+    if s == "" or s.lower() in {"none", "null"}:
+        return None
+    arr = json.loads(s) if s.startswith("[") else [float(x) for x in s.split(",")]
+    return np.asarray(arr, dtype=np.float64)
 
 
 def build_fixed_hmf_proto5_random_reset(task_name, fixed_object_pose, fixed_object_shape=None, fixed_object_size=None):
@@ -485,6 +503,8 @@ def rollout_single_episode_return(
     film_theta=None,
     film_pca_theta=None,
     fixed_object_pose=None,
+    fixed_object_shape=None,
+    fixed_object_size=None,
     fixed_init_qpos=None,
     init_qpos_from_dataset=False,
     dataset_dir=None,
@@ -537,7 +557,10 @@ def rollout_single_episode_return(
         raise ValueError('direct_replay is sim-only')
 
     if not real_robot:
-        apply_object_pose_for_reset(task_name, fixed_object_pose, env_family=env_family)
+        apply_object_pose_for_reset(
+            task_name, fixed_object_pose, env_family=env_family,
+            fixed_object_shape=fixed_object_shape, fixed_object_size=fixed_object_size,
+        )
     ts = env.reset()
 
     if not real_robot and fixed_init_qpos is not None:
@@ -823,7 +846,11 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
     num_rollouts = num_rollouts_cfg if not direct_replay else min(num_rollouts_cfg, num_episodes)
     episode_returns = []
     highest_rewards = []
-    fixed_object_pose = config.get('fixed_object_pose', None)
+    fixed_object_pose = _parse_float_list_str(config.get('fixed_object_pose', None))
+    fixed_object_shape = config.get('fixed_object_shape', None)
+    fixed_object_size = _parse_float_list_str(config.get('fixed_object_size', None))
+    if fixed_object_shape is not None and fixed_object_pose is None:
+        raise ValueError("--fixed_object_shape requires --fixed_object_pose")
     fixed_init_qpos = config.get('fixed_init_qpos', None)
     for rollout_id in range(num_rollouts):
         rollout_latent_z = base_latent_z
@@ -843,6 +870,8 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
             use_pca_action=use_pca_action,
             rollout_latent_z=rollout_latent_z,
             fixed_object_pose=fixed_object_pose,
+            fixed_object_shape=fixed_object_shape,
+            fixed_object_size=fixed_object_size,
             fixed_init_qpos=fixed_init_qpos,
             init_qpos_from_dataset=init_qpos_from_dataset,
             dataset_dir=dataset_dir,
@@ -1010,6 +1039,18 @@ def _parse_eval_args():
                         help='Eval total rollouts (default 50; direct_replay uses min(num_rollouts, num_episodes))')
     parser.add_argument('--latent_z_sample', type=str, default=None,
                         help='(eval only) Fixed latent z for whole rollout. Format: "v1,...,vD" or JSON list e.g. "[0,0.1,...]". Dim = latent_z_dim.')
+    parser.add_argument('--fixed_object_pose', type=str, default=None,
+                        help='Eval (sim): fix object pose instead of the task\'s random reset sample. '
+                        'Comma or JSON list (transfer 7 / insertion 14 / dex 7 / hmf_proto5 7).')
+    parser.add_argument('--fixed_object_shape', type=str, default=None,
+                        choices=('box', 'cylinder', 'sphere'),
+                        help='Eval (sim, hmf_proto5 tasks only): pin the target object shape. Requires '
+                        '--fixed_object_pose. Size defaults to the mid-point of the task\'s train_shapes '
+                        'size_ranges; override with --fixed_object_size.')
+    parser.add_argument('--fixed_object_size', type=str, default=None,
+                        help='Requires --fixed_object_shape. Comma or JSON list overriding the default '
+                        'mid-range size (box: half-extents x,y,z / cylinder: radius,half-height / sphere: '
+                        'radius). Not clamped to the task\'s train_shapes size_ranges.')
     parser.add_argument('--ckpt_dir', type=str, required=True,
                         help='checkpoint dir (required; provided via CLI only)')
     eval_args, unknown = parser.parse_known_args()
@@ -1030,6 +1071,9 @@ def main(cfg):
     args_dict['max_save_episodes'] = _EVAL_ARGS.max_save_episodes
     args_dict['num_rollouts'] = _EVAL_ARGS.num_rollouts
     args_dict['latent_z_sample'] = _EVAL_ARGS.latent_z_sample
+    args_dict['fixed_object_pose'] = _EVAL_ARGS.fixed_object_pose
+    args_dict['fixed_object_shape'] = _EVAL_ARGS.fixed_object_shape
+    args_dict['fixed_object_size'] = _EVAL_ARGS.fixed_object_size
     train_or_eval(args_dict, hydra_cfg=cfg)
 
 
