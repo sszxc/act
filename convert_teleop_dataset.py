@@ -11,20 +11,23 @@ by hand, since it's a single episode in the current batches).
 
 Alignment: manifest sample_counts are not reliable (checked against actual decoded frame count instead).
 The `combined` joint stream is already a uniform 90Hz nearest-sample grid derived from the arm+hand
-streams; video is natively 30fps and doesn't carry true per-frame capture timestamps (mp4 is written at
-a constant 1/30s spacing from video_origin_ns). Joint recording and video also don't start/stop together
-(joint recording usually starts a bit before video, and sometimes stops several seconds before video
-does). So: clip to the intersection of [video_origin_ns, video_end_ns] and the combined stream's own time
-range, then resample everything (each camera + joint state) onto a nominal 30Hz grid over that window by
-nearest-timestamp match.
+streams; video doesn't carry true per-frame capture timestamps (each cam's mp4 is written at a constant
+spacing from video_origin_ns, at that cam's own fps — read per-camera from the container, since the
+fingertip cams (thumb/index/middle/ring) are 10fps while the rest are 30fps; an earlier version of this
+script assumed 30fps for all cams, which silently broke alignment for the fingertip streams). Joint
+recording and video also don't start/stop together (joint recording usually starts a bit before video,
+and sometimes stops several seconds before video does). So: clip to the intersection of
+[video_origin_ns, video_end_ns] and the combined stream's own time range, then resample everything (each
+camera + joint state) onto a nominal 30Hz grid over that window by nearest-timestamp match.
 
 Output: --out_dir/episode_{0..N-1}.hdf5, one per kept episode, ordered by source dir name (chronological).
 Feed --out_dir as a `good` (or `good2`, `good3`, ...) source dir to merge_teleop_dataset.py to combine
 with other batches later.
 
 Usage:
-    python convert_teleop_dataset.py --data_root ~/Documents/data/20260901_good_data_90hz \\
-        --out_dir data/real_pick_yellow_bottle/good --cameras left top
+    python convert_teleop_dataset.py --data_root ~/data/data_0901 \\
+        --out_dir data/real_pick_yellow_bottle/good_0901_c20
+(--cameras defaults to all 9 streams: wrist left right top side thumb index middle ring.)
 """
 import argparse
 import glob
@@ -48,7 +51,10 @@ def nearest_indices(sorted_times, query_times):
 
 
 def read_video_frames(path):
+    """Returns (frames, fps) — fps read from the container (some cams, e.g. fingertip cams,
+    are recorded at 10fps rather than the main cams' 30fps; frame_times must use the real one)."""
     cap = cv2.VideoCapture(path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
     frames = []
     while True:
         ok, frame = cap.read()
@@ -56,7 +62,9 @@ def read_video_frames(path):
             break
         frames.append(frame[:, :, ::-1].copy())  # BGR -> RGB
     cap.release()
-    return frames
+    if not fps or fps <= 0:
+        fps = FPS
+    return frames, fps
 
 
 def convert_episode(ep_dir, cameras, log):
@@ -88,11 +96,12 @@ def convert_episode(ep_dir, cameras, log):
     cam_images = {}
     for cam in cameras:
         vp = os.path.join(ep_dir, manifest["video_paths"][cam])
-        frames = read_video_frames(vp)
+        frames, cam_fps = read_video_frames(vp)
         manifest_n = manifest["sample_counts"].get(cam)
         if len(frames) != manifest_n:
             log(f"{ep_id}: NOTE {cam} manifest sample_counts={manifest_n} but decoded {len(frames)} frames")
-        frame_times = video_origin_ns + np.arange(len(frames)) * PERIOD_NS
+        cam_period_ns = 1e9 / cam_fps  # e.g. fingertip cams are 10fps, not the main cams' 30fps
+        frame_times = video_origin_ns + np.arange(len(frames)) * cam_period_ns
         fi = nearest_indices(frame_times, out_times)
         cam_images[cam] = np.stack([frames[i] for i in fi], axis=0)
 
@@ -139,7 +148,8 @@ def main():
     ap.add_argument("--data_root", required=True,
                      help="dir containing episode subdirs (each with manifest.json/trajectory.h5/videos/)")
     ap.add_argument("--out_dir", required=True, help="output dir for episode_{i}.hdf5")
-    ap.add_argument("--cameras", nargs="+", default=["left", "top"])
+    ap.add_argument("--cameras", nargs="+",
+                     default=["wrist", "left", "right", "top", "side", "thumb", "index", "middle", "ring"])
     args = ap.parse_args()
 
     data_root = os.path.expanduser(args.data_root)
