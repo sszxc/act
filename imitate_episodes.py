@@ -152,6 +152,10 @@ def train_or_eval(args, hydra_cfg=None):
         'max_save_episodes': args.get('max_save_episodes', None),
         # Eval: total rollouts to run
         'num_rollouts': args.get('num_rollouts', 50),
+        # Eval: pin object pose/shape/size instead of the task's random reset sample
+        'fixed_object_pose': args.get('fixed_object_pose', None),
+        'fixed_object_shape': args.get('fixed_object_shape', None),
+        'fixed_object_size': args.get('fixed_object_size', None),
     }
 
     if is_eval:
