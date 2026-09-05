@@ -10,6 +10,84 @@ cd act/detr && pip install -e .
 ```
 
 
+## Real-Robot Data Pipeline (teleop -> ACT)
+
+Raw teleop batches live outside the repo, e.g. `~/data/data_0901` (episode dirs flat) or
+`~/data/data_0902` (episode dirs under `success/` and `failure/`). Each episode dir holds
+`manifest.json` + `trajectory.h5` + `videos/<cam>.mp4` for 9 cameras
+(wrist left right top side thumb index middle ring).
+
+### 1. Convert one batch: raw -> ACT hdf5
+
+```
+python convert_teleop_dataset.py --data_root ~/data/data_0902/success \
+    --out_dir data/real_pick_yellow_bottle/good_0902_c21
+```
+
+`--data_root` is globbed one level deep, so point it at the dir that directly contains the
+episode dirs (`.../data_0902/success`, not `.../data_0902`). Keeps only
+`schema_version == "1.3"` and `task_label == "success"`; clips to the video/joint time
+intersection and resamples everything onto a 30Hz grid (per-camera fps read from the
+container — the 4 fingertip cams are 10fps). Writes `episode_{0..N-1}.hdf5` with
+`observations/{qpos,qvel,images/<cam>}` + `action`, and `source_episode_id` in the attrs.
+
+### 2. Merge batches into one training dir
+
+One `convert` run = one batch = its own `episode_0..N-1`. Training reads a single flat dir,
+so multiple batches must be merged with contiguous renumbering. `good_41` is the current
+merged set: 41 symlinks into `good_0901_c20` (20) + `good_0902_c21` (21), ordered by mtime,
+plus a `manifest.json` mapping new index -> (source_dir, source_episode).
+
+The `merge_teleop_dataset.py` script that produced it was deleted in `3eb902a`; for a small
+batch just create the symlinks by hand, or restore it with
+`git show 3eb902a^:merge_teleop_dataset.py > merge_teleop_dataset.py`.
+
+### 3. Sanity check
+
+```
+python visualize_episodes.py --dataset_dir data/real_pick_yellow_bottle/good_41
+```
+Without `--episode_idx` it renders every episode in the dir to `episode_i_video.mp4` +
+`episode_i_qpos.png`.
+
+### 4. Register the task
+
+`aloha_scripts/constants.py` -> `TASK_CONFIGS["real_pick_yellow_bottle"]`: `dataset_dir`,
+`num_episodes`, `episode_len` (longest episode; eval rollout cap only), `camera_names`,
+`state_dim`/`action_dim` (24 for this robot). Any of these can be overridden per-run from
+the CLI instead (see below).
+
+### 5. Train
+
+```
+python imitate_episodes.py --ckpt_dir results/real_pick_yellow_bottle \
+    task_name=real_pick_yellow_bottle camera_names=[left,top] image_size=[240,320] \
+    lr=1e-4 kl_weight=1 chunk_size=50 batch_size=8 num_epochs=8000
+```
+
+- `image_size=[H,W]` is **required** whenever the selected cameras have different native
+  resolutions (480x640 / 480x848 / 400x400 here), and must match between train and eval.
+- `dataset_dir` / `num_episodes` / `camera_names` are hydra overrides that take precedence
+  over `TASK_CONFIGS`.
+- `batch_size` above the number of train episodes needs `batches_per_epoch=<int>`
+  (with-replacement sampling).
+- Best sweep config to date: see `results/sweep_real_pick_yellow_bottle_20260902/REPORT.md`.
+
+### Optional: strip teleop pauses
+
+```
+python clean_pauses.py --data_dir data/real_pick_yellow_bottle/good_41 \
+    --out_dir data/real_pick_yellow_bottle/good_41_clean
+```
+
+Deletes runs of >= `--min_pause_s` (0.5s) where `||qvel|| < --vel_thresh` (0.15) and
+recomputes `action`; episode numbering is preserved 1:1. **Not part of the default flow**:
+on `good_41` it touched 11/41 episodes and removed 1.4% of frames (15s total), while the
+output is a full uncompressed copy (212GB vs the source batches' 108+107GB). No training run
+has used the cleaned set so far. Worth revisiting only if a future batch has genuinely long
+pauses — check with the script's own per-episode log before committing the disk.
+
+
 ## Training with Teleoperation Data from Dex-Retargeting
 
 Use `visualize_episodes.py` to generate videos and qpos plots for quick sanity checking of your data.  
