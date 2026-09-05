@@ -29,6 +29,7 @@ DETR_DEFAULTS = {
     'state_dim': 14,
     'action_dim': None,
     'latent_z_dim': 32,
+    'qpos_dropout': 0.0,
 }
 
 

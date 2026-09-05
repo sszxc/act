@@ -47,7 +47,8 @@ _FILM_VIZ_MODE = "mean"  # "max" or "mean"
 
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
-    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, action_dim=None, latent_z_dim=32):
+    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, action_dim=None, latent_z_dim=32,
+                 qpos_dropout=0.0):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -56,10 +57,13 @@ class DETRVAE(nn.Module):
             num_queries: number of object queries
             camera_names: list of camera names
             action_dim: policy output dimension; if None, equals state_dim (backward compatible)
+            qpos_dropout: train-time prob of zeroing the whole proprio input per sample, forcing
+                the policy to read the images instead of copying qpos into the action.
         """
         super().__init__()
         if action_dim is None:
             action_dim = state_dim
+        self.qpos_dropout = float(qpos_dropout)
         self.num_queries = num_queries
         self.camera_names = camera_names
         self.transformer = transformer
@@ -346,8 +350,13 @@ class DETRVAE(nn.Module):
                 pos = pos[0]
                 all_cam_features.append(self.input_proj(features))
                 all_cam_pos.append(pos)
-            # proprioception features
-            proprio_input = self.input_proj_robot_state(qpos)
+            # proprioception features; qpos_dropout zeros the whole state for a random subset of
+            # samples (zero == dataset-mean qpos in normalized space) so the decoder can't rely on it
+            qpos_dec = qpos
+            if self.training and self.qpos_dropout > 0:
+                keep = (torch.rand(bs, 1, device=qpos.device) >= self.qpos_dropout).to(qpos.dtype)
+                qpos_dec = qpos * keep
+            proprio_input = self.input_proj_robot_state(qpos_dec)
             # fold camera dimension into width dimension
             src = torch.cat(all_cam_features, axis=3)
             pos = torch.cat(all_cam_pos, axis=3)
@@ -550,6 +559,7 @@ def build(args):
         camera_names=args.camera_names,
         action_dim=action_dim,
         latent_z_dim=args.latent_z_dim,
+        qpos_dropout=getattr(args, 'qpos_dropout', 0.0),
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)

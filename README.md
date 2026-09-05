@@ -229,3 +229,32 @@ You can also add ``--onscreen_render`` to see real-time rendering during evaluat
 For real-world data where things can be harder to model, train for at least 5000 epochs or 3-4 times the length after the loss has plateaued.
 Please refer to [tuning tips](https://docs.google.com/document/d/1FVIZfoALXg_ZkYKaYVh-qOlaXveq5CtvJHXkY25eYhs/edit?usp=sharing) for more info.
 
+
+### Action representation, and why the loss can lie here
+
+`action[t]` in this dataset is exactly `qpos[t+1]` (the converter has no commanded-joint channel;
+see `NOTE`). Copying qpos is therefore a near-optimal solution to the training loss and a useless
+policy on the robot, and the ordinary val loss is measured on the CVAE *posterior*, which is fed
+the ground-truth action chunk. Three knobs and one metric address this:
+
+- `action_repr=delta` — predict `action - qpos[t]` instead of the raw action, removing the
+  shortcut. Recorded in `dataset_stats.pkl`, so eval un-normalizes correctly without extra flags.
+- `action_offset=0` — the chunk starts at `action[start_ts]`. The upstream default `-1` makes the
+  first chunk element exactly `qpos[start_ts]`, a guaranteed no-op step.
+- `qpos_dropout=0.5` — zero the decoder's proprio input for a random half of training samples,
+  forcing the policy to read the images.
+- `deploy/{l1_rad,skill,motion_ratio}` in TensorBoard + `deploy_metrics.json`: chunk L1 in
+  radians on the deployed path (prior, z=0) over a fixed val set. `skill < 1` means better than
+  freezing in place; `motion_ratio ≈ 0` is the "robot barely moves" failure. Selects
+  `policy_best_deploy.ckpt`; `policy_best.ckpt` is still chosen by val loss.
+
+```
+python replay_eval.py --ckpt_dir <ckpt_dir> --chunk_size 50 --camera_names left top --plot
+python eval_deploy_metrics.py --ckpt_dir <ckpt_dir> --chunk_size 50   # older ckpts too
+```
+`replay_eval.py` replays held-out episodes open-loop (recorded observations in, commands out) and
+compares action-selection modes. Note `eval_bc`'s temporal ensembling weights the *oldest* chunk
+prediction most, which at 30Hz costs ~0.8s of lag; `--temporal_agg_newest --temporal_agg_k 0.5`
+reverses that and cut command error 34% on the 2026-09-02 best checkpoint.
+
+Sweep in flight: `results/sweep_20260904/PLAN.md`.

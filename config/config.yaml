@@ -38,3 +38,24 @@ num_episodes: null
 # different native resolutions (e.g. left 480x640 + side 480x848 + thumb 400x400).
 # null = keep native size. Must match between train and eval.
 image_size: null
+
+# Action representation. 'absolute' = raw action (original ACT). 'delta' = action - qpos[t],
+# which removes the copy-qpos shortcut this dataset invites (action[t] == qpos[t+1] exactly).
+# Must match between train and eval; the choice is recorded in dataset_stats.pkl.
+action_repr: absolute
+# Chunk starts at action[start_ts + action_offset] (real-robot data only; sim always uses 0).
+# -1 is the upstream ALOHA alignment hack, which here makes the first chunk element a
+# guaranteed no-op step. 0 is the honest choice for this dataset.
+action_offset: -1
+# Train-time prob of zeroing the decoder's proprio input per sample, forcing the policy to
+# read the images. 0 = off.
+qpos_dropout: 0.0
+
+# DataLoader workers. The h5py random-frame reads are the bottleneck; >1 helps a lot.
+num_workers: 6
+# Epochs between deployment-metric evaluations (deploy/{l1_rad,skill,motion_ratio}, see
+# imitate_episodes.deploy_metrics). Runs on a fixed GPU-resident val set, so it's cheap.
+deploy_every: 25
+# Epochs between periodic policy_epoch_N checkpoints. 0 = save only best/last/best_deploy
+# (a sweep of ~50 runs would otherwise write ~300GB of intermediate checkpoints).
+save_every: 500

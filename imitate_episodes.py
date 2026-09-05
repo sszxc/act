@@ -117,6 +117,7 @@ def train_or_eval(args, hydra_cfg=None):
                          'camera_names': camera_names,
                          'state_dim': state_dim,
                          'action_dim': action_dim,
+                         'qpos_dropout': args.get('qpos_dropout', 0.0),
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
@@ -137,8 +138,15 @@ def train_or_eval(args, hydra_cfg=None):
         'task_name': task_name,
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
+        'temporal_agg_k': args.get('temporal_agg_k', 0.01),
+        'temporal_agg_newest': args.get('temporal_agg_newest', False),
         'camera_names': camera_names,
         'image_size': image_size,
+        'action_repr': args.get('action_repr', 'absolute'),
+        'action_offset': args.get('action_offset', -1),
+        'num_workers': args.get('num_workers', 1),
+        'deploy_every': args.get('deploy_every', 25),
+        'save_every': args.get('save_every', 500),
         'env_family': env_family,
         'real_robot': not is_sim,
         # eval-only: user-specified latent z (fixed within rollout)
@@ -177,7 +185,7 @@ def train_or_eval(args, hydra_cfg=None):
             print(msg, file=log_file)
             log_file.flush()
 
-        ckpt_names = [f'policy_best.ckpt']
+        ckpt_names = [args.get('ckpt_name') or 'policy_best.ckpt']
         results = []
 
         eval_start = time.time()
@@ -241,7 +249,12 @@ def train_or_eval(args, hydra_cfg=None):
         task_name=task_name,
         batches_per_epoch=args.get('batches_per_epoch', None),
         image_size=image_size,
+        action_repr=config['action_repr'],
+        action_offset=config['action_offset'],
+        num_workers=config['num_workers'],
     )
+    # Eval must reproduce the training action representation; keep it with the stats.
+    stats['action_repr'] = config['action_repr']
 
     # save dataset stats
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
@@ -252,6 +265,8 @@ def train_or_eval(args, hydra_cfg=None):
         with open(pca_path, 'wb') as f:
             pickle.dump(stats['pca'], f)
         print(f'Saved PCA to {pca_path}')
+
+    config['deploy_set'] = build_deploy_set(val_dataloader.dataset, stats)
 
     best_ckpt_info = train_bc(train_dataloader, val_dataloader, config)
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
@@ -465,6 +480,8 @@ def rollout_single_episode_return(
     task_name = config['task_name']
     env_family = config.get('env_family', None)
     temporal_agg = config['temporal_agg']
+    temporal_agg_k = float(config.get('temporal_agg_k', 0.01))
+    temporal_agg_newest = bool(config.get('temporal_agg_newest', False))
     max_timesteps_cfg = config['episode_len']
     if env_family == ENV_FAMILY_ALLEGRO:
         onscreen_cam = 'default_cam'
@@ -596,8 +613,12 @@ def rollout_single_episode_return(
                         actions_for_curr_step = all_time_actions[:, t]
                         actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
                         actions_for_curr_step = actions_for_curr_step[actions_populated]
-                        k = 0.01
-                        exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
+                        # Upstream weights index 0 -- the OLDEST chunk still covering t --
+                        # most, so at 30Hz with num_queries=50 the command lags ~0.8s behind
+                        # the observation. temporal_agg_newest reverses it; see replay_eval.py.
+                        n_agg = len(actions_for_curr_step)
+                        order = np.arange(n_agg)[::-1] if temporal_agg_newest else np.arange(n_agg)
+                        exp_weights = np.exp(-temporal_agg_k * order)
                         exp_weights = exp_weights / exp_weights.sum()
                         exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
                         raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
@@ -608,7 +629,7 @@ def rollout_single_episode_return(
                 else:
                     raise NotImplementedError
                 raw_action = raw_action.squeeze(0).cpu().numpy()
-                target_qpos = post_process(raw_action)
+                target_qpos = post_process(raw_action, qpos_numpy)
                 if use_pca_action and pca is not None:
                     root_6 = target_qpos[:ROOT_DIM]
                     finger_pcs = target_qpos[ROOT_DIM:].reshape(1, -1)
@@ -736,7 +757,11 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
         stats = pickle.load(f)
 
     pre_process = lambda s_qpos: (s_qpos - stats['qpos_mean']) / stats['qpos_std']
-    post_process = lambda a: a * stats['action_std'] + stats['action_mean']
+    # 'delta' policies predict action - qpos[t], so un-normalizing needs the current qpos.
+    if stats.get('action_repr') == 'delta':
+        post_process = lambda a, q: a * stats['delta_std'] + stats['delta_mean'] + q
+    else:
+        post_process = lambda a, q: a * stats['action_std'] + stats['action_mean']
 
     pca = None
     if use_pca_action:
@@ -842,6 +867,65 @@ def forward_pass(data, policy):
     return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
 
 
+def build_deploy_set(val_dataset, stats, n_per_episode=8):
+    """A fixed (episode, start_ts) sample set, preloaded to GPU, for the deployment metrics.
+
+    Fixed rather than resampled so the metric is comparable across epochs *and* across runs;
+    the ordinary val loss redraws random timesteps every epoch and is noisy enough that
+    min-over-8000-epochs is partly a lottery.
+    """
+    items = []
+    for episode_id in val_dataset.episode_ids:
+        path = os.path.join(val_dataset.dataset_dir, f'episode_{episode_id}.hdf5')
+        with h5py.File(path, 'r') as root:
+            T = int(root['/action'].shape[0])
+        for ts in np.linspace(0, T - 1, n_per_episode + 2)[1:-1].astype(int):
+            items.append(val_dataset.load(episode_id, start_ts=int(ts)))
+    batch = [torch.stack([it[i] for it in items]).cuda() for i in range(4)]
+    to_t = lambda k: torch.as_tensor(np.asarray(stats[k], dtype=np.float32)).cuda()
+    ref = {k: to_t(k) for k in ('action_mean', 'action_std', 'qpos_mean', 'qpos_std')}
+    if 'delta_mean' in stats:
+        ref.update(delta_mean=to_t('delta_mean'), delta_std=to_t('delta_std'))
+    print(f'Deployment metric set: {len(items)} samples from {len(val_dataset.episode_ids)} val episodes')
+    return batch, ref
+
+
+def deploy_metrics(policy, deploy_set, action_repr, chunk=64):
+    """Val diagnostics in raw joint radians, on the path the robot actually runs.
+
+    The train/val loss goes through the CVAE *posterior* (it is handed the ground-truth action
+    chunk), so it can look healthy while the deployed policy -- prior, z=0, images+qpos only --
+    does nothing. These use that deployed path, and being in radians they are comparable across
+    action representations and camera sets:
+      l1_rad        mean |pred - gt| over the chunk
+      skill         l1_rad / l1_rad of "hold current qpos"; < 1 = better than freezing
+      motion_ratio  mean|pred - qpos| / mean|gt - qpos|; ~0 is the "robot barely moves" failure
+    """
+    (image, qpos, action, is_pad), ref = deploy_set
+    preds = []
+    with torch.inference_mode():
+        for i in range(0, len(qpos), chunk):
+            preds.append(policy(qpos[i:i + chunk], image[i:i + chunk]))
+    a_hat = torch.cat(preds)
+
+    qpos_raw = (qpos * ref['qpos_std'] + ref['qpos_mean']).unsqueeze(1)  # (B,1,D)
+    if action_repr == 'delta':
+        denorm = lambda a: a * ref['delta_std'] + ref['delta_mean'] + qpos_raw
+    else:
+        denorm = lambda a: a * ref['action_std'] + ref['action_mean']
+    pred_abs, gt_abs = denorm(a_hat), denorm(action)
+
+    m = (~is_pad).unsqueeze(-1).float()
+    n = m.sum() * gt_abs.shape[-1]
+    mae = lambda x, y: ((x - y).abs() * m).sum() / n
+    l1_rad, copy_rad = mae(pred_abs, gt_abs), mae(qpos_raw, gt_abs)
+    return {
+        'l1_rad': l1_rad.item(),
+        'skill': (l1_rad / copy_rad).item(),
+        'motion_ratio': (mae(pred_abs, qpos_raw) / mae(gt_abs, qpos_raw)).item(),
+    }
+
+
 def train_bc(train_dataloader, val_dataloader, config):
     num_epochs = config['num_epochs']
     ckpt_dir = config['ckpt_dir']
@@ -863,9 +947,27 @@ def train_bc(train_dataloader, val_dataloader, config):
     validation_history = []
     min_val_loss = np.inf
     best_ckpt_info = None
+    # Second, independent selection track: best on the deployed (prior, z=0) path in radians.
+    # policy_best.ckpt stays selected by val loss so it matches earlier runs; the deploy pick
+    # is saved alongside as policy_best_deploy.ckpt.
+    deploy_set = config.get('deploy_set', None)
+    deploy_every = int(config.get('deploy_every', 25))
+    save_every = int(config.get('save_every', 500))  # 0 = only best/last/best_deploy
+    min_l1_rad, best_deploy = np.inf, None
+    deploy_history = []
     global_step = 0  # cumulative optimizer.step() calls; standard TensorBoard x-axis
     for epoch in tqdm(range(num_epochs)):
         print(f'\nEpoch {epoch}')
+        if deploy_set is not None and (epoch % deploy_every == 0 or epoch == num_epochs - 1):
+            policy.eval()
+            dm = deploy_metrics(policy, deploy_set, config.get('action_repr', 'absolute'))
+            for k, v in dm.items():
+                tb_writer.add_scalar(f'deploy/{k}', v, global_step)
+            deploy_history.append({'epoch': epoch, **dm})
+            print('deploy: ' + ' '.join(f'{k}={v:.4f}' for k, v in dm.items()))
+            if dm['l1_rad'] < min_l1_rad:
+                min_l1_rad = dm['l1_rad']
+                best_deploy = (epoch, dm, deepcopy(policy.state_dict()))
         # validation
         with torch.inference_mode():
             policy.eval()
@@ -908,7 +1010,7 @@ def train_bc(train_dataloader, val_dataloader, config):
             tb_writer.add_scalar(f'train/{k}', v.item(), global_step)
         print(summary_string)
 
-        if epoch % 500 == 0:
+        if save_every and epoch % save_every == 0:
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
             torch.save(policy.state_dict(), ckpt_path)
             plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
@@ -917,9 +1019,20 @@ def train_bc(train_dataloader, val_dataloader, config):
     torch.save(policy.state_dict(), ckpt_path)
 
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
-    ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt')
-    torch.save(best_state_dict, ckpt_path)
+    if save_every:
+        torch.save(best_state_dict, os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt'))
     print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}')
+
+    if best_deploy is not None:
+        d_epoch, d_metrics, d_state = best_deploy
+        torch.save(d_state, os.path.join(ckpt_dir, 'policy_best_deploy.ckpt'))
+        summary = {'best_deploy_epoch': d_epoch, **d_metrics,
+                   'best_val_loss': float(min_val_loss), 'best_val_loss_epoch': int(best_epoch),
+                   'history': deploy_history}
+        with open(os.path.join(ckpt_dir, 'deploy_metrics.json'), 'w') as f:
+            json.dump(summary, f, indent=2)
+        print('Best deploy ckpt @ epoch {}: '.format(d_epoch)
+              + ' '.join(f'{k}={v:.4f}' for k, v in d_metrics.items()))
 
     tb_writer.close()
 
@@ -962,6 +1075,11 @@ def _parse_eval_args():
                         help='direct_replay start episode index (rollout i replays episode replay_episode+i)')
     parser.add_argument('--temporal_agg', action='store_true',
                         help='Eval: temporal aggregation to smooth ACT output')
+    parser.add_argument('--temporal_agg_newest', action='store_true',
+                        help='Eval: weight the NEWEST chunk prediction most instead of the oldest '
+                             '(upstream weights the oldest, costing ~0.8s of lag at 30Hz)')
+    parser.add_argument('--temporal_agg_k', type=float, default=0.01,
+                        help='Eval: temporal-aggregation decay rate (default 0.01, near-uniform)')
     parser.add_argument('--max_save_episodes', type=int, default=None,
                         help='Eval: only save video/png for first N rollouts; default all')
     parser.add_argument('--num_rollouts', type=int, default=50,
@@ -970,6 +1088,9 @@ def _parse_eval_args():
                         help='(eval only) Fixed latent z for whole rollout. Format: "v1,...,vD" or JSON list e.g. "[0,0.1,...]". Dim = latent_z_dim.')
     parser.add_argument('--ckpt_dir', type=str, required=True,
                         help='checkpoint dir (required; provided via CLI only)')
+    parser.add_argument('--ckpt_name', type=str, default=None,
+                        help="Eval: which checkpoint in ckpt_dir (default policy_best.ckpt; "
+                             "policy_best_deploy.ckpt is the one picked by the deployed-path metric)")
     eval_args, unknown = parser.parse_known_args()
     return eval_args, unknown
 
@@ -984,7 +1105,10 @@ def main(cfg):
     args_dict['direct_replay'] = _EVAL_ARGS.direct_replay
     args_dict['replay_episode'] = _EVAL_ARGS.replay_episode
     args_dict['temporal_agg'] = _EVAL_ARGS.temporal_agg
+    args_dict['temporal_agg_newest'] = _EVAL_ARGS.temporal_agg_newest
+    args_dict['temporal_agg_k'] = _EVAL_ARGS.temporal_agg_k
     args_dict['ckpt_dir'] = _EVAL_ARGS.ckpt_dir
+    args_dict['ckpt_name'] = _EVAL_ARGS.ckpt_name
     args_dict['max_save_episodes'] = _EVAL_ARGS.max_save_episodes
     args_dict['num_rollouts'] = _EVAL_ARGS.num_rollouts
     args_dict['latent_z_sample'] = _EVAL_ARGS.latent_z_sample
