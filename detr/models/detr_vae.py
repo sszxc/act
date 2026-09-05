@@ -350,10 +350,15 @@ class DETRVAE(nn.Module):
                 pos = pos[0]
                 all_cam_features.append(self.input_proj(features))
                 all_cam_pos.append(pos)
-            # proprioception features; qpos_dropout zeros the whole state for a random subset of
-            # samples (zero == dataset-mean qpos in normalized space) so the decoder can't rely on it
+            # proprioception features. qpos_dropout zeros the whole state (zero == dataset-mean
+            # qpos in normalized space) so the decoder can't rely on it. <1 is train-time
+            # augmentation and eval uses the real qpos; >=1 means proprio is never used at all,
+            # eval included -- otherwise eval would feed real qpos through a projection that saw
+            # only zeros in training, which is off-distribution and untrained.
             qpos_dec = qpos
-            if self.training and self.qpos_dropout > 0:
+            if self.qpos_dropout >= 1.0:
+                qpos_dec = torch.zeros_like(qpos)
+            elif self.training and self.qpos_dropout > 0:
                 keep = (torch.rand(bs, 1, device=qpos.device) >= self.qpos_dropout).to(qpos.dtype)
                 qpos_dec = qpos * keep
             proprio_input = self.input_proj_robot_state(qpos_dec)

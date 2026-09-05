@@ -181,6 +181,12 @@ if stage_wanted 5; then
   queue s5_lr3e-5  $B lr=3e-5
   queue s5_lr3e-4  $B lr=3e-4
   queue s5_kl10    $B kl_weight=10
+  # Every delta variant commands only ~25% of the true motion (motion_ratio), the signature of
+  # L1 regressing to the conditional median. The CVAE latent is meant to absorb that
+  # multimodality but its KL collapses to ~0, leaving a deterministic median predictor. Lower
+  # kl_weight is the direct test of whether keeping the latent alive restores motion amplitude.
+  queue s5_kl0.1   $B kl_weight=0.1
+  queue s5_kl0.01  $B kl_weight=0.01
   queue s5_bpe16   $B batches_per_epoch=16 num_epochs=3000   # 4x the gradient steps per epoch
   queue s5_long    $B num_epochs=30000
   wait

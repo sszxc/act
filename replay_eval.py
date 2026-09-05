@@ -33,6 +33,29 @@ from utils import load_cam_images, set_seed
 TEMPORAL_AGG_K = 0.01  # matches rollout_single_episode_return()
 
 
+def run_defaults(ckpt_dir):
+    """Read a run's own config_hydra_resolved.yaml so eval can't silently disagree with training.
+    qpos_dropout in particular: >=1 means the policy was trained with no proprio at all, and
+    feeding it real qpos at eval would be off-distribution."""
+    path = os.path.join(ckpt_dir, 'config_hydra_resolved.yaml')
+    if not os.path.isfile(path):
+        return {}
+    import yaml
+    cfg = yaml.safe_load(open(path))
+    keys = ('camera_names', 'chunk_size', 'qpos_dropout', 'action_offset', 'dataset_dir',
+            'num_episodes', 'val_episode_ids', 'hidden_dim', 'dim_feedforward', 'seed')
+    return {k: cfg[k] for k in keys if cfg.get(k) is not None}
+
+
+def apply_run_defaults(args, parser):
+    """CLI values the user actually typed win; everything else falls back to the run's config."""
+    defaults = run_defaults(args.ckpt_dir)
+    for k, v in defaults.items():
+        if hasattr(args, k) and getattr(args, k) == parser.get_default(k):
+            setattr(args, k, v)
+    return args
+
+
 def predict_chunks(policy, root, camera_names, image_size, qpos_n, batch=32):
     """all_actions[t] = the policy's chunk prediction at timestep t, normalized. (T, nq, D)"""
     T = len(qpos_n)
@@ -84,6 +107,7 @@ def main():
     p.add_argument('--hidden_dim', type=int, default=512)
     p.add_argument('--dim_feedforward', type=int, default=3200)
     p.add_argument('--state_dim', type=int, default=24)
+    p.add_argument('--qpos_dropout', type=float, default=0.0)
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--val_episode_ids', nargs='+', type=int, default=None,
                    help='explicit held-out episodes; must match training '
@@ -91,7 +115,7 @@ def main():
     p.add_argument('--max_episodes', type=int, default=None, help='cap val episodes, for speed')
     p.add_argument('--plot', action='store_true', help='save per-episode command-vs-recorded plots')
     p.add_argument('--out', default=None, help='json output path (default <ckpt_dir>/replay_eval.json)')
-    args = p.parse_args()
+    args = apply_run_defaults(p.parse_args(), p)
 
     with open(os.path.join(args.ckpt_dir, 'dataset_stats.pkl'), 'rb') as f:
         stats = pickle.load(f)
@@ -112,7 +136,7 @@ def main():
         'latent_z_dim': 32, 'lr_backbone': 1e-5, 'backbone': 'resnet18',
         'enc_layers': 4, 'dec_layers': 7, 'nheads': 8,
         'camera_names': args.camera_names, 'state_dim': args.state_dim,
-        'action_dim': args.state_dim,
+        'action_dim': args.state_dim, 'qpos_dropout': args.qpos_dropout,
     })
     policy.load_state_dict(torch.load(os.path.join(args.ckpt_dir, args.ckpt_name),
                                       map_location='cuda'), strict=False)

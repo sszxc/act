@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from imitate_episodes import build_deploy_set, deploy_metrics, make_policy
+from replay_eval import apply_run_defaults
 from utils import EpisodicDataset, get_norm_stats, set_seed
 
 
@@ -29,6 +30,7 @@ def main():
     p.add_argument('--hidden_dim', type=int, default=512)
     p.add_argument('--dim_feedforward', type=int, default=3200)
     p.add_argument('--state_dim', type=int, default=24)
+    p.add_argument('--qpos_dropout', type=float, default=0.0)
     p.add_argument('--action_repr', default=None, help='default: read from dataset_stats.pkl')
     p.add_argument('--action_offset', type=int, default=-1)
     p.add_argument('--seed', type=int, default=0)
@@ -36,7 +38,7 @@ def main():
                    help='explicit held-out episodes; must match training '
                         '(default: reproduce the seeded 80/20 split)')
     p.add_argument('--n_per_episode', type=int, default=8)
-    args = p.parse_args()
+    args = apply_run_defaults(p.parse_args(), p)
 
     with open(os.path.join(args.ckpt_dir, 'dataset_stats.pkl'), 'rb') as f:
         stats = pickle.load(f)
@@ -65,7 +67,7 @@ def main():
         'latent_z_dim': 32, 'lr_backbone': 1e-5, 'backbone': 'resnet18',
         'enc_layers': 4, 'dec_layers': 7, 'nheads': 8,
         'camera_names': args.camera_names, 'state_dim': args.state_dim,
-        'action_dim': args.state_dim,
+        'action_dim': args.state_dim, 'qpos_dropout': args.qpos_dropout,
     })
     sd = torch.load(os.path.join(args.ckpt_dir, args.ckpt_name), map_location='cuda')
     print(policy.load_state_dict(sd, strict=False))
