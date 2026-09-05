@@ -85,6 +85,9 @@ def main():
     p.add_argument('--dim_feedforward', type=int, default=3200)
     p.add_argument('--state_dim', type=int, default=24)
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--val_episode_ids', nargs='+', type=int, default=None,
+                   help='explicit held-out episodes; must match training '
+                        '(default: reproduce the seeded 80/20 split)')
     p.add_argument('--max_episodes', type=int, default=None, help='cap val episodes, for speed')
     p.add_argument('--plot', action='store_true', help='save per-episode command-vs-recorded plots')
     p.add_argument('--out', default=None, help='json output path (default <ckpt_dir>/replay_eval.json)')
@@ -94,9 +97,12 @@ def main():
         stats = pickle.load(f)
     action_repr = stats.get('action_repr', 'absolute')
 
-    set_seed(args.seed)
-    idx = np.random.permutation(args.num_episodes)
-    val_indices = idx[int(0.8 * args.num_episodes):]
+    if args.val_episode_ids:
+        val_indices = np.array(sorted(args.val_episode_ids))
+    else:
+        set_seed(args.seed)          # same split the run trained with
+        idx = np.random.permutation(args.num_episodes)
+        val_indices = idx[int(0.8 * args.num_episodes):]
     if args.max_episodes:
         val_indices = val_indices[:args.max_episodes]
 

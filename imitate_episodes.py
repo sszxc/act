@@ -145,6 +145,7 @@ def train_or_eval(args, hydra_cfg=None):
         'action_repr': args.get('action_repr', 'absolute'),
         'action_offset': args.get('action_offset', -1),
         'num_workers': args.get('num_workers', 1),
+        'val_episode_ids': args.get('val_episode_ids', None),
         'deploy_every': args.get('deploy_every', 25),
         'save_every': args.get('save_every', 500),
         'env_family': env_family,
@@ -252,6 +253,7 @@ def train_or_eval(args, hydra_cfg=None):
         action_repr=config['action_repr'],
         action_offset=config['action_offset'],
         num_workers=config['num_workers'],
+        val_episode_ids=config['val_episode_ids'],
     )
     # Eval must reproduce the training action representation; keep it with the stats.
     stats['action_repr'] = config['action_repr']

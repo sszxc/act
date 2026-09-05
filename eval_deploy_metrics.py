@@ -32,6 +32,9 @@ def main():
     p.add_argument('--action_repr', default=None, help='default: read from dataset_stats.pkl')
     p.add_argument('--action_offset', type=int, default=-1)
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--val_episode_ids', nargs='+', type=int, default=None,
+                   help='explicit held-out episodes; must match training '
+                        '(default: reproduce the seeded 80/20 split)')
     p.add_argument('--n_per_episode', type=int, default=8)
     args = p.parse_args()
 
@@ -43,9 +46,12 @@ def main():
                                     num_queries=args.chunk_size, action_offset=args.action_offset))
 
     # Same split as training: set_seed(seed) then permutation(num_episodes), 80/20.
-    set_seed(args.seed)
-    idx = np.random.permutation(args.num_episodes)
-    val_indices = idx[int(0.8 * args.num_episodes):]
+    if args.val_episode_ids:
+        val_indices = np.array(sorted(args.val_episode_ids))
+    else:
+        set_seed(args.seed)          # same split the run trained with
+        idx = np.random.permutation(args.num_episodes)
+        val_indices = idx[int(0.8 * args.num_episodes):]
     print(f'val episodes: {sorted(val_indices.tolist())}')
 
     val_dataset = EpisodicDataset(val_indices, args.dataset_dir, args.camera_names, stats,

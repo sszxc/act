@@ -285,12 +285,20 @@ class EpisodicDatasetPCA(torch.utils.data.Dataset):
 
 def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, num_queries,
               task_name=None, batches_per_epoch=None, image_size=None,
-              action_repr='absolute', action_offset=-1, num_workers=1):
+              action_repr='absolute', action_offset=-1, num_workers=1, val_episode_ids=None):
     print(f'\nData from: {dataset_dir}\n')
-    train_ratio = 0.8
-    shuffled_indices = np.random.permutation(num_episodes)
-    train_indices = shuffled_indices[:int(train_ratio * num_episodes)]
-    val_indices = shuffled_indices[int(train_ratio * num_episodes):]
+    if val_episode_ids is not None:
+        # Explicit held-out set instead of a seeded 80/20 split. Needed whenever runs with
+        # different dataset sizes must be compared (the human/scripted mixes): a random split
+        # would give each mix a different val set, and their losses would not be comparable.
+        val_indices = np.array(sorted(val_episode_ids))
+        train_indices = np.setdiff1d(np.arange(num_episodes), val_indices)
+    else:
+        train_ratio = 0.8
+        shuffled_indices = np.random.permutation(num_episodes)
+        train_indices = shuffled_indices[:int(train_ratio * num_episodes)]
+        val_indices = shuffled_indices[int(train_ratio * num_episodes):]
+    print(f'train episodes: {len(train_indices)}, val episodes: {sorted(val_indices.tolist())}')
 
     if task_name == 'sim_dexgrasp_pca_cube_teleop':
         from constants import SIM_TASK_CONFIGS

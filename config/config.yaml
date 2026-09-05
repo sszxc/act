@@ -51,6 +51,11 @@ action_offset: -1
 # read the images. 0 = off.
 qpos_dropout: 0.0
 
+# Explicit validation episode indices, e.g. [0,1,2,3,4,5,6,7,8]. null = seeded random 80/20
+# split. Needed to compare runs over datasets of different sizes (the human/scripted mixes):
+# a random split would give each one a different val set.
+val_episode_ids: null
+
 # DataLoader workers. The h5py random-frame reads are the bottleneck; >1 helps a lot.
 num_workers: 6
 # Epochs between deployment-metric evaluations (deploy/{l1_rad,skill,motion_ratio}, see
