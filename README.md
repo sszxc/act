@@ -258,3 +258,25 @@ prediction most, which at 30Hz costs ~0.8s of lag; `--temporal_agg_newest --temp
 reverses that and cut command error 34% on the 2026-09-02 best checkpoint.
 
 Sweep in flight: `results/sweep_20260904/PLAN.md`.
+
+### Scripted (state-machine) data and human/scripted mixes
+
+`~/data/data_0904/` is a batch recorded by an open-loop fixed-waypoint state machine, same
+schema v1.3 as the teleop batches, so step 1 above converts it unchanged:
+
+```
+python convert_teleop_dataset.py --data_root ~/data/data_0904/success \
+    --out_dir data/real_pick_yellow_bottle/scripted_0904_c19
+```
+
+19/19 success episodes convert (363-684 steps each). Despite "fixed waypoints" the executed arm
+trajectories are *not* near-identical: start-aligned cross-episode std is 0.303 rad on the arm
+joints vs 0.247 for human teleop (hand joints 0.152 vs 0.185), so the batch carries real visual
+variation rather than one replayed path.
+
+`mix_h<H>_s<S>` dirs combine them with the human set. **Indices 0-8 of every mix dir are the same
+9 held-out human episodes** (`good_41` indices 0,3,6,9,19,21,23,24,39 — the seed-0 val split), so
+passing `val_episode_ids=[0,1,2,3,4,5,6,7,8]` validates every mix on one identical human-only set
+and makes their losses comparable despite different dataset sizes. `mix_h32_s0` (41) is the
+no-scripted-data control; the others are `mix_h32_s{5,10,19}` (46/51/60), `mix_h16_s19` (44) and
+`mix_h0_s19` (28, scripted-only). Driver: `run_mix_20260904.sh`.
