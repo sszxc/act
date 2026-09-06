@@ -7,8 +7,8 @@
 # a few sets across 5 seeds and comparing rank-by-seed is far more powerful than adding more
 # camera sets. If one set wins at 5/5 seeds that is a sign test at p=0.03; 3/5 is noise.
 #
-# Sets: the incumbent (left+top), the Stage 3 winner (top+side+wrist), all-RealSense, all-9,
-# and the top+wrist / top+wrist+F pair which isolates the fingertip cameras.
+# Sets: the incumbent (left+top), the Stage 3 winner (top+side+wrist), all-RealSense, and
+# the top+wrist / top+wrist+F pair which isolates the fingertip cameras.
 set -uo pipefail
 cd "$(dirname "$0")"
 PY=/home/asu/miniconda3/envs/aloha/bin/python
@@ -36,7 +36,10 @@ declare -a SETS=(
   "left_top|[left,top]"
   "top_side_wrist|[top,side,wrist]"
   "rs_all|[left,right,side,top,wrist]"
-  "all9|[left,right,side,top,wrist,$F]"
+  # all9 dropped from the replication: at 3.75h/run it is the most expensive arm by far, and
+  # the questions it would answer are already covered more cheaply -- rs_all covers "many
+  # cameras", and top_wrist vs top_wrist_F isolates the fingertip cameras. Its 2 existing seeds
+  # stay in the table.
   "top_wrist|[top,wrist]"
   "top_wrist_F|[top,wrist,$F]"
 )
