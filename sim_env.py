@@ -121,7 +121,7 @@ def _sample_random_object_shape(cfg):
     z = float(cfg["table_z"]) + _shape_z_half_extent(name, size)
     yaw_range = np.asarray(cfg["yaw_range"], dtype=np.float64).reshape(-1)
     yaw = float(np.random.uniform(yaw_range[0], yaw_range[1]))
-    return {
+    sampled = {
         "body_name": cfg["body_name"],
         "geom_name": cfg["geom_name"],
         "density": float(cfg.get("density", 700.0)),
@@ -131,6 +131,9 @@ def _sample_random_object_shape(cfg):
         "position": np.array([xy[0], xy[1], z], dtype=np.float64),
         "yaw": yaw,
     }
+    if cfg.get("color") is not None:
+        sampled["color"] = np.asarray(cfg["color"], dtype=np.float64)
+    return sampled
 
 
 def sample_hmf_proto5_random_reset(task_name):
@@ -230,7 +233,7 @@ def make_sim_env(task_name, time_limit=20):
         # "sim_hmf_proto5_pick_place_v3".
         if task_name.startswith("sim_hmf_proto5_pick_place_v3"):
             task = Proto5PickPlaceV3Task(random=False)
-        elif task_name.startswith("sim_hmf_proto5_pick"):
+        elif task_name.startswith("sim_hmf_proto5_pick") or task_name.startswith("sim_hmf_proto5_grasp"):
             task = Proto5PickTask(random=False)
         elif task_name.startswith("sim_hmf_proto5_drawer"):
             task = Proto5DrawerTask(random=False)
@@ -240,9 +243,12 @@ def make_sim_env(task_name, time_limit=20):
             raise NotImplementedError(
                 f"Unknown HMF proto5 task_name '{task_name}'. "
                 "Expected sim_hmf_proto5_pick_place_v3, sim_hmf_proto5_pick, "
-                "sim_hmf_proto5_drawer, or sim_hmf_proto5_basketball "
+                "sim_hmf_proto5_grasp, sim_hmf_proto5_drawer, or sim_hmf_proto5_basketball "
                 "(optionally with a suffix, e.g. an eval-only scene variant)."
             )
+        camera_names = task_config.get("camera_names")
+        if camera_names:
+            task.CAMERA_NAMES = tuple(camera_names)
         env = control.Environment(physics, task, time_limit=time_limit, control_timestep=DT,
                                   n_sub_steps=None, flat_observation=False)
     else:
@@ -649,6 +655,14 @@ class Proto5HMFMocapTask(base.Task):
                 np.random.uniform(0.15, 0.95),
                 1.0,
             ]
+        elif sampled.get("color") is not None:
+            color = np.asarray(sampled["color"], dtype=np.float64).reshape(-1)
+            rgba = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float64)
+            n = min(4, color.size)
+            rgba[:n] = color[:n]
+            if color.size == 3:
+                rgba[3] = 1.0
+            physics.model.geom_rgba[geom_id] = rgba
 
         mass, diag_inertia = _shape_mass_and_diag_inertia(shape_name, size, density)
         physics.model.body_mass[body_id] = mass
@@ -814,7 +828,7 @@ def episode_reward_meets_success(task_name, episode_highest_reward, env_max_rewa
     Whether a rollout counts as success vs env.task.max_reward.
     Pick-place v3: per-step reward is -distance; episode_highest_reward = max_t(-d_t) = -min_t(d_t).
     Success when min distance is within PICK_PLACE_V3_SUCCESS_DIST_ATOL of the goal.
-    Pick: per-step reward is -remaining_lift; success when peak lift is within
+    Pick / grasp: per-step reward is -remaining_lift; success when peak lift is within
     PICK_SUCCESS_LIFT_ATOL of LIFT_TARGET. pick_place_v3 must be checked first
     (its name also starts with sim_hmf_proto5_pick).
     """
@@ -827,7 +841,7 @@ def episode_reward_meets_success(task_name, episode_highest_reward, env_max_rewa
                 atol=PICK_PLACE_V3_SUCCESS_DIST_ATOL,
             )
         )
-    if task_name.startswith("sim_hmf_proto5_pick"):
+    if task_name.startswith("sim_hmf_proto5_pick") or task_name.startswith("sim_hmf_proto5_grasp"):
         return bool(
             np.isclose(
                 episode_highest_reward,

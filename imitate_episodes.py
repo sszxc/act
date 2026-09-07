@@ -240,6 +240,7 @@ def train_or_eval(args, hydra_cfg=None):
         batch_size_val,
         num_queries=policy_config['num_queries'],
         task_name=task_name,
+        state_dim=state_dim,
     )
 
     # save dataset stats
@@ -446,6 +447,8 @@ def build_fixed_hmf_proto5_random_reset(task_name, fixed_object_pose, fixed_obje
             "position": pos,
             "yaw": 0.0,
         }
+        if shape_cfg.get("color") is not None:
+            state["random_object_shape"]["color"] = np.asarray(shape_cfg["color"], dtype=np.float64)
 
     return state
 

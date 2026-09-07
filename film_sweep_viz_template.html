@@ -354,6 +354,53 @@
   }
 
   var DATA = injected ? injected.rows : buildMockDataset();
+  var HAS_OBJECT_GRID = OBJECT_X_VALUES.length > 1 || OBJECT_Y_VALUES.length > 1;
+
+  // When the object sits on an x/y grid, lock 3D / height / reward axes to the full
+  // dataset so dragging the position sliders doesn't re-autorange around the current cell.
+  function paddedRange(vals, padFrac) {
+    if (!vals.length) return null;
+    var lo = vals[0], hi = vals[0];
+    for (var i = 1; i < vals.length; i++) {
+      if (vals[i] < lo) lo = vals[i];
+      if (vals[i] > hi) hi = vals[i];
+    }
+    if (!(isFinite(lo) && isFinite(hi))) return null;
+    var span = hi - lo;
+    var pad = span > 0 ? span * (padFrac || 0.08) : Math.max(0.01, Math.abs(lo) * 0.05 || 0.01);
+    return [lo - pad, hi + pad];
+  }
+  function collectFixedRanges() {
+    var xs = [], ys = [], zs = [], rets = [];
+    DATA.forEach(function (r) {
+      rets.push(r.episode_return);
+      r.mocap_pos.forEach(function (p) {
+        xs.push(p[0]); ys.push(p[1]); zs.push(p[2]);
+      });
+    });
+    OBJECT_X_VALUES.forEach(function (x) { xs.push(x); });
+    OBJECT_Y_VALUES.forEach(function (y) { ys.push(y); });
+    zs.push(OBJECT_POS[2]);
+    return { x: paddedRange(xs), y: paddedRange(ys), z: paddedRange(zs), reward: paddedRange(rets) };
+  }
+  var FIXED_RANGE = HAS_OBJECT_GRID ? collectFixedRanges() : null;
+  // aspectmode "data" rebuilds the 3D box from the *currently plotted* traces, so the
+  // window's x:y:z ratio jumps as you drag x/y even when axis `range` is locked.
+  // Pin it to the global workspace instead.
+  var FIXED_ASPECT = (function () {
+    if (!FIXED_RANGE || !FIXED_RANGE.x || !FIXED_RANGE.y || !FIXED_RANGE.z) return null;
+    var sx = FIXED_RANGE.x[1] - FIXED_RANGE.x[0];
+    var sy = FIXED_RANGE.y[1] - FIXED_RANGE.y[0];
+    var sz = FIXED_RANGE.z[1] - FIXED_RANGE.z[0];
+    var m = Math.max(sx, sy, sz, 1e-6);
+    return { x: sx / m, y: sy / m, z: sz / m };
+  })();
+
+  function axis3d(title, range) {
+    var ax = { title: title, color: COLOR.muted, gridcolor: COLOR.grid, backgroundcolor: "transparent" };
+    if (range) { ax.range = range; ax.autorange = false; }
+    return ax;
+  }
 
   // ---------- header / footer text ----------
   (function fillText() {
@@ -393,6 +440,23 @@
   var elR = document.getElementById("plotReward");
   var currentDim = DIM_NAMES[0];
   var plotted = false;
+  var DEFAULT_CAMERA = { eye: { x: 1.5, y: -1.5, z: 0.9 } };
+  var savedCamera = DEFAULT_CAMERA;
+
+  // Plotly's uirevision does not reliably keep scatter3d cameras across Plotly.react
+  // (especially after the first update). Flush the GL scene into layout, then reuse it.
+  function currentCamera() {
+    try {
+      var scene = el3d._fullLayout && el3d._fullLayout.scene && el3d._fullLayout.scene._scene;
+      if (scene && typeof scene.saveLayout === "function") scene.saveLayout(el3d.layout);
+    } catch (e) { /* scene not ready yet */ }
+    var cam = (el3d._fullLayout && el3d._fullLayout.scene && el3d._fullLayout.scene.camera)
+      || (el3d.layout && el3d.layout.scene && el3d.layout.scene.camera)
+      || savedCamera
+      || DEFAULT_CAMERA;
+    savedCamera = cam;
+    try { return JSON.parse(JSON.stringify(cam)); } catch (e) { return DEFAULT_CAMERA; }
+  }
 
   function layoutCommon(extra) {
     var base = {
@@ -442,17 +506,28 @@
       hovertemplate: "object<extra></extra>",
     });
 
+    var sceneLayout = {
+      aspectmode: FIXED_ASPECT ? "manual" : "data",
+      uirevision: "film-sweep-scene",
+      xaxis: axis3d("x (m)", FIXED_RANGE && FIXED_RANGE.x),
+      yaxis: axis3d("y (m)", FIXED_RANGE && FIXED_RANGE.y),
+      zaxis: axis3d("z (m)", FIXED_RANGE && FIXED_RANGE.z),
+      camera: plotted ? currentCamera() : DEFAULT_CAMERA,
+    };
+    if (FIXED_ASPECT) sceneLayout.aspectratio = FIXED_ASPECT;
+
     var fn3d = plotted ? Plotly.react : Plotly.newPlot;
     fn3d(el3d, traces3d, layoutCommon({
       showlegend: false,
-      scene: {
-        aspectmode: "data",
-        xaxis: { title: "x (m)", color: COLOR.muted, gridcolor: COLOR.grid, backgroundcolor: "transparent" },
-        yaxis: { title: "y (m)", color: COLOR.muted, gridcolor: COLOR.grid, backgroundcolor: "transparent" },
-        zaxis: { title: "z (m)", color: COLOR.muted, gridcolor: COLOR.grid, backgroundcolor: "transparent" },
-        camera: { eye: { x: 1.5, y: -1.5, z: 0.9 } },
-      },
+      uirevision: "film-sweep",
+      scene: sceneLayout,
     }), { displayModeBar: false, responsive: true });
+    if (!el3d._cameraSaveBound) {
+      el3d._cameraSaveBound = true;
+      el3d.on("plotly_relayout", function (ev) {
+        if (ev && ev["scene.camera"]) savedCamera = ev["scene.camera"];
+      });
+    }
 
     // ---- height over time ----
     var tracesH = rows.map(function (r, i) {
@@ -469,8 +544,12 @@
     var fnH = plotted ? Plotly.react : Plotly.newPlot;
     fnH(elH, tracesH, layoutCommon({
       showlegend: false,
+      uirevision: "film-sweep",
       xaxis: { title: "timestep", color: COLOR.muted, gridcolor: COLOR.grid, zeroline: false },
-      yaxis: { title: "z (m)", color: COLOR.muted, gridcolor: COLOR.grid, zeroline: false },
+      yaxis: {
+        title: "z (m)", color: COLOR.muted, gridcolor: COLOR.grid, zeroline: false,
+        range: FIXED_RANGE && FIXED_RANGE.z, autorange: FIXED_RANGE ? false : true,
+      },
     }), { displayModeBar: false, responsive: true });
 
     // ---- reward vs value ----
@@ -493,8 +572,12 @@
     var fnR = plotted ? Plotly.react : Plotly.newPlot;
     fnR(elR, rewardTraces, layoutCommon({
       showlegend: false,
+      uirevision: "film-sweep",
       xaxis: { title: label + " value", type: "category", categoryarray: cats, color: COLOR.muted, gridcolor: COLOR.grid },
-      yaxis: { title: "episode_return", color: COLOR.muted, gridcolor: COLOR.grid, zeroline: false },
+      yaxis: {
+        title: "episode_return", color: COLOR.muted, gridcolor: COLOR.grid, zeroline: false,
+        range: FIXED_RANGE && FIXED_RANGE.reward, autorange: FIXED_RANGE ? false : true,
+      },
     }), { displayModeBar: false, responsive: true });
 
     // cross-highlight: hovering a reward marker dims the other trajectories

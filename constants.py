@@ -109,6 +109,59 @@ HMF_PROTO5_RANDOM_RESET_CONFIGS = {
             },
         ],
     },
+    # Scripted grasp_red_box_200 (collect_grasp_data.py): fixed red box 0.03x0.03x0.05,
+    # XY jitter ±0.03 around (0, 0.65), full yaw, table_z = 0.66 - 0.05 = 0.61.
+    # random_obj_goal is here so --fixed_object_pose works on the train task too
+    # (shape sampling overwrites xy/z on random eval).
+    "grasp_red_box": {
+        "random_obj_goal": [
+            {
+                "name": "obj",
+                "type": "body",
+                "position_ranges": [[-0.03, 0.03], [0.62, 0.68], [0.66, 0.66]],
+            },
+        ],
+        "random_object_shape": {
+            "enabled": True,
+            "body_name": "obj",
+            "geom_name": "objGeom",
+            "table_z": 0.61,
+            "position_ranges": [[-0.03, 0.03], [0.62, 0.68]],
+            "yaw_range": [0.0, 6.28318],
+            "density": 700,
+            "randomize_color": False,
+            "color": [1.0, 0.0, 0.0],
+            "train_shapes": [
+                {"name": "box", "size_ranges": [[0.03, 0.03], [0.03, 0.03], [0.05, 0.05]]},
+            ],
+        },
+    },
+    # Eval/ICL: XML-baked red box (no shape sampling). train_shapes catalog
+    # collect_grasp_data.py OBJECT_SIZE_RANGES for --fixed_object_shape overrides.
+    "grasp_red_box_eval": {
+        "random_obj_goal": [
+            {
+                "name": "obj",
+                "type": "body",
+                "position_ranges": [[-0.03, 0.03], [0.62, 0.68], [0.66, 0.66]],
+            },
+        ],
+        "random_object_shape": {
+            "enabled": False,
+            "body_name": "obj",
+            "geom_name": "objGeom",
+            "table_z": 0.61,
+            "density": 700,
+            "randomize_color": False,
+            "color": [1.0, 0.0, 0.0],
+            "train_shapes": [
+                {"name": "box", "size_ranges": [[0.02, 0.04], [0.02, 0.04], [0.03, 0.06]]},
+                {"name": "cylinder", "size_ranges": [[0.02, 0.035], [0.03, 0.06]]},
+                {"name": "sphere", "size_ranges": [[0.025, 0.045]]},
+                {"name": "capsule", "size_ranges": [[0.02, 0.03], [0.03, 0.05]]},
+            ],
+        },
+    },
 }
 
 SIM_TASK_CONFIGS = {
@@ -248,6 +301,34 @@ SIM_TASK_CONFIGS = {
         "env_family": ENV_FAMILY_HMF_PROTO5_HAND,
         "xml_path": "/home/lab/Documents/proto5_description/mjcf/hmf_hand_proto5_release_right_ur7e_scene_basketball.xml",
         "random_reset": HMF_PROTO5_RANDOM_RESET_CONFIGS["basketball"],
+    },
+    # Scripted red-box grasp (collect_grasp_data.py --object-shape box --object-color 1 0 0
+    # --object-size 0.03 0.03 0.05 --ctrl-noise --tcp-calib-noise -n 200 --skip-failures).
+    # Cameras match the hdf5 (topview + corner). Reward: Proto5PickTask.
+    "sim_hmf_proto5_grasp_red_box": {
+        "dataset_dir": "/home/lab/Documents/proto5_description/mjcf/data/hdf5/grasp_red_box_200",
+        "num_episodes": 200,
+        "episode_len": 220,
+        "camera_names": ["topview", "corner"],
+        "state_dim": HMF_PROTO5_STATE_DIM,
+        "action_dim": HMF_PROTO5_ACTION_DIM,
+        "env_family": ENV_FAMILY_HMF_PROTO5_HAND,
+        "xml_path": "/home/lab/Documents/proto5_description/mjcf/hmf_hand_proto5_release_right_ur7e_scene_pick.xml",
+        "random_reset": HMF_PROTO5_RANDOM_RESET_CONFIGS["grasp_red_box"],
+    },
+    # Same dataset/checkpoint as grasp_red_box. Default reset keeps the XML box;
+    # ICL/eval: --task_name sim_hmf_proto5_grasp_red_box_eval --ckpt_dir <grasp ckpt>
+    # plus --fixed_object_pose / --fixed_object_shape.
+    "sim_hmf_proto5_grasp_red_box_eval": {
+        "dataset_dir": "/home/lab/Documents/proto5_description/mjcf/data/hdf5/grasp_red_box_200",
+        "num_episodes": 200,
+        "episode_len": 220,
+        "camera_names": ["topview", "corner"],
+        "state_dim": HMF_PROTO5_STATE_DIM,
+        "action_dim": HMF_PROTO5_ACTION_DIM,
+        "env_family": ENV_FAMILY_HMF_PROTO5_HAND,
+        "xml_path": "/home/lab/Documents/proto5_description/mjcf/hmf_hand_proto5_release_right_ur7e_scene_pick.xml",
+        "random_reset": HMF_PROTO5_RANDOM_RESET_CONFIGS["grasp_red_box_eval"],
     },
 }
 
