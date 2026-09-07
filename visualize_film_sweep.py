@@ -76,6 +76,39 @@ def build_payload(npz_path: Path, meta_path: Path | None, max_points: int) -> di
     return {"meta": meta, "rows": rows}
 
 
+def render(
+    sweep_dir: Path,
+    npz_path: Path | None = None,
+    output: Path | None = None,
+    max_points: int = 200,
+    template: Path | None = None,
+) -> Path:
+    """Build film_sweep_viz.html for a sweep dir. Returns the output path. Used by both this
+    script's CLI and optimize_film_params.py (auto-viz right after --method sweep finishes)."""
+    sweep_dir = Path(sweep_dir).resolve()
+    npz_path = Path(npz_path).resolve() if npz_path else sweep_dir / "film_sweep_trajectories.npz"
+    if not npz_path.is_file():
+        raise SystemExit(f"Not found: {npz_path} (did the sweep finish? see sweep_history.jsonl in {sweep_dir})")
+    meta_path = sweep_dir / "run_meta.json"
+    template_path = Path(template).resolve() if template else Path(__file__).resolve().parent / "film_sweep_viz_template.html"
+    output_path = Path(output).resolve() if output else sweep_dir / "film_sweep_viz.html"
+
+    payload = build_payload(npz_path, meta_path, max_points)
+    # Escape "</" so a stray "</script"-like substring in e.g. a ckpt path can't break out of
+    # the <script> block the JSON is embedded in.
+    payload_json = json.dumps(payload).replace("</", "<\\/")
+
+    template_html = template_path.read_text(encoding="utf-8")
+    marker = '<script type="application/json" id="sweep-data">null</script>'
+    if marker not in template_html:
+        raise SystemExit(f"Template {template_path} is missing the expected `{marker}` placeholder")
+    html = template_html.replace(marker, f'<script type="application/json" id="sweep-data">{payload_json}</script>')
+
+    output_path.write_text(html, encoding="utf-8")
+    print(f"Wrote {output_path} ({len(payload['rows'])} trajectories, {max_points} pts/traj max)")
+    return output_path
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--sweep_dir", type=str, required=True, help="Output dir from --method sweep (contains film_sweep_trajectories.npz)")
@@ -90,27 +123,13 @@ def main():
     )
     args = p.parse_args()
 
-    sweep_dir = Path(args.sweep_dir).resolve()
-    npz_path = Path(args.npz_path).resolve() if args.npz_path else sweep_dir / "film_sweep_trajectories.npz"
-    if not npz_path.is_file():
-        raise SystemExit(f"Not found: {npz_path} (did the sweep finish? see sweep_history.jsonl in {sweep_dir})")
-    meta_path = sweep_dir / "run_meta.json"
-    template_path = Path(args.template).resolve() if args.template else Path(__file__).resolve().parent / "film_sweep_viz_template.html"
-    output_path = Path(args.output).resolve() if args.output else sweep_dir / "film_sweep_viz.html"
-
-    payload = build_payload(npz_path, meta_path, args.max_points)
-    # Escape "</" so a stray "</script"-like substring in e.g. a ckpt path can't break out of
-    # the <script> block the JSON is embedded in.
-    payload_json = json.dumps(payload).replace("</", "<\\/")
-
-    template = template_path.read_text(encoding="utf-8")
-    marker = '<script type="application/json" id="sweep-data">null</script>'
-    if marker not in template:
-        raise SystemExit(f"Template {template_path} is missing the expected `{marker}` placeholder")
-    html = template.replace(marker, f'<script type="application/json" id="sweep-data">{payload_json}</script>')
-
-    output_path.write_text(html, encoding="utf-8")
-    print(f"Wrote {output_path} ({len(payload['rows'])} trajectories, {args.max_points} pts/traj max)")
+    render(
+        Path(args.sweep_dir),
+        npz_path=Path(args.npz_path) if args.npz_path else None,
+        output=Path(args.output) if args.output else None,
+        max_points=args.max_points,
+        template=Path(args.template) if args.template else None,
+    )
     print("Open it directly in a browser, or ask Claude to publish it as an Artifact.")
 
 

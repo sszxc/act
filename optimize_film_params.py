@@ -2244,7 +2244,11 @@ def main():
                 theta_base=theta_base,
             )
             print(f"Saved {len(sweep_records)} trajectories to {out_dir / 'film_sweep_trajectories.npz'}")
-            print(f"Visualize: python visualize_film_sweep.py --sweep_dir {out_dir}")
+            try:
+                from visualize_film_sweep import render as render_sweep_viz
+                render_sweep_viz(out_dir)
+            except Exception as e:
+                print(f"Warning: auto-visualization failed ({e}); run manually: python visualize_film_sweep.py --sweep_dir {out_dir}")
     elif args.method == "llm":
         if int(args.parallel) > 1:
             print("Warning: --method llm currently evaluates one candidate per iteration; extra parallel envs stay idle.")
