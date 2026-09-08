@@ -280,3 +280,12 @@ passing `val_episode_ids=[0,1,2,3,4,5,6,7,8]` validates every mix on one identic
 and makes their losses comparable despite different dataset sizes. `mix_h32_s0` (41) is the
 no-scripted-data control; the others are `mix_h32_s{5,10,19}` (46/51/60), `mix_h16_s19` (44) and
 `mix_h0_s19` (28, scripted-only). Driver: `run_mix_20260904.sh`.
+
+### Sweep results (2026-09-04/07)
+
+96 runs, 66.5h. Report: `results/sweep_20260904/REPORT.md` (design notes: `PLAN.md`; raw numbers:
+`stage*.csv`, `summary.csv`, `results/mix_20260904/summary.csv`). Headlines: delta actions cut
+deployed-path error ~40%; camera choice and human/scripted mixing ratio are both inside the seed
+noise; raw scripted data at dose collapses the policy into freezing (pause-strip it first); and
+`--temporal_agg_newest --temporal_agg_k 0.5` cuts command error 47.5% on existing checkpoints
+with no retraining. `results/` is gitignored, so the report lives on disk only.

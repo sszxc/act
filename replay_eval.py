@@ -12,6 +12,10 @@ are very small, the robot barely moves"), which the training loss cannot:
   motion        mean |command - qpos[t]|, radians -- how far the robot is asked to move
   gt_motion     same for the recorded action
   motion_ratio  motion / gt_motion;  << 1 IS the "barely moves" failure, ~1 is healthy
+  track_corr    per-joint Pearson r between commanded motion (cmd - qpos) and recorded motion
+                (action - qpos), averaged over joints. Scale-free, so unlike cmd_l1 it cannot be
+                improved by simply commanding less motion -- a frozen policy scores ~0, not ~1.
+                Read it WITH motion_ratio: useful means r high AND motion_ratio near 1.
 
     python replay_eval.py --ckpt_dir results/... --chunk_size 50 --camera_names left top
 """
@@ -147,7 +151,8 @@ def main():
     modes = {'chunked': chunked, 'temporal_agg': temporal_ensemble}
     for k in (0.01, 0.1, 0.5):
         modes[f'agg_newest_k{k}'] = (lambda kk: lambda a: temporal_ensemble(a, True, kk))(k)
-    acc = {m: {k: [] for k in ('cmd_l1', 'freeze_l1', 'motion', 'gt_motion')} for m in modes}
+    acc = {m: {k: [] for k in ('cmd_l1', 'freeze_l1', 'motion', 'gt_motion', 'track_corr')}
+           for m in modes}
 
     plots = {}
     for ep in sorted(val_indices.tolist()):
@@ -168,6 +173,11 @@ def main():
             acc[name]['freeze_l1'].append(np.abs(qpos - gt_action).mean())
             acc[name]['motion'].append(np.abs(cmd - qpos).mean())
             acc[name]['gt_motion'].append(np.abs(gt_action - qpos).mean())
+            cd, gd = cmd - qpos, gt_action - qpos
+            cd = cd - cd.mean(0); gd = gd - gd.mean(0)
+            den = np.sqrt((cd ** 2).sum(0) * (gd ** 2).sum(0))
+            acc[name]['track_corr'].append(
+                np.nanmean(np.where(den > 0, (cd * gd).sum(0) / np.where(den > 0, den, 1), np.nan)))
             if args.plot:
                 plots.setdefault(ep, {})[name] = cmd
         if ep in plots:
@@ -181,8 +191,8 @@ def main():
         m['skill'] = m['cmd_l1'] / m['freeze_l1']
         m['motion_ratio'] = m['motion'] / m['gt_motion']
         result[name] = m
-        print(f"{name:19s} cmd_l1={m['cmd_l1']:.5f} freeze_l1={m['freeze_l1']:.5f} "
-              f"skill={m['skill']:.3f} motion_ratio={m['motion_ratio']:.3f}")
+        print(f"{name:19s} cmd_l1={m['cmd_l1']:.5f} skill={m['skill']:.3f} "
+              f"motion_ratio={m['motion_ratio']:.3f} track_corr={m['track_corr']:.3f}")
 
     out = args.out or os.path.join(args.ckpt_dir, 'replay_eval.json')
     with open(out, 'w') as f:
