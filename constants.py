@@ -110,7 +110,8 @@ HMF_PROTO5_RANDOM_RESET_CONFIGS = {
         ],
     },
     # Scripted grasp_red_box_200 (collect_grasp_data.py): fixed red box 0.03x0.03x0.05,
-    # XY jitter ±0.03 around (0, 0.65), full yaw, table_z = 0.66 - 0.05 = 0.61.
+    # XY range matches dex-retargeting's random_object_shape.position_ranges (the "pick"
+    # config above), full yaw, table_z = 0.66 - 0.05 = 0.61.
     # random_obj_goal is here so --fixed_object_pose works on the train task too
     # (shape sampling overwrites xy/z on random eval).
     "grasp_red_box": {
@@ -118,7 +119,7 @@ HMF_PROTO5_RANDOM_RESET_CONFIGS = {
             {
                 "name": "obj",
                 "type": "body",
-                "position_ranges": [[-0.03, 0.03], [0.62, 0.68], [0.66, 0.66]],
+                "position_ranges": [[-0.2, 0.2], [0.6, 0.9], [0.66, 0.66]],
             },
         ],
         "random_object_shape": {
@@ -126,8 +127,8 @@ HMF_PROTO5_RANDOM_RESET_CONFIGS = {
             "body_name": "obj",
             "geom_name": "objGeom",
             "table_z": 0.61,
-            "position_ranges": [[-0.03, 0.03], [0.62, 0.68]],
-            "yaw_range": [0.0, 6.28318],
+            "position_ranges": [[-0.2, 0.2], [0.6, 0.9]],
+            "yaw_range": [-3.14159, 3.14159],
             "density": 700,
             "randomize_color": False,
             "color": [1.0, 0.0, 0.0],
@@ -143,7 +144,7 @@ HMF_PROTO5_RANDOM_RESET_CONFIGS = {
             {
                 "name": "obj",
                 "type": "body",
-                "position_ranges": [[-0.03, 0.03], [0.62, 0.68], [0.66, 0.66]],
+                "position_ranges": [[-0.2, 0.2], [0.6, 0.9], [0.66, 0.66]],
             },
         ],
         "random_object_shape": {
