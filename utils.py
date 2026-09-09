@@ -41,11 +41,19 @@ class EpisodicDataset(torch.utils.data.Dataset):
     action_offset: chunk starts at action[start_ts + offset]. -1 is the upstream ALOHA
     'timestep alignment' hack; with action == qpos shifted by one it makes the first chunk
     element exactly qpos[start_ts] (a guaranteed no-op step), so 0 is the honest choice here.
+    action_stride: chunk element j targets action[start + offset + j*stride], i.e. the policy
+    commands at 30/stride Hz. At stride 1 the per-step motion (0.003 rad) is at the error
+    floor; stride 3 makes each commanded step 3x larger without changing the wall-clock span
+    a chunk covers (chunk_size 10 x stride 3 = the same 1.0 s as chunk_size 30 x stride 1).
     """
 
     def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, num_queries, image_size=None,
-                 action_repr='absolute', action_offset=-1):
+                 action_repr='absolute', action_offset=-1, joint_ids=None, action_stride=1):
         super(EpisodicDataset).__init__()
+        self.action_stride = int(action_stride)
+        self.joint_ids = None if joint_ids is None else np.asarray(joint_ids, dtype=int)
+        if self.joint_ids is not None and action_repr == 'task_space':
+            raise ValueError("joint_ids is incompatible with action_repr='task_space' (FK needs all 24 joints)")
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
         self.camera_names = camera_names
@@ -83,11 +91,20 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 action_start_ts = start_ts
             else:
                 action_start_ts = max(0, start_ts + self.action_offset)
-            action_end_ts = min(episode_len, action_start_ts + self.num_queries)
-            action = root['/action'][action_start_ts:action_end_ts]
-            action_len = action_end_ts - action_start_ts
+            if self.action_stride == 1:
+                action_end_ts = min(episode_len, action_start_ts + self.num_queries)
+                action = root['/action'][action_start_ts:action_end_ts]
+                action_len = action_end_ts - action_start_ts
+            else:
+                stop = min(episode_len, action_start_ts + self.num_queries * self.action_stride)
+                action = root['/action'][action_start_ts:stop:self.action_stride]
+                action_len = len(action)
 
         self.is_sim = is_sim
+        if self.joint_ids is not None:
+            qpos = qpos[self.joint_ids]
+            action = action[:, self.joint_ids]
+            action_dim = len(self.joint_ids)
         if self.action_repr == 'delta':
             action = action - qpos[None, :]
         elif self.action_repr == 'task_space':
@@ -119,7 +136,8 @@ class EpisodicDataset(torch.utils.data.Dataset):
         return image_data, qpos_data, action_data, is_pad
 
 
-def get_norm_stats(dataset_dir, num_episodes, num_queries=None, action_offset=-1, action_repr='absolute'):
+def get_norm_stats(dataset_dir, num_episodes, num_queries=None, action_offset=-1, action_repr='absolute',
+                   joint_ids=None, action_stride=1):
     all_qpos_data = []
     all_action_data = []
     per_ep = []
@@ -129,6 +147,8 @@ def get_norm_stats(dataset_dir, num_episodes, num_queries=None, action_offset=-1
             qpos = root['/observations/qpos'][()]
             qvel = root['/observations/qvel'][()]
             action = root['/action'][()]
+        if joint_ids is not None:
+            qpos, action = qpos[:, joint_ids], action[:, joint_ids]
         # qpos_mean/std must match what EpisodicDataset actually feeds the model as state.
         qpos_for_stats = forward_kinematics.task_state_batch(qpos) if action_repr == 'task_space' else qpos
         all_qpos_data.append(torch.from_numpy(qpos_for_stats))
@@ -156,11 +176,12 @@ def get_norm_stats(dataset_dir, num_episodes, num_queries=None, action_offset=-1
         if action_repr == 'task_space':
             stats.update(_task_space_stats(per_ep, int(num_queries), int(action_offset)))
         else:
-            stats.update(_delta_stats(per_ep, int(num_queries), int(action_offset)))
+            stats.update(_delta_stats(per_ep, int(num_queries), int(action_offset),
+                                      int(action_stride)))
     return stats
 
 
-def _delta_stats(per_ep, num_queries, action_offset):
+def _delta_stats(per_ep, num_queries, action_offset, action_stride=1):
     """Stats for action_repr='delta': over every (start_ts, j) the sampler can draw,
     delta_j = action[start_ts + action_offset + j] - qpos[start_ts]. Scale is ~50x smaller than
     the absolute action's, which is the whole point of the representation."""
@@ -168,11 +189,12 @@ def _delta_stats(per_ep, num_queries, action_offset):
     for qpos, action in per_ep:
         T = len(action)
         for j in range(num_queries):
-            lo = max(0, -(action_offset + j))          # start_ts values with a valid target
-            hi = min(T, T - (action_offset + j))
+            off = action_offset + j * action_stride
+            lo = max(0, -off)                         # start_ts values with a valid target
+            hi = min(T, T - off)
             if hi <= lo:
                 continue
-            d = action[lo + action_offset + j:hi + action_offset + j] - qpos[lo:hi]
+            d = action[lo + off:hi + off] - qpos[lo:hi]
             s += d.sum(0); s2 += (d ** 2).sum(0); n += len(d)
     mean = s / n
     std = np.sqrt(np.maximum(s2 / n - mean ** 2, 0.0))
@@ -321,7 +343,8 @@ class EpisodicDatasetPCA(torch.utils.data.Dataset):
 
 def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, num_queries,
               task_name=None, batches_per_epoch=None, image_size=None,
-              action_repr='absolute', action_offset=-1, num_workers=1, val_episode_ids=None):
+              action_repr='absolute', action_offset=-1, num_workers=1, val_episode_ids=None,
+              joint_ids=None, action_stride=1):
     print(f'\nData from: {dataset_dir}\n')
     if val_episode_ids is not None:
         # Explicit held-out set instead of a seeded 80/20 split. Needed whenever runs with
@@ -349,14 +372,17 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
             pca=pca, pca_finger_dim=pca_finger_dim, image_size=image_size)
     else:
         norm_stats = get_norm_stats(dataset_dir, num_episodes, num_queries=num_queries,
-                                    action_offset=action_offset, action_repr=action_repr)
+                                    action_offset=action_offset, action_repr=action_repr,
+                                    joint_ids=joint_ids, action_stride=action_stride)
         stats = norm_stats
         train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats,
                                         num_queries=num_queries, image_size=image_size,
-                                        action_repr=action_repr, action_offset=action_offset)
+                                        action_repr=action_repr, action_offset=action_offset,
+                                        joint_ids=joint_ids, action_stride=action_stride)
         val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats,
                                       num_queries=num_queries, image_size=image_size,
-                                      action_repr=action_repr, action_offset=action_offset)
+                                      action_repr=action_repr, action_offset=action_offset,
+                                      joint_ids=joint_ids, action_stride=action_stride)
 
     if batches_per_epoch is None:
         # Original behavior: one pass over train_dataset per epoch (each episode sampled once,

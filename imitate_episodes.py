@@ -12,6 +12,7 @@ import torch
 import numpy as np
 import cv2
 import pickle
+import random
 import argparse
 import matplotlib.pyplot as plt
 from omegaconf import OmegaConf
@@ -92,8 +93,14 @@ def train_or_eval(args, hydra_cfg=None):
     episode_len = task_config['episode_len']
     camera_names = list(args.get('camera_names') or task_config['camera_names'])
     image_size = args.get('image_size') or None
+    # joint_ids: train on a subset of the 24 joints (e.g. [0..7] = 6 arm + 2 wrist, dropping
+    # the 16 finger joints from both observation and action). Sets state/action dim implicitly.
+    joint_ids = args.get('joint_ids', None)
+    joint_ids = list(joint_ids) if joint_ids is not None else None
     state_dim = args.get('state_dim') or task_config.get('state_dim', DEFAULT_STATE_DIM)
     action_dim = args.get('action_dim') or task_config.get('action_dim', state_dim)
+    if joint_ids is not None:
+        state_dim = action_dim = len(joint_ids)
     env_family = task_config.get('env_family', None)
 
     # fixed parameters
@@ -118,6 +125,7 @@ def train_or_eval(args, hydra_cfg=None):
                          'state_dim': state_dim,
                          'action_dim': action_dim,
                          'qpos_dropout': args.get('qpos_dropout', 0.0),
+                         'no_encoder': args.get('no_encoder', False),
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
@@ -144,8 +152,13 @@ def train_or_eval(args, hydra_cfg=None):
         'image_size': image_size,
         'action_repr': args.get('action_repr', 'absolute'),
         'action_offset': args.get('action_offset', -1),
+        'joint_ids': joint_ids,
+        'action_stride': args.get('action_stride', 1),
         'num_workers': args.get('num_workers', 1),
         'val_episode_ids': args.get('val_episode_ids', None),
+        'amp': args.get('amp', False),
+        'resume': args.get('resume', False),
+        'resume_every': args.get('resume_every', 100),
         'deploy_every': args.get('deploy_every', 25),
         'save_every': args.get('save_every', 500),
         'env_family': env_family,
@@ -229,14 +242,15 @@ def train_or_eval(args, hydra_cfg=None):
         log_file.close()
         exit()
 
-    # Train: refuse to overwrite existing ckpt_dir
-    if os.path.exists(ckpt_dir):
+    # Train: refuse to overwrite an existing ckpt_dir, unless this is an explicit resume.
+    if os.path.exists(ckpt_dir) and not args.get('resume', False):
         raise FileExistsError(
-            f'ckpt_dir already exists: {ckpt_dir}. Refusing to overwrite in train mode.'
+            f'ckpt_dir already exists: {ckpt_dir}. Refusing to overwrite in train mode '
+            f'(pass resume=true to continue it instead).'
         )
 
     # Train: create result dir and save Hydra config
-    os.makedirs(ckpt_dir, exist_ok=False)
+    os.makedirs(ckpt_dir, exist_ok=True)
     if hydra_cfg is not None:
         _save_hydra_config_to_dir(hydra_cfg, ckpt_dir)
 
@@ -254,9 +268,13 @@ def train_or_eval(args, hydra_cfg=None):
         action_offset=config['action_offset'],
         num_workers=config['num_workers'],
         val_episode_ids=config['val_episode_ids'],
+        joint_ids=joint_ids,
+        action_stride=config['action_stride'],
     )
     # Eval must reproduce the training action representation; keep it with the stats.
     stats['action_repr'] = config['action_repr']
+    stats['joint_ids'] = joint_ids
+    stats['action_stride'] = config['action_stride']
 
     # save dataset stats
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
@@ -272,10 +290,10 @@ def train_or_eval(args, hydra_cfg=None):
 
     best_ckpt_info = train_bc(train_dataloader, val_dataloader, config)
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
-
-    # save best checkpoint
-    ckpt_path = os.path.join(ckpt_dir, f'policy_best.ckpt')
-    torch.save(best_state_dict, ckpt_path)
+    # policy_best.ckpt is written inside train_bc the moment val loss improves, so there is
+    # nothing left to save here unless an older code path handed back a state_dict.
+    if best_state_dict is not None:
+        torch.save(best_state_dict, os.path.join(ckpt_dir, 'policy_best.ckpt'))
     print(f'Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}')
 
 
@@ -863,10 +881,19 @@ def eval_bc(config, ckpt_name, save_episode=True, output_dir=None, logger=print,
     return success_rate, avg_return
 
 
+# bf16 autocast for the train/val forward. Off by default; `amp=true` turns it on. Training is
+# GPU-bound here (97% util), so this is roughly a 2x speedup, which is what buys the "train
+# well past plateau" runs. bf16 needs no GradScaler. Deploy metrics stay fp32 -- 72 samples,
+# and they are the numbers every conclusion is ranked on.
+_AMP = False
+
+
 def forward_pass(data, policy):
     image_data, qpos_data, action_data, is_pad = data
     image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
-    return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
+    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=_AMP):
+        out = policy(qpos_data, image_data, action_data, is_pad)
+    return {k: v.float() for k, v in out.items()}
 
 
 def build_deploy_set(val_dataset, stats, n_per_episode=8):
@@ -938,14 +965,62 @@ def deploy_metrics(policy, deploy_set, action_repr, chunk=64):
         denorm = lambda a: a * ref['action_std'] + ref['action_mean']
     pred_abs, gt_abs = denorm(a_hat), denorm(action)
 
+    out = _chunk_metrics(pred_abs, gt_abs, qpos_raw, m)
+    n_arm = min(8, gt_abs.shape[-1])  # joints 0-7 = 6 arm + 2 wrist, present in every joint set
+    if n_arm < gt_abs.shape[-1]:
+        out.update({f'arm_{k}': v for k, v in _chunk_metrics(
+            pred_abs[..., :n_arm], gt_abs[..., :n_arm], qpos_raw[..., :n_arm], m).items()})
+    else:
+        out.update({f'arm_{k}': v for k, v in list(out.items())})
+    return out
+
+
+def _chunk_metrics(pred_abs, gt_abs, qpos_raw, m):
+    """l1_rad / skill / motion_ratio / track_corr for one set of joint dims. `m` is the
+    (B,T,1) non-padding mask; track_corr correlates commanded vs demonstrated displacement
+    per joint over all unmasked (sample, chunk-step) pairs, then averages the joints."""
     n = m.sum() * gt_abs.shape[-1]
     mae = lambda x, y: ((x - y).abs() * m).sum() / n
     l1_rad, copy_rad = mae(pred_abs, gt_abs), mae(qpos_raw, gt_abs)
+    cd, gd = (pred_abs - qpos_raw) * m, (gt_abs - qpos_raw) * m
+    cnt = m.sum()
+    cd = (cd - cd.sum((0, 1)) / cnt) * m
+    gd = (gd - gd.sum((0, 1)) / cnt) * m
+    den = ((cd ** 2).sum((0, 1)) * (gd ** 2).sum((0, 1))).sqrt()
+    corr = torch.where(den > 0, (cd * gd).sum((0, 1)) / den.clamp(min=1e-12),
+                       torch.zeros_like(den))
     return {
         'l1_rad': l1_rad.item(),
         'skill': (l1_rad / copy_rad).item(),
         'motion_ratio': (mae(pred_abs, qpos_raw) / mae(gt_abs, qpos_raw)).item(),
+        'track_corr': corr.mean().item(),
     }
+
+
+def _hist_to_float(hist):
+    """[{k: tensor}] -> [{k: float}], so the resume file stays small and picklable."""
+    return [{k: float(v) for k, v in d.items()} for d in hist]
+
+
+def _hist_to_tensor(hist):
+    """Inverse of _hist_to_float; plot_history/compute_dict_mean want tensors."""
+    return [{k: torch.tensor(float(v)) for k, v in d.items()} for d in hist]
+
+
+def save_train_state(path, policy, optimizer, epoch, tr):
+    """Everything needed to continue this run, written atomically.
+
+    Model + AdamW state is ~1GB, so this is written every `resume_every` epochs, not every
+    epoch. The best-so-far checkpoints are NOT in here -- they are written to their final
+    paths the moment they improve, which is both crash-safe and cheaper than carrying three
+    deepcopied state_dicts in memory for a multi-thousand-epoch run.
+    """
+    state = {'epoch': epoch, 'model': policy.state_dict(), 'optimizer': optimizer.state_dict(),
+             'trackers': tr,
+             'rng': {'torch': torch.get_rng_state(), 'cuda': torch.cuda.get_rng_state_all(),
+                     'numpy': np.random.get_state(), 'python': random.getstate()}}
+    torch.save(state, path + '.tmp')
+    os.replace(path + '.tmp', path)
 
 
 def train_bc(train_dataloader, val_dataloader, config):
@@ -957,9 +1032,31 @@ def train_bc(train_dataloader, val_dataloader, config):
 
     set_seed(seed)
 
+    global _AMP
+    _AMP = bool(config.get('amp', False))
+    if _AMP:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print('bf16 autocast enabled for train/val forward')
+
     policy = make_policy(policy_class, policy_config)
     policy.cuda()
     optimizer = make_optimizer(policy_class, policy)
+
+    resume_path = os.path.join(ckpt_dir, 'train_state.pt')
+    resume_every = int(config.get('resume_every', 100))
+    start_epoch, resumed = 0, None
+    if config.get('resume', False) and os.path.isfile(resume_path):
+        resumed = torch.load(resume_path, map_location='cuda', weights_only=False)
+        policy.load_state_dict(resumed['model'])
+        optimizer.load_state_dict(resumed['optimizer'])
+        start_epoch = int(resumed['epoch'])
+        r = resumed['rng']
+        torch.set_rng_state(r['torch'].cpu() if torch.is_tensor(r['torch']) else r['torch'])
+        torch.cuda.set_rng_state_all([x.cpu() if torch.is_tensor(x) else x for x in r['cuda']])
+        np.random.set_state(r['numpy'])
+        random.setstate(r['python'])
+        print(f'RESUMED from {resume_path} at epoch {start_epoch}')
 
     # TensorBoard: `tensorboard --logdir <ckpt_dir>/tb` (or the parent results/ dir to
     # compare runs side by side), then forward the port over SSH if training runs remotely.
@@ -976,9 +1073,48 @@ def train_bc(train_dataloader, val_dataloader, config):
     deploy_every = int(config.get('deploy_every', 25))
     save_every = int(config.get('save_every', 500))  # 0 = only best/last/best_deploy
     min_l1_rad, best_deploy = np.inf, None
+    # Third track: max arm track_corr. l1_rad (like val loss) rewards freezing in place, so on a
+    # long run its argmin can be a do-nothing checkpoint; track_corr is scale-free and cannot be
+    # gamed that way. Saved as policy_best_track.ckpt.
+    max_track = -np.inf
     deploy_history = []
     global_step = 0  # cumulative optimizer.step() calls; standard TensorBoard x-axis
-    for epoch in tqdm(range(num_epochs)):
+    # Best-so-far checkpoints are written to their final paths the moment they improve rather
+    # than deepcopied and held to the end: crash-safe, and it keeps three extra model copies
+    # out of RAM on runs that are thousands of epochs long.
+    best_epoch = best_deploy_epoch = best_track_epoch = -1
+    best_deploy_metrics = best_track_metrics = None
+    if resumed is not None:
+        t = resumed['trackers']
+        min_val_loss, best_epoch = t['min_val_loss'], t['best_epoch']
+        min_l1_rad, best_deploy_epoch, best_deploy_metrics = (
+            t['min_l1_rad'], t['best_deploy_epoch'], t['best_deploy_metrics'])
+        max_track, best_track_epoch, best_track_metrics = (
+            t['max_track'], t['best_track_epoch'], t['best_track_metrics'])
+        deploy_history, global_step = t['deploy_history'], t['global_step']
+        train_history = _hist_to_tensor(t['train_history'])
+        validation_history = _hist_to_tensor(t['validation_history'])
+
+    def _trackers():
+        return {'min_val_loss': float(min_val_loss), 'best_epoch': int(best_epoch),
+                'min_l1_rad': float(min_l1_rad), 'best_deploy_epoch': int(best_deploy_epoch),
+                'best_deploy_metrics': best_deploy_metrics,
+                'max_track': float(max_track), 'best_track_epoch': int(best_track_epoch),
+                'best_track_metrics': best_track_metrics,
+                'deploy_history': deploy_history, 'global_step': global_step,
+                'train_history': _hist_to_float(train_history),
+                'validation_history': _hist_to_float(validation_history)}
+
+    def _write_deploy_json():
+        with open(os.path.join(ckpt_dir, 'deploy_metrics.json'), 'w') as f:
+            json.dump({'best_deploy_epoch': best_deploy_epoch, **(best_deploy_metrics or {}),
+                       'best_track_epoch': best_track_epoch,
+                       'best_track_metrics': best_track_metrics,
+                       'best_val_loss': float(min_val_loss),
+                       'best_val_loss_epoch': int(best_epoch),
+                       'history': deploy_history}, f, indent=2)
+
+    for epoch in tqdm(range(start_epoch, num_epochs), initial=start_epoch, total=num_epochs):
         print(f'\nEpoch {epoch}')
         if deploy_set is not None and (epoch % deploy_every == 0 or epoch == num_epochs - 1):
             policy.eval()
@@ -988,8 +1124,13 @@ def train_bc(train_dataloader, val_dataloader, config):
             deploy_history.append({'epoch': epoch, **dm})
             print('deploy: ' + ' '.join(f'{k}={v:.4f}' for k, v in dm.items()))
             if dm['l1_rad'] < min_l1_rad:
-                min_l1_rad = dm['l1_rad']
-                best_deploy = (epoch, dm, deepcopy(policy.state_dict()))
+                min_l1_rad, best_deploy_epoch, best_deploy_metrics = dm['l1_rad'], epoch, dm
+                torch.save(policy.state_dict(), os.path.join(ckpt_dir, 'policy_best_deploy.ckpt'))
+            if dm.get('arm_track_corr', dm['track_corr']) > max_track:
+                max_track, best_track_epoch, best_track_metrics = (
+                    dm.get('arm_track_corr', dm['track_corr']), epoch, dm)
+                torch.save(policy.state_dict(), os.path.join(ckpt_dir, 'policy_best_track.ckpt'))
+            _write_deploy_json()   # partial results survive a crash / an interrupted long run
         # validation
         with torch.inference_mode():
             policy.eval()
@@ -1002,8 +1143,9 @@ def train_bc(train_dataloader, val_dataloader, config):
 
             epoch_val_loss = epoch_summary['loss']
             if epoch_val_loss < min_val_loss:
-                min_val_loss = epoch_val_loss
-                best_ckpt_info = (epoch, min_val_loss, deepcopy(policy.state_dict()))
+                min_val_loss, best_epoch = epoch_val_loss, epoch
+                best_ckpt_info = (epoch, min_val_loss, None)
+                torch.save(policy.state_dict(), os.path.join(ckpt_dir, 'policy_best.ckpt'))
         print(f'Val loss:   {epoch_val_loss:.5f}')
         summary_string = ''
         for k, v in epoch_summary.items():
@@ -1036,25 +1178,22 @@ def train_bc(train_dataloader, val_dataloader, config):
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
             torch.save(policy.state_dict(), ckpt_path)
             plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
+        if resume_every and (epoch + 1) % resume_every == 0:
+            torch.save(policy.state_dict(), os.path.join(ckpt_dir, 'policy_last.ckpt'))
+            save_train_state(resume_path, policy, optimizer, epoch + 1, _trackers())
 
     ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
     torch.save(policy.state_dict(), ckpt_path)
 
-    best_epoch, min_val_loss, best_state_dict = best_ckpt_info
-    if save_every:
-        torch.save(best_state_dict, os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt'))
+    save_train_state(resume_path, policy, optimizer, num_epochs, _trackers())
     print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}')
-
-    if best_deploy is not None:
-        d_epoch, d_metrics, d_state = best_deploy
-        torch.save(d_state, os.path.join(ckpt_dir, 'policy_best_deploy.ckpt'))
-        summary = {'best_deploy_epoch': d_epoch, **d_metrics,
-                   'best_val_loss': float(min_val_loss), 'best_val_loss_epoch': int(best_epoch),
-                   'history': deploy_history}
-        with open(os.path.join(ckpt_dir, 'deploy_metrics.json'), 'w') as f:
-            json.dump(summary, f, indent=2)
-        print('Best deploy ckpt @ epoch {}: '.format(d_epoch)
-              + ' '.join(f'{k}={v:.4f}' for k, v in d_metrics.items()))
+    if best_track_metrics is not None:
+        print(f'Best track ckpt @ epoch {best_track_epoch}: '
+              + ' '.join(f'{k}={v:.4f}' for k, v in best_track_metrics.items()))
+    if best_deploy_metrics is not None:
+        _write_deploy_json()
+        print(f'Best deploy ckpt @ epoch {best_deploy_epoch}: '
+              + ' '.join(f'{k}={v:.4f}' for k, v in best_deploy_metrics.items()))
 
     tb_writer.close()
 

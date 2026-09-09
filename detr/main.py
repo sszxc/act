@@ -30,6 +30,7 @@ DETR_DEFAULTS = {
     'action_dim': None,
     'latent_z_dim': 32,
     'qpos_dropout': 0.0,
+    'no_encoder': False,
 }
 
 

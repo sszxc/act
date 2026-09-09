@@ -48,7 +48,7 @@ _FILM_VIZ_MODE = "mean"  # "max" or "mean"
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
     def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, action_dim=None, latent_z_dim=32,
-                 qpos_dropout=0.0):
+                 qpos_dropout=0.0, no_encoder=False):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -59,11 +59,15 @@ class DETRVAE(nn.Module):
             action_dim: policy output dimension; if None, equals state_dim (backward compatible)
             qpos_dropout: train-time prob of zeroing the whole proprio input per sample, forcing
                 the policy to read the images instead of copying qpos into the action.
+            no_encoder: drop the CVAE entirely -- training uses the same z=0 prior path as
+                deployment, so the val loss finally measures what the robot will run (and the
+                KL term vanishes). The latent modules still exist but get no gradient.
         """
         super().__init__()
         if action_dim is None:
             action_dim = state_dim
         self.qpos_dropout = float(qpos_dropout)
+        self.no_encoder = bool(no_encoder)
         self.num_queries = num_queries
         self.camera_names = camera_names
         self.transformer = transformer
@@ -285,7 +289,7 @@ class DETRVAE(nn.Module):
         is_training = actions is not None # train or val
         bs, _ = qpos.shape
         ### Obtain latent z from action sequence
-        if is_training:
+        if is_training and not self.no_encoder:
             # project action sequence to embedding dim, and concat with a CLS token
             action_embed = self.encoder_action_proj(actions) # (bs, seq, hidden_dim)
             qpos_embed = self.encoder_joint_proj(qpos)  # (bs, hidden_dim)
@@ -565,6 +569,7 @@ def build(args):
         action_dim=action_dim,
         latent_z_dim=args.latent_z_dim,
         qpos_dropout=getattr(args, 'qpos_dropout', 0.0),
+        no_encoder=getattr(args, 'no_encoder', False),
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)

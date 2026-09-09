@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import torchvision.transforms as transforms
@@ -54,7 +55,12 @@ class ACTPolicy(nn.Module):
                 film_pca_hs_gamma=film_pca_hs_gamma,
                 film_pca_hs_beta=film_pca_hs_beta,
             )
-            total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
+            # no_encoder: the model returns mu=logvar=None (z is fixed at the z=0 prior), so
+            # there is no KL term and this loss is exactly the deployed path's loss.
+            if mu is None:
+                total_kld = [torch.zeros((), device=a_hat.device)]
+            else:
+                total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
             loss_dict = dict()
             all_l1 = F.l1_loss(actions, a_hat, reduction='none')
             l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()

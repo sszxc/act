@@ -55,11 +55,33 @@ action_offset: -1
 # Train-time prob of zeroing the decoder's proprio input per sample, forcing the policy to
 # read the images. 0 = off.
 qpos_dropout: 0.0
+# Chunk element j targets action[start + action_offset + j*action_stride], i.e. the policy
+# commands at 30/stride Hz. 1 = every recorded frame. 3 makes each commanded step 3x larger
+# (0.003 -> 0.009 rad, above the measured command-error floor) for the same wall-clock span.
+action_stride: 1
+# Train on a subset of the 24 joints, e.g. [0,1,2,3,4,5,6,7] = 6 arm + 2 wrist, dropping the
+# 16 finger joints from observation *and* action. Overrides state_dim/action_dim. null = all.
+# Joint order: 0-5 arm, 6-7 wrist yaw/pitch, 8-23 fingers (see forward_kinematics.JOINT_NAMES).
+joint_ids: null
+# Drop the CVAE encoder: train on the same z=0 prior path the robot runs, so the val loss stops
+# being a posterior-only number and kl_weight becomes irrelevant.
+no_encoder: false
 
 # Explicit validation episode indices, e.g. [0,1,2,3,4,5,6,7,8]. null = seeded random 80/20
 # split. Needed to compare runs over datasets of different sizes (the human/scripted mixes):
 # a random split would give each one a different val set.
 val_episode_ids: null
+
+# bf16 autocast on the train/val forward (~2x; deploy metrics stay fp32). Changes numerics,
+# so keep it constant within a comparison set.
+amp: false
+
+# Resume an interrupted run: continue from <ckpt_dir>/train_state.pt (model + optimizer + RNG
+# + all best-so-far trackers) instead of refusing to touch an existing ckpt_dir. Raising
+# num_epochs on a resume simply extends the run. resume_every = epochs between train_state.pt
+# writes (~1GB each, so don't set it to 1).
+resume: false
+resume_every: 100
 
 # DataLoader workers. The h5py random-frame reads are the bottleneck; >1 helps a lot.
 num_workers: 6
