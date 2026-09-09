@@ -261,7 +261,7 @@ Sweep in flight: `results/sweep_20260904/PLAN.md`.
 
 ### Scripted (state-machine) data and human/scripted mixes
 
-`~/data/data_0904/` is a batch recorded by an open-loop fixed-waypoint state machine, same
+`~/data/data_0904/` and `~/data/data_0908/` are batches recorded by an open-loop fixed-waypoint state machine, same
 schema v1.3 as the teleop batches, so step 1 above converts it unchanged:
 
 ```

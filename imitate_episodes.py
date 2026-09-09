@@ -92,8 +92,8 @@ def train_or_eval(args, hydra_cfg=None):
     episode_len = task_config['episode_len']
     camera_names = list(args.get('camera_names') or task_config['camera_names'])
     image_size = args.get('image_size') or None
-    state_dim = task_config.get('state_dim', DEFAULT_STATE_DIM)
-    action_dim = task_config.get('action_dim', state_dim)
+    state_dim = args.get('state_dim') or task_config.get('state_dim', DEFAULT_STATE_DIM)
+    action_dim = args.get('action_dim') or task_config.get('action_dim', state_dim)
     env_family = task_config.get('env_family', None)
 
     # fixed parameters
@@ -888,6 +888,8 @@ def build_deploy_set(val_dataset, stats, n_per_episode=8):
     ref = {k: to_t(k) for k in ('action_mean', 'action_std', 'qpos_mean', 'qpos_std')}
     if 'delta_mean' in stats:
         ref.update(delta_mean=to_t('delta_mean'), delta_std=to_t('delta_std'))
+    if 'task_space_mean' in stats:
+        ref.update(task_space_mean=to_t('task_space_mean'), task_space_std=to_t('task_space_std'))
     print(f'Deployment metric set: {len(items)} samples from {len(val_dataset.episode_ids)} val episodes')
     return batch, ref
 
@@ -902,6 +904,9 @@ def deploy_metrics(policy, deploy_set, action_repr, chunk=64):
       l1_rad        mean |pred - gt| over the chunk
       skill         l1_rad / l1_rad of "hold current qpos"; < 1 = better than freezing
       motion_ratio  mean|pred - qpos| / mean|gt - qpos|; ~0 is the "robot barely moves" failure
+
+    For action_repr='task_space' the units are mixed (meters + unitless rot6d + radians), so
+    'l1_rad' is not literally radians there; skill/motion_ratio (ratios) stay meaningful.
     """
     (image, qpos, action, is_pad), ref = deploy_set
     preds = []
@@ -909,6 +914,22 @@ def deploy_metrics(policy, deploy_set, action_repr, chunk=64):
         for i in range(0, len(qpos), chunk):
             preds.append(policy(qpos[i:i + chunk], image[i:i + chunk]))
     a_hat = torch.cat(preds)
+    m = (~is_pad).unsqueeze(-1).float()
+
+    if action_repr == 'task_space':
+        # No absolute-pose reconstruction here: composing the 6D-rotation delta back onto qpos
+        # needs a matrix multiply, not addition -- and it isn't needed anyway. qpos_raw cancels
+        # out of every metric below for any delta-style repr (see 'delta' below: pred_abs and
+        # gt_abs both add the same qpos_raw, so it drops out of pred_abs-gt_abs, and copy_rad's
+        # qpos_raw baseline is exactly "predict zero delta"). So work directly in delta space.
+        denorm = lambda a: a * ref['task_space_std'] + ref['task_space_mean']
+        pred_abs, gt_abs = denorm(a_hat), denorm(action)
+        n = m.sum() * gt_abs.shape[-1]
+        mae = lambda x, y: ((x - y).abs() * m).sum() / n
+        zero = torch.zeros_like(gt_abs)
+        l1_rad, copy_rad = mae(pred_abs, gt_abs), mae(zero, gt_abs)
+        return {'l1_rad': l1_rad.item(), 'skill': (l1_rad / copy_rad).item(),
+                'motion_ratio': (mae(pred_abs, zero) / copy_rad).item()}
 
     qpos_raw = (qpos * ref['qpos_std'] + ref['qpos_mean']).unsqueeze(1)  # (B,1,D)
     if action_repr == 'delta':
@@ -917,7 +938,6 @@ def deploy_metrics(policy, deploy_set, action_repr, chunk=64):
         denorm = lambda a: a * ref['action_std'] + ref['action_mean']
     pred_abs, gt_abs = denorm(a_hat), denorm(action)
 
-    m = (~is_pad).unsqueeze(-1).float()
     n = m.sum() * gt_abs.shape[-1]
     mae = lambda x, y: ((x - y).abs() * m).sum() / n
     l1_rad, copy_rad = mae(pred_abs, gt_abs), mae(qpos_raw, gt_abs)

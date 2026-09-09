@@ -33,6 +33,11 @@ latent_z_dim: 32
 dataset_dir: null
 camera_names: null
 num_episodes: null
+# state_dim/action_dim: null = use TASK_CONFIGS value. Needed for action_repr=task_space,
+# which changes action/state dims (see forward_kinematics.TASKSPACE_DIM) without a dedicated
+# TASK_CONFIGS entry, e.g. state_dim=27 action_dim=27.
+state_dim: null
+action_dim: null
 
 # Resize every camera to [H, W] before stacking. Required when the selected cameras have
 # different native resolutions (e.g. left 480x640 + side 480x848 + thumb 400x400).
