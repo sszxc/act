@@ -18,6 +18,12 @@ are very small, the robot barely moves"), which the training loss cannot:
                 Read it WITH motion_ratio: useful means r high AND motion_ratio near 1.
 
     python replay_eval.py --ckpt_dir results/... --chunk_size 50 --camera_names left top
+
+Observations stay teacher-forced by default (--qpos_source dataset): the qpos fed to the policy
+at every step is the recorded one, so compounding error in the proprio channel is invisible.
+--qpos_source policy closes that loop -- the policy is fed its OWN previous command instead
+(perfect-tracking assumption, since there's no sim/robot here to actually move) -- for one
+action-selection mode at a time (--replay_mode). Images are still teacher-forced either way.
 """
 import argparse
 import json
@@ -99,6 +105,48 @@ def chunked(all_actions):
     return np.stack([all_actions[t - t % nq, t % nq] for t in range(T)])
 
 
+def denormalize(raw, qpos_ref, stats, action_repr):
+    if action_repr == 'delta':
+        return raw * stats['delta_std'] + stats['delta_mean'] + qpos_ref
+    return raw * stats['action_std'] + stats['action_mean']
+
+
+def rollout_closed_loop(policy, root, camera_names, image_size, qpos0, T, stats, action_repr,
+                         chunk_size, temporal_agg, k=TEMPORAL_AGG_K, newest_first=False):
+    """Closed-loop replay: the qpos fed to the policy is its OWN previous command, not the
+    recording (perfect-tracking assumption -- there's no sim/robot here to give real dynamics).
+    Images still come from the recording. temporal_agg=False re-queries every chunk_size steps
+    (mirrors chunked()); temporal_agg=True queries every step and aggregates overlapping chunks,
+    same weighting as temporal_ensemble() (mirrors what eval_bc does in a real rollout).
+    """
+    query_every = 1 if temporal_agg else chunk_size
+    D = qpos0.shape[0]
+    all_time_actions = np.zeros((T, T + chunk_size, D)) if temporal_agg else None
+    qpos_sim = qpos0.astype(np.float64).copy()
+    cmd = np.zeros((T, D))
+    chunk = None
+    with torch.inference_mode():
+        for t in range(T):
+            if t % query_every == 0:
+                img = load_cam_images(root, camera_names, t, image_size)[None]
+                img = torch.from_numpy(img).cuda().permute(0, 1, 4, 2, 3).float() / 255.0
+                qpos_n = torch.from_numpy(
+                    (qpos_sim - stats['qpos_mean']) / stats['qpos_std']).float().cuda()[None]
+                chunk = policy(qpos_n, img)[0].cpu().numpy()  # (chunk_size, D)
+            if temporal_agg:
+                all_time_actions[t, t:t + chunk_size] = chunk
+                lo = max(0, t - chunk_size + 1)
+                preds = all_time_actions[lo:t + 1, t]
+                j = np.arange(len(preds))
+                w = np.exp(-k * (j[::-1] if newest_first else j))
+                raw = (preds * (w / w.sum())[:, None]).sum(0)
+            else:
+                raw = chunk[t % chunk_size]
+            cmd[t] = denormalize(raw, qpos_sim, stats, action_repr)
+            qpos_sim = cmd[t]
+    return cmd
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--ckpt_dir', required=True)
@@ -119,11 +167,29 @@ def main():
     p.add_argument('--max_episodes', type=int, default=None, help='cap val episodes, for speed')
     p.add_argument('--plot', action='store_true', help='save per-episode command-vs-recorded plots')
     p.add_argument('--out', default=None, help='json output path (default <ckpt_dir>/replay_eval.json)')
+    p.add_argument('--qpos_source', choices=['dataset', 'policy'], default='dataset',
+                   help="'dataset' (default): fully teacher-forced, as above. 'policy': feed the "
+                        "policy its own previous command as qpos instead (perfect-tracking "
+                        "assumption -- no sim/robot here), showing compounding error; runs a "
+                        "single mode (--replay_mode) instead of the full sweep, since each mode "
+                        "would otherwise drift onto its own qpos trajectory.")
+    p.add_argument('--replay_mode', choices=['chunked', 'temporal_agg'], default='temporal_agg',
+                   help='action-selection mode driving the closed loop; only used with '
+                        '--qpos_source policy')
+    p.add_argument('--temporal_agg_k', type=float, default=TEMPORAL_AGG_K)
+    p.add_argument('--temporal_agg_newest', action='store_true')
     args = apply_run_defaults(p.parse_args(), p)
 
     with open(os.path.join(args.ckpt_dir, 'dataset_stats.pkl'), 'rb') as f:
         stats = pickle.load(f)
     action_repr = stats.get('action_repr', 'absolute')
+    # joint_ids: the run trained on a subset of the 24 joints, so every recorded array has to be
+    # sliced the same way before it can be compared with what the policy emits.
+    joint_ids = stats.get('joint_ids', None)
+    joint_ids = np.asarray(joint_ids, dtype=int) if joint_ids is not None else None
+    if joint_ids is not None:
+        args.state_dim = len(joint_ids)
+        print(f'joint subset from dataset_stats.pkl: {joint_ids.tolist()}')
 
     if args.val_episode_ids:
         val_indices = np.array(sorted(args.val_episode_ids))
@@ -148,36 +214,52 @@ def main():
 
     # Action selection is a free sweep here: the chunk predictions are computed once and every
     # mode is a different weighted average of them. 'temporal_agg' is what eval_bc does today.
-    modes = {'chunked': chunked, 'temporal_agg': temporal_ensemble}
-    for k in (0.01, 0.1, 0.5):
-        modes[f'agg_newest_k{k}'] = (lambda kk: lambda a: temporal_ensemble(a, True, kk))(k)
-    acc = {m: {k: [] for k in ('cmd_l1', 'freeze_l1', 'motion', 'gt_motion', 'track_corr')}
-           for m in modes}
+    # (--qpos_source policy instead runs a single closed-loop mode; see rollout_closed_loop.)
+    if args.qpos_source == 'dataset':
+        modes = {'chunked': chunked, 'temporal_agg': temporal_ensemble}
+        for k in (0.01, 0.1, 0.5):
+            modes[f'agg_newest_k{k}'] = (lambda kk: lambda a: temporal_ensemble(a, True, kk))(k)
+    else:
+        modes = {args.replay_mode: None}
+    # Also accumulate the same five over arm+wrist dims 0-7 alone (`arm_*`): a 24-joint run's
+    # plain numbers are three-quarters finger error, so they cannot be compared with an
+    # 8-joint run's without this restriction.
+    KEYS = ('cmd_l1', 'freeze_l1', 'motion', 'gt_motion', 'track_corr')
+    acc = {m: {k: [] for k in KEYS + tuple('arm_' + k for k in KEYS)} for m in modes}
 
     plots = {}
     for ep in sorted(val_indices.tolist()):
         with h5py.File(os.path.join(args.dataset_dir, f'episode_{ep}.hdf5'), 'r') as root:
             qpos = root['/observations/qpos'][()]
             gt_action = root['/action'][()]
-            qpos_n = torch.from_numpy(
-                (qpos - stats['qpos_mean']) / stats['qpos_std']).float().cuda()
-            all_actions = predict_chunks(policy, root, args.camera_names, args.image_size, qpos_n)
+            if joint_ids is not None:
+                qpos, gt_action = qpos[:, joint_ids], gt_action[:, joint_ids]
 
-        for name, fn in modes.items():
-            raw = fn(all_actions)
-            if action_repr == 'delta':
-                cmd = raw * stats['delta_std'] + stats['delta_mean'] + qpos
+            if args.qpos_source == 'dataset':
+                qpos_n = torch.from_numpy(
+                    (qpos - stats['qpos_mean']) / stats['qpos_std']).float().cuda()
+                all_actions = predict_chunks(policy, root, args.camera_names, args.image_size, qpos_n)
+                cmds = {name: denormalize(fn(all_actions), qpos, stats, action_repr)
+                        for name, fn in modes.items()}
             else:
-                cmd = raw * stats['action_std'] + stats['action_mean']
-            acc[name]['cmd_l1'].append(np.abs(cmd - gt_action).mean())
-            acc[name]['freeze_l1'].append(np.abs(qpos - gt_action).mean())
-            acc[name]['motion'].append(np.abs(cmd - qpos).mean())
-            acc[name]['gt_motion'].append(np.abs(gt_action - qpos).mean())
-            cd, gd = cmd - qpos, gt_action - qpos
-            cd = cd - cd.mean(0); gd = gd - gd.mean(0)
-            den = np.sqrt((cd ** 2).sum(0) * (gd ** 2).sum(0))
-            acc[name]['track_corr'].append(
-                np.nanmean(np.where(den > 0, (cd * gd).sum(0) / np.where(den > 0, den, 1), np.nan)))
+                cmds = {args.replay_mode: rollout_closed_loop(
+                    policy, root, args.camera_names, args.image_size, qpos[0], len(qpos),
+                    stats, action_repr, args.chunk_size,
+                    temporal_agg=(args.replay_mode == 'temporal_agg'),
+                    k=args.temporal_agg_k, newest_first=args.temporal_agg_newest)}
+
+        for name, cmd in cmds.items():
+            for pre, sl in (('', slice(None)), ('arm_', slice(0, min(8, cmd.shape[1])))):
+                c, g, q = cmd[:, sl], gt_action[:, sl], qpos[:, sl]
+                acc[name][pre + 'cmd_l1'].append(np.abs(c - g).mean())
+                acc[name][pre + 'freeze_l1'].append(np.abs(q - g).mean())
+                acc[name][pre + 'motion'].append(np.abs(c - q).mean())
+                acc[name][pre + 'gt_motion'].append(np.abs(g - q).mean())
+                cd, gd = c - q, g - q
+                cd = cd - cd.mean(0); gd = gd - gd.mean(0)
+                den = np.sqrt((cd ** 2).sum(0) * (gd ** 2).sum(0))
+                acc[name][pre + 'track_corr'].append(np.nanmean(
+                    np.where(den > 0, (cd * gd).sum(0) / np.where(den > 0, den, 1), np.nan)))
             if args.plot:
                 plots.setdefault(ep, {})[name] = cmd
         if ep in plots:
@@ -188,11 +270,13 @@ def main():
               'val_episodes': sorted(val_indices.tolist())}
     for name in modes:
         m = {k: float(np.mean(v)) for k, v in acc[name].items()}
-        m['skill'] = m['cmd_l1'] / m['freeze_l1']
-        m['motion_ratio'] = m['motion'] / m['gt_motion']
+        for pre in ('', 'arm_'):
+            m[pre + 'skill'] = m[pre + 'cmd_l1'] / m[pre + 'freeze_l1']
+            m[pre + 'motion_ratio'] = m[pre + 'motion'] / m[pre + 'gt_motion']
         result[name] = m
-        print(f"{name:19s} cmd_l1={m['cmd_l1']:.5f} skill={m['skill']:.3f} "
-              f"motion_ratio={m['motion_ratio']:.3f} track_corr={m['track_corr']:.3f}")
+        print(f"{name:19s} arm: cmd_l1={m['arm_cmd_l1']:.5f} skill={m['arm_skill']:.3f} "
+              f"motion_ratio={m['arm_motion_ratio']:.3f} track_corr={m['arm_track_corr']:.3f}"
+              f"   (all dims: skill={m['skill']:.3f} track_corr={m['track_corr']:.3f})")
 
     out = args.out or os.path.join(args.ckpt_dir, 'replay_eval.json')
     with open(out, 'w') as f:
@@ -206,7 +290,7 @@ COLORS = {'chunked': 'tab:green', 'temporal_agg': 'tab:red',
 
 
 def save_plot(ckpt_dir, ep, qpos, gt_action, cmds):
-    dims = [0, 1, 2, 6, 10, 14]  # 3 arm joints + 3 hand joints
+    dims = [d for d in (0, 1, 2, 6, 10, 14) if d < gt_action.shape[1]]  # arm + hand joints
     fig, axes = plt.subplots(len(dims), 1, figsize=(12, 2 * len(dims)), sharex=True)
     for ax, d in zip(axes, dims):
         ax.plot(gt_action[:, d], 'k--', lw=1.2, label='recorded action')
