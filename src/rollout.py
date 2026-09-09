@@ -12,7 +12,7 @@ from policy import ACTPolicy
 from visualize_episodes import save_videos
 
 from src.cli_utils import _progress
-from src.film_utils import _film_pca_attr, _split_film_theta_batch
+from src.film_utils import _film_bottleneck_attr, _split_film_theta_batch
 
 
 def rollout_batch_episode_returns(
@@ -39,15 +39,17 @@ def rollout_batch_episode_returns(
     capture_mocap_pos: bool = False,
     video_layout: str = "combined",
     film_target: str = "visual",
+    film_bottleneck_method: str = "pca",
 ):
     """
     Step multiple envs in parallel (one theta each), batch observations per timestep on one GPU.
     Returns episode_return per trajectory (shape: (B,)).
 
-    film_target: which PCA-bottleneck FiLM insertion point `thetas` searches — "visual"
-    (default), "memory" (candidate 4, encoder-decoder boundary), or "hs" (candidate 5,
-    pre-action_head). Must match whatever load_film_pca(..., target=film_target) installed on
-    `policy.model` beforehand; see _film_pca_attr().
+    film_target: which FiLM insertion point `thetas` searches — "visual" (default), "memory"
+    (candidate 4, encoder-decoder boundary), or "hs" (candidate 5, pre-action_head).
+    film_bottleneck_method: "pca" (default) or "ae" — must match whichever
+    load_film_pca(..., target=film_target)/load_film_ae(..., target=film_target) installed on
+    `policy.model` beforehand; see _film_bottleneck_attr().
 
     If video_dir is not None, records video(s) per env to video_dir / f"{round_label}_env{i}.mp4".
     video_layout="combined" (default) writes one side-by-side mp4; "separate" writes one mp4
@@ -72,7 +74,7 @@ def rollout_batch_episode_returns(
     if thetas.shape[0] != B:
         raise ValueError(f"thetas batch {thetas.shape[0]} != envs {B}")
 
-    k_attr, g_attr, b_attr = (_film_pca_attr(film_target, n) for n in ("k", "gamma", "beta"))
+    k_attr, g_attr, b_attr = (_film_bottleneck_attr(film_bottleneck_method, film_target, n) for n in ("k", "gamma", "beta"))
     k = int(getattr(policy.model, k_attr))
     film_gamma_t, film_beta_t = _split_film_theta_batch(thetas, k)
     film_theta_kwargs = {g_attr: film_gamma_t, b_attr: film_beta_t}

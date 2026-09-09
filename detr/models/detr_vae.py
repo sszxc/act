@@ -102,6 +102,20 @@ class DETRVAE(nn.Module):
             self.register_buffer("film_pca_mu", torch.zeros(hidden_dim))
             self.register_buffer("film_pca_gamma", torch.zeros(0))
             self.register_buffer("film_pca_beta", torch.zeros(0))
+
+            # --- AE-bottleneck FiLM (nonlinear analog of film_pca_* above) ---
+            # Same encode->modulate->decode-diff->residual-add math (see _bottleneck_core()),
+            # but the fixed PCA basis (W, tied encode/decode) is replaced by a learned
+            # encoder/decoder pair (fit offline by fit_film_ae.py, possibly nonlinear if
+            # fit with --ae_hidden > 0). film_ae_encoder/film_ae_decoder are NOT
+            # pre-registered here (added dynamically by load_film_ae(), like nn.Linear's
+            # bias=None pattern) — absent until then, matching film_ae_k == 0 meaning "no
+            # basis loaded". The decoder is trained bias-free (see fit_film_ae.py) so that
+            # decode(0) == 0 exactly, preserving the identity-at-gamma=1,beta=0 guarantee.
+            self.film_ae_k = 0
+            self.register_buffer("film_ae_mu", torch.zeros(hidden_dim))
+            self.register_buffer("film_ae_gamma", torch.zeros(0))
+            self.register_buffer("film_ae_beta", torch.zeros(0))
         else:
             self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)
             self.input_proj_env_state = nn.Linear(7, hidden_dim)
@@ -133,6 +147,19 @@ class DETRVAE(nn.Module):
         self.register_buffer("film_pca_hs_mu", torch.zeros(hidden_dim))
         self.register_buffer("film_pca_hs_gamma", torch.zeros(0))
         self.register_buffer("film_pca_hs_beta", torch.zeros(0))
+
+        # AE-bottleneck FiLM counterparts of the two blocks above (see the visual-branch
+        # film_ae_* comment for the encode/decode-diff/residual math and why the decoder
+        # must be bias-free). Also registered unconditionally.
+        self.film_ae_memory_k = 0
+        self.register_buffer("film_ae_memory_mu", torch.zeros(hidden_dim))
+        self.register_buffer("film_ae_memory_gamma", torch.zeros(0))
+        self.register_buffer("film_ae_memory_beta", torch.zeros(0))
+
+        self.film_ae_hs_k = 0
+        self.register_buffer("film_ae_hs_mu", torch.zeros(hidden_dim))
+        self.register_buffer("film_ae_hs_gamma", torch.zeros(0))
+        self.register_buffer("film_ae_hs_beta", torch.zeros(0))
 
         # encoder extra parameters
         self.latent_dim = latent_z_dim # final size of latent z
@@ -184,35 +211,90 @@ class DETRVAE(nn.Module):
         setattr(self, f"{prefix}_gamma", torch.ones(k, device=device, dtype=dtype))
         setattr(self, f"{prefix}_beta", torch.zeros(k, device=device, dtype=dtype))
 
+    def load_film_ae(self, encoder: nn.Module, decoder: nn.Module, mu: torch.Tensor, target: str = "visual"):
+        """AE-bottleneck FiLM counterpart of load_film_pca(): same encode->modulate->
+        decode-diff->residual-add math (_bottleneck_core), but the fixed tied-weight PCA
+        basis is replaced by a learned encoder/decoder pair — fit offline by fit_film_ae.py
+        (--target matching this one), possibly nonlinear (fit with --ae_hidden > 0).
+
+        encoder: hidden_dim -> k. decoder: k -> hidden_dim, MUST be bias-free (every Linear
+        layer bias=False; see fit_film_ae.py's make_film_ae_decoder()) so that decode(0) == 0
+        exactly — required for the identity-at-gamma=1,beta=0 guarantee (mirrors W being
+        used with no additive term in the PCA path). Verified below with a zero-probe.
+        mu: (hidden_dim,) — subtracted before encoding, matching the PCA convention (sets the
+        origin gamma/beta scale around). k is inferred from encoder's output width.
+        Replaces any previously loaded AE basis for that target; gamma/beta reset to
+        identity (1, 0). Independent of film_pca_*/load_film_pca() for the same target.
+        """
+        if target not in self._FILM_PCA_TARGETS:
+            raise ValueError(f"Unknown FiLM target {target!r}; expected one of {self._FILM_PCA_TARGETS}")
+        prefix = "film_ae" if target == "visual" else f"film_ae_{target}"
+        hidden_dim = self.hidden_dim
+        if mu.shape != (hidden_dim,):
+            raise ValueError(f"{prefix} mu shape {tuple(mu.shape)} expected ({hidden_dim},)")
+        device = self.additional_pos_embed.weight.device
+        dtype = self.additional_pos_embed.weight.dtype
+        encoder = encoder.to(device=device, dtype=dtype)
+        decoder = decoder.to(device=device, dtype=dtype)
+        with torch.no_grad():
+            probe_in = torch.zeros(1, hidden_dim, device=device, dtype=dtype)
+            k = int(encoder(probe_in).shape[-1])
+            zero_out = decoder(torch.zeros(1, k, device=device, dtype=dtype))
+            if not torch.allclose(zero_out, torch.zeros_like(zero_out), atol=1e-5):
+                raise ValueError(
+                    f"{prefix} decoder(0) = {zero_out.abs().max().item():.2e} (max abs), expected ~0 — "
+                    "decoder must have bias=False on every layer (see make_film_ae_decoder())"
+                )
+        setattr(self, f"{prefix}_k", k)
+        self.add_module(f"{prefix}_encoder", encoder)
+        self.add_module(f"{prefix}_decoder", decoder)
+        setattr(self, f"{prefix}_mu", mu.detach().to(device=device, dtype=dtype).clone())
+        setattr(self, f"{prefix}_gamma", torch.ones(k, device=device, dtype=dtype))
+        setattr(self, f"{prefix}_beta", torch.zeros(k, device=device, dtype=dtype))
+
     @staticmethod
+    def _bottleneck_core(
+        x_bnc: torch.Tensor,
+        encode_fn,
+        decode_fn,
+        gamma: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> torch.Tensor:
+        """Shared encode->modulate->decode-diff->residual-add math for every PCA-/AE-bottleneck
+        FiLM target (visual/memory/hs, both methods) — see load_film_pca()/load_film_ae().
+        Generalizes over any (possibly nonlinear) encode_fn/decode_fn: linear+tied (PCA) or a
+        learned MLP pair (AE) both reduce to the same formula.
+
+        x_bnc: (B, N, C) (N = whatever the "token" axis is: spatial location, sequence
+        position, query index, etc. — callers permute/reshape into this layout first and back
+        after). encode_fn: (B,N,C) -> (B,N,k). decode_fn: (B,N,k) -> (B,N,C), must satisfy
+        decode_fn(0) == 0 (true by construction for PCA; enforced for AE in load_film_ae()).
+        gamma, beta: (k,) shared across the batch, or (B,k) per-sample (batched search).
+
+        Returns x_bnc + decode_fn((gamma-1)*z + beta), z = encode_fn(x_bnc) — a residual
+        correction confined to the k-dim bottleneck, added onto the untouched input. At
+        gamma=1, beta=0 this is exactly x_bnc (decode_fn(0) == 0), for any k or architecture.
+        """
+        z = encode_fn(x_bnc)
+        g = gamma.view(1, 1, -1) if gamma.dim() == 1 else gamma.view(gamma.shape[0], 1, -1)
+        b = beta.view(1, 1, -1) if beta.dim() == 1 else beta.view(beta.shape[0], 1, -1)
+        delta = z * (g - 1.0) + b
+        return x_bnc + decode_fn(delta)
+
+    @classmethod
     def _pca_bottleneck_core(
+        cls,
         x_bnc: torch.Tensor,
         W: torch.Tensor,
         mu: torch.Tensor,
         gamma: torch.Tensor,
         beta: torch.Tensor,
     ) -> torch.Tensor:
-        """Shared encode->modulate->residual-add math for the "memory"/"hs" PCA-bottleneck FiLM
-        targets (see load_film_pca()). Mirrors the inline visual-src math in forward() below,
-        just generalized to a canonical (B, N, C) layout so it works for both memory's
-        (S,B,C)-shaped tokens and hs's (B,Q,C)-shaped tokens without duplicating the einsum
-        per shape — callers permute into (B, N, C) first (N = whatever the "token" axis is:
-        sequence position, query index, etc.) and permute the result back.
-
-        x_bnc: (B, N, C). W: (C, k). mu: (C,).
-        gamma, beta: (k,) shared across the whole batch, or (B, k) per-sample (batched search,
-        same convention as film_pca_gamma/beta). Broadcast across N either way (gamma/beta do
-        not vary across tokens), matching the visual path's spatial broadcast over H,W.
-
-        Returns x_bnc + W @ ((gamma-1)*z + beta) — a residual correction confined to the k-dim
-        subspace, added onto the untouched input (not a low-rank reconstruction replacing it).
-        At gamma=1, beta=0 the correction is exactly zero, so this is the identity for any k.
-        """
-        z = torch.einsum("bnc,ck->bnk", x_bnc - mu.view(1, 1, -1), W)
-        g = gamma.view(1, 1, -1) if gamma.dim() == 1 else gamma.view(gamma.shape[0], 1, -1)
-        b = beta.view(1, 1, -1) if beta.dim() == 1 else beta.view(beta.shape[0], 1, -1)
-        delta = z * (g - 1.0) + b
-        return x_bnc + torch.einsum("bnk,ck->bnc", delta, W)
+        """PCA specialization of _bottleneck_core(): encode/decode via the same tied linear
+        basis W (see load_film_pca()). x_bnc: (B, N, C). W: (C, k). mu: (C,)."""
+        encode_fn = lambda t: torch.einsum("bnc,ck->bnk", t - mu.view(1, 1, -1), W)
+        decode_fn = lambda z: torch.einsum("bnk,ck->bnc", z, W)
+        return cls._bottleneck_core(x_bnc, encode_fn, decode_fn, gamma, beta)
 
     def _resolve_film_pca_override(
         self, override, default_buffer: torch.Tensor, ref: torch.Tensor
@@ -251,6 +333,29 @@ class DETRVAE(nn.Module):
         beta = self._resolve_film_pca_override(beta_override, self.film_pca_hs_beta, hs)
         return self._pca_bottleneck_core(hs, W, mu, gamma, beta)  # already (B,Q,C)
 
+    def _apply_film_ae_memory(self, memory: torch.Tensor, gamma_override, beta_override) -> torch.Tensor:
+        """AE counterpart of _apply_film_pca_memory(). No-op if no basis is loaded
+        (film_ae_memory_k==0)."""
+        if int(self.film_ae_memory_k) <= 0:
+            return memory
+        mu = self.film_ae_memory_mu.to(dtype=memory.dtype, device=memory.device)
+        gamma = self._resolve_film_pca_override(gamma_override, self.film_ae_memory_gamma, memory)
+        beta = self._resolve_film_pca_override(beta_override, self.film_ae_memory_beta, memory)
+        encoder, decoder = self.film_ae_memory_encoder, self.film_ae_memory_decoder
+        x_bnc = memory.permute(1, 0, 2)  # (S,B,C) -> (B,S,C)
+        x_hat = self._bottleneck_core(x_bnc, lambda t: encoder(t - mu.view(1, 1, -1)), decoder, gamma, beta)
+        return x_hat.permute(1, 0, 2)  # (B,S,C) -> (S,B,C)
+
+    def _apply_film_ae_hs(self, hs: torch.Tensor, gamma_override, beta_override) -> torch.Tensor:
+        """AE counterpart of _apply_film_pca_hs(). No-op if no basis is loaded (film_ae_hs_k==0)."""
+        if int(self.film_ae_hs_k) <= 0:
+            return hs
+        mu = self.film_ae_hs_mu.to(dtype=hs.dtype, device=hs.device)
+        gamma = self._resolve_film_pca_override(gamma_override, self.film_ae_hs_gamma, hs)
+        beta = self._resolve_film_pca_override(beta_override, self.film_ae_hs_beta, hs)
+        encoder, decoder = self.film_ae_hs_encoder, self.film_ae_hs_decoder
+        return self._bottleneck_core(hs, lambda t: encoder(t - mu.view(1, 1, -1)), decoder, gamma, beta)  # already (B,Q,C)
+
     def forward(
         self,
         qpos,
@@ -267,6 +372,12 @@ class DETRVAE(nn.Module):
         film_pca_memory_beta=None,
         film_pca_hs_gamma=None,
         film_pca_hs_beta=None,
+        film_ae_gamma=None,
+        film_ae_beta=None,
+        film_ae_memory_gamma=None,
+        film_ae_memory_beta=None,
+        film_ae_hs_gamma=None,
+        film_ae_hs_beta=None,
     ):
         """
         qpos: batch, qpos_dim
@@ -280,6 +391,11 @@ class DETRVAE(nn.Module):
         "memory" (encoder-decoder boundary) and "hs" (pre-action_head) PCA-bottleneck FiLM
         targets respectively (see load_film_pca(..., target=...) and
         _apply_film_pca_memory()/_apply_film_pca_hs()). Independent of film_pca_gamma/beta.
+        film_ae_gamma/beta, film_ae_memory_gamma/beta, film_ae_hs_gamma/beta: same override
+        convention as their film_pca_* counterparts, for the AE-bottleneck FiLM path (see
+        load_film_ae()). A given target uses at most one of film_pca_*/film_ae_* at a time
+        (whichever was loaded via load_film_pca()/load_film_ae()); nothing prevents loading
+        both, but optimize_film_params.py only ever loads one per run.
         """
         is_training = actions is not None # train or val
         bs, _ = qpos.shape
@@ -333,11 +449,14 @@ class DETRVAE(nn.Module):
             latent_input = self.latent_out_proj(latent_sample)
 
         # Candidate-4 hook, built once (independent of the backbones branch below): applied
-        # inside Transformer.forward() right between its encoder and decoder.
-        memory_film_fn = (
-            (lambda memory: self._apply_film_pca_memory(memory, film_pca_memory_gamma, film_pca_memory_beta))
-            if self.film_pca_memory_k > 0 else None
-        )
+        # inside Transformer.forward() right between its encoder and decoder. PCA takes
+        # precedence if somehow both are loaded (optimize_film_params.py only ever loads one).
+        if self.film_pca_memory_k > 0:
+            memory_film_fn = lambda memory: self._apply_film_pca_memory(memory, film_pca_memory_gamma, film_pca_memory_beta)
+        elif self.film_ae_memory_k > 0:
+            memory_film_fn = lambda memory: self._apply_film_ae_memory(memory, film_ae_memory_gamma, film_ae_memory_beta)
+        else:
+            memory_film_fn = None
 
         if self.backbones is not None:
             # Image observation features and position embeddings
@@ -384,6 +503,19 @@ class DETRVAE(nn.Module):
                 z = torch.einsum("bchw,ck->bkhw", src - mu.view(1, -1, 1, 1), W)  # encode
                 delta = z * (g_pca - 1.0) + b_pca  # modulation only (free params: film_pca_gamma/beta)
                 src = src + torch.einsum("bkhw,ck->bchw", delta, W)  # residual add; identity at gamma=1,beta=0
+            elif self.film_ae_k > 0:
+                # AE-bottleneck FiLM: nonlinear analog of the PCA branch above, same
+                # encode->modulate->decode-diff->residual-add math via _bottleneck_core(), just
+                # reshaped from (B,C,H,W) to the (B,N,C) layout that helper expects. See
+                # load_film_ae() for why the decoder is bias-free (identity at gamma=1,beta=0).
+                gamma = self._resolve_film_pca_override(film_ae_gamma, self.film_ae_gamma, src)
+                beta = self._resolve_film_pca_override(film_ae_beta, self.film_ae_beta, src)
+                mu = self.film_ae_mu.to(dtype=src.dtype, device=src.device)
+                encoder, decoder = self.film_ae_encoder, self.film_ae_decoder
+                B, C, H, Wd = src.shape
+                x_bnc = src.permute(0, 2, 3, 1).reshape(B, H * Wd, C)  # (B,C,H,W) -> (B,HW,C)
+                x_hat = self._bottleneck_core(x_bnc, lambda t: encoder(t - mu.view(1, 1, -1)), decoder, gamma, beta)
+                src = x_hat.reshape(B, H, Wd, C).permute(0, 3, 1, 2)  # (B,HW,C) -> (B,C,H,W)
             else:
                 # FiLM (feature-wise affine): src = gamma * src + beta
                 # Default: use internal buffers (shared across batch).
@@ -442,6 +574,8 @@ class DETRVAE(nn.Module):
                                    memory_film_fn=memory_film_fn)[0]
         if self.film_pca_hs_k > 0:
             hs = self._apply_film_pca_hs(hs, film_pca_hs_gamma, film_pca_hs_beta)
+        elif self.film_ae_hs_k > 0:
+            hs = self._apply_film_ae_hs(hs, film_ae_hs_gamma, film_ae_hs_beta)
         a_hat = self.action_head(hs)
         is_pad_hat = self.is_pad_head(hs)
         return a_hat, is_pad_hat, [mu, logvar]

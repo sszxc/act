@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Search PCA-bottleneck FiLM parameters in ACT with CMA-ES, ARS, or an LLM optimizer, under a fixed
-object pose, to maximize episode_return.
+Search PCA- or AE-bottleneck FiLM parameters in ACT with CMA-ES, ARS, or an LLM optimizer, under a
+fixed object pose, to maximize episode_return.
 
 The search space is theta = [gamma, beta], each k-dim, where k = --film_bottleneck_dim. These are
-NOT raw per-channel FiLM values: they modulate a k-dim PCA subspace of a hidden_dim-wide tensor
-(see detr_vae.py's load_film_pca()/forward()), fit offline from recorded activations by
-fit_film_pca.py. --film_pca_path points at that fit's .npz output; k is sliced from its stored
-basis (k <= max_k used when fitting).
+NOT raw per-channel FiLM values: they modulate a k-dim bottleneck of a hidden_dim-wide tensor
+(see detr_vae.py's load_film_pca()/load_film_ae()/forward()). --film_bottleneck_method selects how
+that bottleneck is built:
+  - "pca" (default): linear tied-weight basis, fit offline by fit_film_pca.py; --film_pca_path
+    points at that .npz; k is sliced from the stored basis (k <= max_k used when fitting).
+  - "ae": learned encoder/decoder (linear if fit with --ae_hidden 0, nonlinear otherwise), fit
+    offline by fit_film_ae.py; --film_ae_path points at that .pt; k must equal the fit's --k
+    exactly (an AE latent width cannot be sliced at search time).
 
---film_target selects WHERE in the network that tensor is (must match --target used when fitting
---film_pca_path):
+--film_target selects WHERE in the network that tensor is (must match --target used when fitting):
   - "visual" (default): before the Transformer encoder (the original mode).
   - "memory": the encoder-decoder boundary (encoder's output, right before the decoder reads it).
   - "hs": right after the decoder, before action_head/is_pad_head.
@@ -30,6 +33,13 @@ Examples:
     --fixed_object_pose "0.1,0.5,0.05,1,0,0,0" --method ars --ars_iters 3 --ars_pairs 2 --output_dir tmp/film_search
 
   python optimize_film_params.py --ckpt ... --film_pca_path ... --film_bottleneck_dim 8 --method cma --cma_maxiter 5 --cma_popsize 8 ...
+
+  # AE analog of (1)+(2): fit then search (k must match; --film_target must match --target):
+  python fit_film_ae.py --ckpt ... --task_name ... --target visual --k 8 --ae_hidden 0 \\
+    --output tmp/film_ae/..._visual_k8_h0.pt
+  python optimize_film_params.py --ckpt ... --film_bottleneck_method ae \\
+    --film_ae_path tmp/film_ae/..._visual_k8_h0.pt --film_bottleneck_dim 8 --film_target visual \\
+    --fixed_object_pose "..." --method ars --output_dir tmp/film_search_ae
 
   # candidate 4 / 5 (fit + search must use the same --target / --film_target):
   python fit_film_pca.py --ckpt ... --task_name ... --target memory --output tmp/film_pca/..._memory.npz
@@ -64,7 +74,16 @@ from sim_env import make_sim_env
 from visualize_episodes import _video_path_for_cam
 
 from src.cli_utils import _parse_float_list, _parse_latent_z
-from src.film_utils import _FILM_TARGETS, _film_pca_attr, _load_policy_and_stats, _film_theta_from_policy, _apply_film_theta
+from src.film_utils import (
+    _FILM_TARGETS,
+    _FILM_METHODS,
+    _film_bottleneck_attr,
+    _film_pca_attr,
+    _load_policy_and_stats,
+    _film_theta_from_policy,
+    _apply_film_theta,
+    _load_film_ae_checkpoint,
+)
 from src.rollout import rollout_batch_episode_returns, _build_eval_config
 from src.logging_utils import _format_duration, _save_curve_png
 from src.optimizers import run_ars, run_ars_batched, run_cma, run_cma_batched, run_sweep
@@ -192,18 +211,38 @@ def main():
         help="Parallel candidates to evaluate (batch rollout count; single-GPU batched inference)",
     )
     p.add_argument(
+        "--film_bottleneck_method",
+        type=str,
+        choices=_FILM_METHODS,
+        default="pca",
+        help="How the hidden_dim-wide tensor at --film_target is bottlenecked to k dims: "
+        "'pca' (default, linear, fit by fit_film_pca.py, --film_pca_path) or 'ae' (learned "
+        "encoder/decoder, possibly nonlinear, fit by fit_film_ae.py, --film_ae_path).",
+    )
+    p.add_argument(
         "--film_pca_path",
         type=str,
-        required=True,
-        help="Path to a fit_film_pca.py .npz output (W, mu, explained_variance_ratio, meta). "
-        "Must have been fit with --target matching --film_target below.",
+        default=None,
+        help="Required when --film_bottleneck_method pca (default). Path to a fit_film_pca.py "
+        ".npz output (W, mu, explained_variance_ratio, meta). Must have been fit with --target "
+        "matching --film_target below.",
+    )
+    p.add_argument(
+        "--film_ae_path",
+        type=str,
+        default=None,
+        help="Required when --film_bottleneck_method ae. Path to a fit_film_ae.py .pt output "
+        "(encoder/decoder state dicts, mu, meta). Must have been fit with --target matching "
+        "--film_target below AND --k matching --film_bottleneck_dim exactly (unlike PCA, an "
+        "AE's latent width can't be sliced at search time).",
     )
     p.add_argument(
         "--film_bottleneck_dim",
         type=int,
         required=True,
-        help="k: PCA-bottleneck FiLM dim to search (theta = [gamma, beta], each k-dim). "
-        "Must be <= max_k stored in --film_pca_path; W is sliced to W[:, :k]",
+        help="k: bottleneck FiLM dim to search (theta = [gamma, beta], each k-dim). PCA: must "
+        "be <= max_k stored in --film_pca_path (W is sliced to W[:, :k]). AE: must equal exactly "
+        "the k that --film_ae_path was fit with.",
     )
     p.add_argument(
         "--film_target",
@@ -298,6 +337,14 @@ def main():
     if args.policy_class != "ACT":
         print("FiLM exists only on ACT (DETRVAE); use --policy_class ACT", file=sys.stderr)
         sys.exit(1)
+    if args.film_bottleneck_method == "pca":
+        if args.film_pca_path is None:
+            print("--film_bottleneck_method pca requires --film_pca_path", file=sys.stderr)
+            sys.exit(1)
+    else:
+        if args.film_ae_path is None:
+            print("--film_bottleneck_method ae requires --film_ae_path", file=sys.stderr)
+            sys.exit(1)
 
     # --output_dir is the *parent* folder for this run; the actual run always lands one level
     # down in icl_<timestamp>_<model_or_method>/, so a script sweeping multiple runs can pass the
@@ -350,33 +397,51 @@ def main():
     )
 
     hidden_dim = int(policy.model.visual_film_gamma.numel())
-
-    film_pca_path = Path(args.film_pca_path).resolve()
-    pca_npz = np.load(film_pca_path, allow_pickle=False)
-    pca_W_full = pca_npz["W"]  # (hidden_dim, max_k)
-    pca_mu = pca_npz["mu"]  # (hidden_dim,)
-    max_k = int(pca_W_full.shape[1])
-    if pca_W_full.shape[0] != hidden_dim:
-        print(
-            f"--film_pca_path hidden_dim={pca_W_full.shape[0]} != model hidden_dim={hidden_dim}; "
-            "was it fit against a different --hidden_dim / architecture?",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    bottleneck_method = args.film_bottleneck_method
     k = int(args.film_bottleneck_dim)
-    if k <= 0 or k > max_k:
-        print(f"--film_bottleneck_dim={k} must be in [1, {max_k}] (max_k stored in {film_pca_path})", file=sys.stderr)
+    if k <= 0:
+        print(f"--film_bottleneck_dim={k} must be >= 1", file=sys.stderr)
         sys.exit(1)
-    policy.model.load_film_pca(
-        torch.from_numpy(np.ascontiguousarray(pca_W_full[:, :k])).float(),
-        torch.from_numpy(np.ascontiguousarray(pca_mu)).float(),
-        target=args.film_target,
-    )
+
+    if bottleneck_method == "pca":
+        film_pca_path = Path(args.film_pca_path).resolve()
+        film_ae_path = None
+        pca_npz = np.load(film_pca_path, allow_pickle=False)
+        pca_W_full = pca_npz["W"]  # (hidden_dim, max_k)
+        pca_mu = pca_npz["mu"]  # (hidden_dim,)
+        max_k = int(pca_W_full.shape[1])
+        if pca_W_full.shape[0] != hidden_dim:
+            print(
+                f"--film_pca_path hidden_dim={pca_W_full.shape[0]} != model hidden_dim={hidden_dim}; "
+                "was it fit against a different --hidden_dim / architecture?",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if k > max_k:
+            print(f"--film_bottleneck_dim={k} must be in [1, {max_k}] (max_k stored in {film_pca_path})", file=sys.stderr)
+            sys.exit(1)
+        policy.model.load_film_pca(
+            torch.from_numpy(np.ascontiguousarray(pca_W_full[:, :k])).float(),
+            torch.from_numpy(np.ascontiguousarray(pca_mu)).float(),
+            target=args.film_target,
+        )
+        ae_hidden = None
+        print(
+            f"Loaded {ckpt_loaded}, PCA-bottleneck FiLM target={args.film_target}: k={k} "
+            f"(max_k={max_k} in {film_pca_path}), film_dim={2 * k}"
+        )
+    else:
+        film_pca_path = None
+        max_k = None
+        film_ae_path = Path(args.film_ae_path).resolve()
+        encoder, decoder, ae_mu, ae_meta = _load_film_ae_checkpoint(film_ae_path, hidden_dim, k)
+        policy.model.load_film_ae(encoder, decoder, ae_mu, target=args.film_target)
+        ae_hidden = int(ae_meta.get("ae_hidden", -1))
+        print(
+            f"Loaded {ckpt_loaded}, AE-bottleneck FiLM target={args.film_target}: k={k} "
+            f"(ae_hidden={ae_hidden} in {film_ae_path}), film_dim={2 * k}"
+        )
     film_dim = 2 * k
-    print(
-        f"Loaded {ckpt_loaded}, PCA-bottleneck FiLM target={args.film_target}: k={k} "
-        f"(max_k={max_k} in {film_pca_path}), film_dim={film_dim}"
-    )
     sweep_dim_names = [f"gamma_{i}" for i in range(k)] + [f"beta_{i}" for i in range(k)]
 
     latent_z = _parse_latent_z(args.latent_z_sample, args.latent_z_dim)
@@ -443,9 +508,10 @@ def main():
             capture_frames=capture_frames,
             video_layout=args.video_layout,
             film_target=args.film_target,
+            film_bottleneck_method=bottleneck_method,
         )
 
-    theta_base = _film_theta_from_policy(policy, target=args.film_target).astype(np.float64, copy=False)
+    theta_base = _film_theta_from_policy(policy, target=args.film_target, method=bottleneck_method).astype(np.float64, copy=False)
 
     def fitness_batch(theta_batch: np.ndarray) -> np.ndarray:
         return eval_theta_batch(theta_batch)
@@ -477,9 +543,12 @@ def main():
         "task_name": task_name,
         "method": args.method,
         "film_target": args.film_target,
-        "film_pca_path": str(film_pca_path),
+        "film_bottleneck_method": bottleneck_method,
+        "film_pca_path": str(film_pca_path) if film_pca_path is not None else None,
+        "film_ae_path": str(film_ae_path) if film_ae_path is not None else None,
         "film_bottleneck_dim": k,
         "film_pca_max_k": max_k,
+        "film_ae_hidden": ae_hidden,
         "film_dim": film_dim,
         "theta_base": theta_base.tolist(),
         "fixed_object_pose": fixed_object_pose.tolist(),
@@ -709,6 +778,7 @@ def main():
                     capture_mocap_pos=True,
                     video_layout=args.video_layout,
                     film_target=args.film_target,
+                    film_bottleneck_method=bottleneck_method,
                 )
                 sweep_records.append(
                     {
@@ -814,20 +884,36 @@ def main():
 
     best_theta = np.asarray(best_x, dtype=np.float64)
 
-    _apply_film_theta(policy, best_theta, k, target=args.film_target)
-    W_attr, mu_attr, g_attr, b_attr = (_film_pca_attr(args.film_target, n) for n in ("W", "mu", "gamma", "beta"))
+    _apply_film_theta(policy, best_theta, k, target=args.film_target, method=bottleneck_method)
     film_ckpt = {
         "film_target": args.film_target,
-        # Saved under fixed (unprefixed) keys regardless of film_target, for a stable
-        # best_film_only.pt schema across targets — "film_target" above says which
-        # detr_vae.py insertion point (load_film_pca(..., target=...)) these belong to.
-        "film_pca_W": getattr(policy.model, W_attr).cpu(),
-        "film_pca_mu": getattr(policy.model, mu_attr).cpu(),
-        "film_pca_gamma": getattr(policy.model, g_attr).cpu(),
-        "film_pca_beta": getattr(policy.model, b_attr).cpu(),
+        # "film_bottleneck_method" says which schema the method-specific keys below follow —
+        # "film_target" says which detr_vae.py insertion point (load_film_pca()/load_film_ae()
+        # (..., target=...)) they belong to.
+        "film_bottleneck_method": bottleneck_method,
         "best_theta": torch.from_numpy(best_theta.astype(np.float32)),
         "film_bottleneck_dim": k,
     }
+    if bottleneck_method == "pca":
+        W_attr, mu_attr, g_attr, b_attr = (_film_pca_attr(args.film_target, n) for n in ("W", "mu", "gamma", "beta"))
+        film_ckpt.update(
+            film_pca_W=getattr(policy.model, W_attr).cpu(),
+            film_pca_mu=getattr(policy.model, mu_attr).cpu(),
+            film_pca_gamma=getattr(policy.model, g_attr).cpu(),
+            film_pca_beta=getattr(policy.model, b_attr).cpu(),
+        )
+    else:
+        enc_attr, dec_attr, mu_attr, g_attr, b_attr = (
+            _film_bottleneck_attr("ae", args.film_target, n) for n in ("encoder", "decoder", "mu", "gamma", "beta")
+        )
+        film_ckpt.update(
+            film_ae_hidden=ae_hidden,
+            film_ae_encoder_state_dict=getattr(policy.model, enc_attr).cpu().state_dict(),
+            film_ae_decoder_state_dict=getattr(policy.model, dec_attr).cpu().state_dict(),
+            film_ae_mu=getattr(policy.model, mu_attr).cpu(),
+            film_ae_gamma=getattr(policy.model, g_attr).cpu(),
+            film_ae_beta=getattr(policy.model, b_attr).cpu(),
+        )
     torch.save(film_ckpt, out_dir / "best_film_only.pt")
     best_logged = float(np.max(h_best)) if len(h_best) else float("nan")
     best_logged_kind = "progress_reward" if use_reward_predictor else "episode_return"
