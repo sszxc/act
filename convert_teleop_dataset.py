@@ -2,23 +2,27 @@
 
 Each source episode dir (e.g. data/20260901_good_data_90hz/20260901_HHMMSS_xxxx) must have:
   manifest.json   (schema_version, task_label, time_sync.video_origin_ns/video_end_ns, video_paths, sample_counts)
-  trajectory.h5   trajectories/combined/{position,velocity,source_time_ns}   (schema_version 1.3+ only)
+  trajectory.h5   trajectories/{ur_arm,robot_hand}/{position,velocity,source_time_ns}   (schema_version 1.3+ only)
   videos/<cam>.mp4
 
 Only episodes with schema_version == "1.3" and task_label == "success" are converted; everything else
-is skipped and logged (schema 1.1 episodes have no `combined` stream and are dropped rather than merged
-by hand, since it's a single episode in the current batches).
+is skipped and logged (schema 1.1 episodes have no ur_arm/robot_hand split with source_time_ns and are
+dropped rather than merged by hand, since it's a single episode in the current batches).
 
 Alignment: manifest sample_counts are not reliable (checked against actual decoded frame count instead).
-The `combined` joint stream is already a uniform 90Hz nearest-sample grid derived from the arm+hand
-streams; video doesn't carry true per-frame capture timestamps (each cam's mp4 is written at a constant
-spacing from video_origin_ns, at that cam's own fps — read per-camera from the container, since the
-fingertip cams (thumb/index/middle/ring) are 10fps while the rest are 30fps; an earlier version of this
-script assumed 30fps for all cams, which silently broke alignment for the fingertip streams). Joint
-recording and video also don't start/stop together (joint recording usually starts a bit before video,
-and sometimes stops several seconds before video does). So: clip to the intersection of
-[video_origin_ns, video_end_ns] and the combined stream's own time range, then resample everything (each
-camera + joint state) onto a nominal 30Hz grid over that window by nearest-timestamp match.
+Joint state is taken from the raw ur_arm/robot_hand streams' own source_time_ns (real ROS header
+timestamps) and linearly interpolated onto the output grid — not the precomputed `combined` stream,
+which upstream is built by nearest-receive_time_ns matching with hold-last-value on gaps: that bakes in
+a multi-second startup lag (queue backlog draining) plus, on every ROS receive hiccup mid-episode
+(100ms-2s gaps, common), a run of repeated/frozen joint samples that shows up as replay stutter. Video
+doesn't carry true per-frame capture timestamps (each cam's mp4 is written at a constant spacing from
+video_origin_ns, at that cam's own fps — read per-camera from the container, since the fingertip cams
+(thumb/index/middle/ring) are 10fps while the rest are 30fps; an earlier version of this script assumed
+30fps for all cams, which silently broke alignment for the fingertip streams). Joint recording and video
+also don't start/stop together (joint recording usually starts a bit before video, and sometimes stops
+several seconds before video does). So: clip to the intersection of [video_origin_ns, video_end_ns] and
+the ur_arm/robot_hand streams' own time ranges, then resample everything onto a nominal 30Hz grid over
+that window — each camera by nearest-timestamp match, joint position/velocity by interpolation.
 
 Output: --out_dir/episode_{0..N-1}.hdf5, one per kept episode, ordered by source dir name (chronological).
 Feed --out_dir as a `good` (or `good2`, `good3`, ...) source dir to merge_teleop_dataset.py to combine
@@ -67,11 +71,19 @@ def read_video_frames(path):
     return frames, fps
 
 
+def interp_columns(src_t, values, out_times):
+    """Linearly interpolate each column of `values` (sampled at its own real src_t) onto out_times."""
+    out = np.empty((len(out_times), values.shape[1]), dtype=np.float64)
+    for j in range(values.shape[1]):
+        out[:, j] = np.interp(out_times, src_t, values[:, j])
+    return out
+
+
 def convert_episode(ep_dir, cameras, log):
     manifest = json.load(open(os.path.join(ep_dir, "manifest.json")))
     ep_id = manifest["episode_id"]
     if manifest.get("schema_version") != "1.3":
-        log(f"{ep_id}: SKIP schema_version={manifest.get('schema_version')} (no combined stream)")
+        log(f"{ep_id}: SKIP schema_version={manifest.get('schema_version')} (no ur_arm/robot_hand split)")
         return None
     if manifest.get("task_label") != "success":
         log(f"{ep_id}: SKIP task_label={manifest.get('task_label')}")
@@ -81,12 +93,15 @@ def convert_episode(ep_dir, cameras, log):
     video_origin_ns, video_end_ns = float(ts["video_origin_ns"]), float(ts["video_end_ns"])
 
     with h5py.File(os.path.join(ep_dir, "trajectory.h5")) as f:
-        pos = f["trajectories/combined/position"][:]
-        vel = f["trajectories/combined/velocity"][:]
-        src_t = f["trajectories/combined/source_time_ns"][:].astype(np.float64)
+        ur_pos = f["trajectories/ur_arm/position"][:]
+        ur_vel = f["trajectories/ur_arm/velocity"][:]
+        ur_t = f["trajectories/ur_arm/source_time_ns"][:].astype(np.float64)
+        rh_pos = f["trajectories/robot_hand/position"][:]
+        rh_vel = f["trajectories/robot_hand/velocity"][:]
+        rh_t = f["trajectories/robot_hand/source_time_ns"][:].astype(np.float64)
 
-    lo = max(video_origin_ns, src_t[0])
-    hi = min(video_end_ns, src_t[-1])
+    lo = max(video_origin_ns, ur_t[0], rh_t[0])
+    hi = min(video_end_ns, ur_t[-1], rh_t[-1])
     if hi <= lo:
         log(f"{ep_id}: SKIP empty video/joint intersection window")
         return None
@@ -105,21 +120,27 @@ def convert_episode(ep_dir, cameras, log):
         fi = nearest_indices(frame_times, out_times)
         cam_images[cam] = np.stack([frames[i] for i in fi], axis=0)
 
-    joint_idx = nearest_indices(src_t, out_times)
-    qpos = pos[joint_idx]
-    qvel = vel[joint_idx]
+    qpos = np.concatenate([interp_columns(ur_t, ur_pos, out_times),
+                            interp_columns(rh_t, rh_pos, out_times)], axis=1)
+    qvel = np.concatenate([interp_columns(ur_t, ur_vel, out_times),
+                            interp_columns(rh_t, rh_vel, out_times)], axis=1)
     action = np.concatenate([qpos[1:], qpos[-1:]], axis=0)  # action[t] = qpos[t+1]; hold pose at the end
 
-    head_clip = (lo - min(video_origin_ns, src_t[0])) / 1e9
+    head_clip = (lo - min(video_origin_ns, ur_t[0], rh_t[0])) / 1e9
     tail_clip_video = max(0.0, video_end_ns - hi) / 1e9
-    tail_clip_joint = max(0.0, src_t[-1] - hi) / 1e9
     flags = []
     if head_clip > 0.3:
         flags.append(f"head_clipped={head_clip:.2f}s")
     if tail_clip_video > 0.3:
         flags.append(f"video_tail_dropped={tail_clip_video:.2f}s")
-    if tail_clip_joint > 0.3:
-        flags.append(f"joint_tail_dropped={tail_clip_joint:.2f}s")
+    for name, t in (("ur_arm", ur_t), ("robot_hand", rh_t)):
+        tail_clip = max(0.0, t[-1] - hi) / 1e9
+        if tail_clip > 0.3:
+            flags.append(f"{name}_tail_dropped={tail_clip:.2f}s")
+        gaps = np.diff(t[(t >= lo) & (t <= hi)])
+        max_gap = gaps.max() / 1e9 if len(gaps) else 0.0
+        if max_gap > 0.3:
+            flags.append(f"{name}_gap_interpolated={max_gap:.2f}s")
     flag_str = f"  [{', '.join(flags)}]" if flags else ""
     log(f"{ep_id}: OK n_steps={n_steps} ({n_steps / FPS:.1f}s){flag_str}")
 

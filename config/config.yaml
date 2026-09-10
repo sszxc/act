@@ -33,9 +33,9 @@ latent_z_dim: 32
 dataset_dir: null
 camera_names: null
 num_episodes: null
-# state_dim/action_dim: null = use TASK_CONFIGS value. Needed for action_repr=task_space,
-# which changes action/state dims (see forward_kinematics.TASKSPACE_DIM) without a dedicated
-# TASK_CONFIGS entry, e.g. state_dim=27 action_dim=27.
+# state_dim/action_dim: null = use TASK_CONFIGS value, except action_repr=task_space, where
+# both are derived automatically (forward_kinematics.TASKSPACE_DIM=27, or fewer with joint_ids
+# arm-only -- see utils._task_space_keep_idx). Set explicitly only to override that.
 state_dim: null
 action_dim: null
 

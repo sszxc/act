@@ -28,6 +28,8 @@ from constants import DT, DEFAULT_STATE_DIM, ROOT_DIM, STATE_DIM_ALLEGRO, SIM_TA
 from constants import ENV_FAMILY_ALLEGRO, ENV_FAMILY_HMF_PROTO5_HAND, ENV_FAMILY_METAWORLD
 from constants import HMF_PROTO5_CTRL_DIM, HMF_PROTO5_STATE_DIM
 from constants import PUPPET_GRIPPER_JOINT_OPEN, PUPPET_GRIPPER_POSITION_UNNORMALIZE_FN
+import utils
+import forward_kinematics
 from utils import load_data # data functions
 from utils import sample_box_pose, sample_insertion_pose # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict # helper functions
@@ -97,9 +99,15 @@ def train_or_eval(args, hydra_cfg=None):
     # the 16 finger joints from both observation and action). Sets state/action dim implicitly.
     joint_ids = args.get('joint_ids', None)
     joint_ids = list(joint_ids) if joint_ids is not None else None
+    action_repr = args.get('action_repr', 'absolute')
     state_dim = args.get('state_dim') or task_config.get('state_dim', DEFAULT_STATE_DIM)
     action_dim = args.get('action_dim') or task_config.get('action_dim', state_dim)
-    if joint_ids is not None:
+    if action_repr == 'task_space':
+        # FK output (pos3+rot6d6+hand18=27), trimmed by joint_ids (arm-only) to just the
+        # hand/wrist dims it keeps -- see utils._task_space_keep_idx.
+        state_dim = action_dim = len(utils._task_space_keep_idx(joint_ids)) if joint_ids is not None \
+            else forward_kinematics.TASKSPACE_DIM
+    elif joint_ids is not None:
         state_dim = action_dim = len(joint_ids)
     env_family = task_config.get('env_family', None)
 
@@ -150,7 +158,7 @@ def train_or_eval(args, hydra_cfg=None):
         'temporal_agg_newest': args.get('temporal_agg_newest', False),
         'camera_names': camera_names,
         'image_size': image_size,
-        'action_repr': args.get('action_repr', 'absolute'),
+        'action_repr': action_repr,
         'action_offset': args.get('action_offset', -1),
         'joint_ids': joint_ids,
         'action_stride': args.get('action_stride', 1),
@@ -948,15 +956,11 @@ def deploy_metrics(policy, deploy_set, action_repr, chunk=64):
         # needs a matrix multiply, not addition -- and it isn't needed anyway. qpos_raw cancels
         # out of every metric below for any delta-style repr (see 'delta' below: pred_abs and
         # gt_abs both add the same qpos_raw, so it drops out of pred_abs-gt_abs, and copy_rad's
-        # qpos_raw baseline is exactly "predict zero delta"). So work directly in delta space.
+        # qpos_raw baseline is exactly "predict zero delta"). So work directly in delta space,
+        # via _chunk_metrics with a zero baseline in place of qpos_raw (also gets track_corr).
         denorm = lambda a: a * ref['task_space_std'] + ref['task_space_mean']
         pred_abs, gt_abs = denorm(a_hat), denorm(action)
-        n = m.sum() * gt_abs.shape[-1]
-        mae = lambda x, y: ((x - y).abs() * m).sum() / n
-        zero = torch.zeros_like(gt_abs)
-        l1_rad, copy_rad = mae(pred_abs, gt_abs), mae(zero, gt_abs)
-        return {'l1_rad': l1_rad.item(), 'skill': (l1_rad / copy_rad).item(),
-                'motion_ratio': (mae(pred_abs, zero) / copy_rad).item()}
+        return _chunk_metrics(pred_abs, gt_abs, torch.zeros_like(gt_abs), m)
 
     qpos_raw = (qpos * ref['qpos_std'] + ref['qpos_mean']).unsqueeze(1)  # (B,1,D)
     if action_repr == 'delta':

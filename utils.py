@@ -29,6 +29,16 @@ def load_cam_images(root, camera_names, start_ts, image_size=None):
     return np.stack(images, axis=0)
 
 
+def _task_space_keep_idx(joint_ids):
+    """action_repr='task_space' + joint_ids (arm-only): the 6 arm joints are always fused into
+    the palm pose, so joint_ids only selects which of the trailing 18 wrist/finger dims survive.
+    Returns the column indices into the 27-dim task-space vector (pos3+rot6d6+hand18) to keep."""
+    joint_ids = np.asarray(joint_ids, dtype=int)
+    hand_keep = [j - forward_kinematics.N_ARM for j in joint_ids if j >= forward_kinematics.N_ARM]
+    return np.array(list(range(forward_kinematics.POSE_DIM)) +
+                     [forward_kinematics.POSE_DIM + h for h in hand_keep], dtype=int)
+
+
 class EpisodicDataset(torch.utils.data.Dataset):
     """action_repr:
       'absolute'   - target is the raw action, normalized by action_mean/std (original ACT).
@@ -53,7 +63,12 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.action_stride = int(action_stride)
         self.joint_ids = None if joint_ids is None else np.asarray(joint_ids, dtype=int)
         if self.joint_ids is not None and action_repr == 'task_space':
-            raise ValueError("joint_ids is incompatible with action_repr='task_space' (FK needs all 24 joints)")
+            # FK fuses all N_ARM arm joints into the palm pose, so none of them can be dropped
+            # individually; joint_ids may only additionally restrict which hand/wrist dims survive.
+            if not set(range(forward_kinematics.N_ARM)).issubset(self.joint_ids.tolist()):
+                raise ValueError(
+                    f"action_repr='task_space' fuses joints 0..{forward_kinematics.N_ARM - 1} into "
+                    f"the palm pose; joint_ids must include all of them (got {joint_ids})")
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
         self.camera_names = camera_names
@@ -101,7 +116,9 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 action_len = len(action)
 
         self.is_sim = is_sim
-        if self.joint_ids is not None:
+        # task_space needs the full 24-dim qpos/action for FK; joint_ids (arm-only) is instead
+        # applied after FK, to the trailing hand/wrist dims of the 27-dim task-space vector.
+        if self.joint_ids is not None and self.action_repr != 'task_space':
             qpos = qpos[self.joint_ids]
             action = action[:, self.joint_ids]
             action_dim = len(self.joint_ids)
@@ -109,7 +126,9 @@ class EpisodicDataset(torch.utils.data.Dataset):
             action = action - qpos[None, :]
         elif self.action_repr == 'task_space':
             action = forward_kinematics.task_action_delta_batch(qpos, action)
-            action_dim = action.shape[1]  # 27, replaces the raw hdf5 action_dim (24)
+            if self.joint_ids is not None:
+                action = action[:, _task_space_keep_idx(self.joint_ids)]
+            action_dim = action.shape[1]  # 27 (or fewer, arm-only), replaces the raw hdf5 action_dim (24)
         padded_action = np.zeros((self.num_queries, action_dim), dtype=np.float32)
         padded_action[:action_len] = action
         is_pad = np.zeros(self.num_queries, dtype=np.float32)
@@ -117,7 +136,12 @@ class EpisodicDataset(torch.utils.data.Dataset):
 
         # construct observations
         image_data = torch.from_numpy(all_cam_images)
-        state = forward_kinematics.task_state(qpos) if self.action_repr == 'task_space' else qpos
+        if self.action_repr == 'task_space':
+            state = forward_kinematics.task_state(qpos)
+            if self.joint_ids is not None:
+                state = state[_task_space_keep_idx(self.joint_ids)]
+        else:
+            state = qpos
         qpos_data = torch.from_numpy(state).float()
         action_data = torch.from_numpy(padded_action).float()
         is_pad = torch.from_numpy(is_pad).bool()
@@ -141,16 +165,21 @@ def get_norm_stats(dataset_dir, num_episodes, num_queries=None, action_offset=-1
     all_qpos_data = []
     all_action_data = []
     per_ep = []
+    # task_space needs the full 24-dim qpos/action for FK (see EpisodicDataset.load); joint_ids
+    # is instead applied after FK, below, to the trailing hand/wrist dims of the 27-dim vector.
+    keep = _task_space_keep_idx(joint_ids) if (joint_ids is not None and action_repr == 'task_space') else None
     for episode_idx in range(num_episodes):
         dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}.hdf5')
         with h5py.File(dataset_path, 'r') as root:
             qpos = root['/observations/qpos'][()]
             qvel = root['/observations/qvel'][()]
             action = root['/action'][()]
-        if joint_ids is not None:
+        if joint_ids is not None and action_repr != 'task_space':
             qpos, action = qpos[:, joint_ids], action[:, joint_ids]
         # qpos_mean/std must match what EpisodicDataset actually feeds the model as state.
         qpos_for_stats = forward_kinematics.task_state_batch(qpos) if action_repr == 'task_space' else qpos
+        if keep is not None:
+            qpos_for_stats = qpos_for_stats[:, keep]
         all_qpos_data.append(torch.from_numpy(qpos_for_stats))
         all_action_data.append(torch.from_numpy(action))
         per_ep.append((qpos, action))
@@ -174,7 +203,10 @@ def get_norm_stats(dataset_dir, num_episodes, num_queries=None, action_offset=-1
 
     if num_queries is not None:
         if action_repr == 'task_space':
-            stats.update(_task_space_stats(per_ep, int(num_queries), int(action_offset)))
+            ts_stats = _task_space_stats(per_ep, int(num_queries), int(action_offset))
+            if keep is not None:
+                ts_stats = {k: v[keep] for k, v in ts_stats.items()}
+            stats.update(ts_stats)
         else:
             stats.update(_delta_stats(per_ep, int(num_queries), int(action_offset),
                                       int(action_stride)))
