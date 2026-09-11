@@ -125,6 +125,13 @@ def rollout_closed_loop(policy, root, camera_names, image_size, qpos0, T, stats,
     qpos_sim = qpos0.astype(np.float64).copy()
     cmd = np.zeros((T, D))
     chunk = None
+    # act/utils.py's delta target is `action - qpos[start_ts]`, ONE reference broadcast over the
+    # whole queried chunk, not a per-step one -- cache qpos_sim at query time and reuse it for
+    # every step until the next query, instead of denormalizing against the continuously-updated
+    # qpos_sim (which used to silently drift the reference away from the query-time qpos as each
+    # chunk played out). qpos_sim itself keeps advancing every step regardless -- it's the
+    # "policy's own previous command" state fed as the model's next INPUT, unaffected by this.
+    chunk_reference = None
     with torch.inference_mode():
         for t in range(T):
             if t % query_every == 0:
@@ -133,6 +140,7 @@ def rollout_closed_loop(policy, root, camera_names, image_size, qpos0, T, stats,
                 qpos_n = torch.from_numpy(
                     (qpos_sim - stats['qpos_mean']) / stats['qpos_std']).float().cuda()[None]
                 chunk = policy(qpos_n, img)[0].cpu().numpy()  # (chunk_size, D)
+                chunk_reference = qpos_sim
             if temporal_agg:
                 all_time_actions[t, t:t + chunk_size] = chunk
                 lo = max(0, t - chunk_size + 1)
@@ -142,7 +150,7 @@ def rollout_closed_loop(policy, root, camera_names, image_size, qpos0, T, stats,
                 raw = (preds * (w / w.sum())[:, None]).sum(0)
             else:
                 raw = chunk[t % chunk_size]
-            cmd[t] = denormalize(raw, qpos_sim, stats, action_repr)
+            cmd[t] = denormalize(raw, chunk_reference, stats, action_repr)
             qpos_sim = cmd[t]
     return cmd
 

@@ -562,6 +562,14 @@ def rollout_single_episode_return(
     steps_this_rollout = min(max_timesteps, replay_actions.shape[0]) if direct_replay else max_timesteps
     if temporal_agg and not direct_replay:
         all_time_actions = torch.zeros([max_timesteps, max_timesteps + num_queries, action_dim]).cuda()
+    # post_process's delta reference: utils.py's delta target is `action - qpos[start_ts]`, ONE
+    # reference broadcast over the whole queried chunk, not a per-step one. Caching it here (set
+    # only when the model is actually queried) keeps every step of an open-loop chunk relative to
+    # the qpos that was live at query time, matching training -- using the CURRENT qpos_numpy at
+    # every step instead (as this used to) silently drifts the reference away from that as the
+    # chunk plays out. temporal_agg queries every step (query_frequency=1) so this always just
+    # equals that step's own qpos_numpy there, same as before.
+    chunk_reference_qpos = None
 
     qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
 
@@ -605,6 +613,7 @@ def rollout_single_episode_return(
             else:
                 if policy_class == "ACT":
                     if t % query_frequency == 0:
+                        chunk_reference_qpos = qpos_numpy
                         if film_theta is not None and film_pca_theta is not None:
                             raise ValueError("film_theta and film_pca_theta are mutually exclusive")
                         film_gamma = film_beta = film_pca_gamma = film_pca_beta = None
@@ -653,11 +662,12 @@ def rollout_single_episode_return(
                     else:
                         raw_action = all_actions[:, t % query_frequency]
                 elif policy_class == "CNNMLP":
+                    chunk_reference_qpos = qpos_numpy  # no chunking -- every step is its own "query time"
                     raw_action = policy(qpos, curr_image)
                 else:
                     raise NotImplementedError
                 raw_action = raw_action.squeeze(0).cpu().numpy()
-                target_qpos = post_process(raw_action, qpos_numpy)
+                target_qpos = post_process(raw_action, chunk_reference_qpos)
                 if use_pca_action and pca is not None:
                     root_6 = target_qpos[:ROOT_DIM]
                     finger_pcs = target_qpos[ROOT_DIM:].reshape(1, -1)
